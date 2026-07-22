@@ -1,0 +1,8 @@
+{
+  "name": "@opencode-config/native-memory",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "peerDependencies": { "@opencode-ai/plugin": "1.18.4" },
+  "dependencies": { "yaml": "^2.9.0" }
+}
