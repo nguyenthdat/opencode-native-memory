@@ -1,8 +1,9 @@
 {
-  "name": "@opencode-config/native-memory",
+  "name": "@nguyenthdat/opencod-memory",
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
   "peerDependencies": { "@opencode-ai/plugin": "1.18.4" },
   "dependencies": { "yaml": "^2.9.0" }
 }
