@@ -479,7 +479,7 @@ fn looks_like_secret_value(value: &str) -> bool {
 fn contains_instruction_injection(content: &str) -> bool {
     let lower = content.to_lowercase();
     if [
-        "<native-memory-policy",
+        "<memory-policy",
         "<project-memory",
         "<system",
         "<developer",

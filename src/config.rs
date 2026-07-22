@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-const DATA_SUBDIR: &str = "opencode/native-memory";
-const CACHE_SUBDIR: &str = "opencode/native-memory/models";
+const DATA_SUBDIR: &str = "opencode/memory";
+const CACHE_SUBDIR: &str = "opencode/memory/models";
 
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {

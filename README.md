@@ -11,8 +11,8 @@ update, delete/forget, purge, feedback, shared-Markdown synchronization,
 optimize, doctor, status, and shutdown.
 
 Data is scoped by the canonical Git worktree and stored under
-`$XDG_DATA_HOME/opencode/native-memory` (or `~/.local/share/...`). Models are
-cached under `$XDG_CACHE_HOME/opencode/native-memory/models`.
+`$XDG_DATA_HOME/opencode/memory` (or `~/.local/share/...`). Models are
+cached under `$XDG_CACHE_HOME/opencode/memory/models`.
 
 ```bash
 bun run memory:build:release

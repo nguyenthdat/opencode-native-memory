@@ -213,7 +213,7 @@ fn model_cache() -> std::path::PathBuf {
         || {
             std::env::var_os("HOME").map_or_else(
                 || std::path::PathBuf::from(".fastembed_cache"),
-                |home| std::path::PathBuf::from(home).join(".cache/opencode/native-memory/models"),
+                |home| std::path::PathBuf::from(home).join(".cache/opencode/memory/models"),
             )
         },
         std::path::PathBuf::from,

@@ -30,8 +30,8 @@ export function resolveNativeMemoryBinary(root: string): string {
   const candidates = override
     ? [resolve(override)]
     : [
-        resolve(root, "target", "release", "opencode-native-memory"),
-        resolve(root, "target", "debug", "opencode-native-memory"),
+        resolve(root, "target", "release", "opencode-memory"),
+        resolve(root, "target", "debug", "opencode-memory"),
       ];
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
@@ -40,7 +40,7 @@ export function resolveNativeMemoryBinary(root: string): string {
       const library = resolve(
         binary,
         "..",
-        "native-memory-libs",
+        "memory-libs",
         process.platform === "darwin"
           ? "libzvec_c_api.dylib"
           : "libzvec_c_api.so",
@@ -313,7 +313,7 @@ export class NativeMemoryClient {
 
     const binary = this.usingSpawnOverride
       ? (process.env.OPENCODE_NATIVE_MEMORY_BIN ??
-        resolve(this.root, "target", "release", "opencode-native-memory"))
+        resolve(this.root, "target", "release", "opencode-memory"))
       : resolveNativeMemoryBinary(this.root);
     const child = this.spawnFn(binary, [], {
       cwd: this.worktree,
