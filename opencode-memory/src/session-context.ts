@@ -1,19 +1,10 @@
-import type {
-  PendingRecall,
-  SearchResponse,
-} from "./contracts.js";
+import type { PendingRecall, SearchResponse } from "./contracts.js";
 import { FEEDBACK_EVENTS, WRITABLE_MEMORY_SCOPES } from "./contracts.js";
 import type { NativeMemoryClient } from "./sidecar-client.js";
 
 export class SessionContext {
-  readonly latestQuery = new Map<
-    string,
-    { query: string; agent?: string }
-  >();
-  readonly recallCache = new Map<
-    string,
-    { key: string; response: SearchResponse }
-  >();
+  readonly latestQuery = new Map<string, { query: string; agent: string | undefined }>();
+  readonly recallCache = new Map<string, { key: string; response: SearchResponse }>();
   readonly pendingRecall = new Map<string, PendingRecall>();
   readonly sessionParents = new Map<string, string | undefined>();
   readonly sessionRoots = new Map<string, string>();
@@ -25,7 +16,7 @@ export class SessionContext {
     private readonly getSessionAPI: (
       path: { id: string },
       query: { directory: string },
-    ) => Promise<{ data?: { parentID?: string | null } }>,
+    ) => Promise<{ data: { parentID?: string | null } | undefined }>,
     private readonly directory: string,
   ) {}
 
@@ -34,7 +25,7 @@ export class SessionContext {
     if (this.warnings.has(message)) return;
     this.warnings.add(message);
     console.warn(`[memory] ${message}`);
-  }
+  };
 
   async resolveSessionRoot(sessionID: string): Promise<string> {
     const cached = this.sessionRoots.get(sessionID);
@@ -49,10 +40,7 @@ export class SessionContext {
       let parent = this.sessionParents.get(current);
       if (!this.sessionParents.has(current)) {
         try {
-          const response = await this.getSessionAPI(
-            { id: current },
-            { directory: this.directory },
-          );
+          const response = await this.getSessionAPI({ id: current }, { directory: this.directory });
           parent = response.data?.parentID ?? undefined;
         } catch {
           complete = false;
@@ -108,10 +96,7 @@ export class SessionContext {
     }
   }
 
-  async closePendingRecall(
-    sessionID: string,
-    event: "ignored" | "error",
-  ): Promise<void> {
+  async closePendingRecall(sessionID: string, event: "ignored" | "error"): Promise<void> {
     const pending = this.pendingRecall.get(sessionID);
     if (!pending) return;
     this.pendingRecall.delete(sessionID);

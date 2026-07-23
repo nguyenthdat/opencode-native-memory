@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package opencode.memory.v1;
+
+enum Method {
+  METHOD_UNSPECIFIED = 0;
+  METHOD_SEARCH = 1;
+  METHOD_STORE = 2;
+  METHOD_GET = 3;
+  METHOD_LIST = 4;
+  METHOD_UPDATE = 5;
+  METHOD_PIN = 6;
+  METHOD_LOCK = 7;
+  METHOD_DELETE = 8;
+  METHOD_FORGET = 9;
+  METHOD_PURGE = 10;
+  METHOD_FEEDBACK = 11;
+  METHOD_SYNC_SHARED = 12;
+  METHOD_STATUS = 13;
+  METHOD_OPTIMIZE = 14;
+  METHOD_DOCTOR = 15;
+  METHOD_SHUTDOWN = 16;
+}
+
+message ValueList {
+  repeated Value values = 1;
+}
+
+message ValueObject {
+  map<string, Value> fields = 1;
+}
+
+message Value {
+  oneof kind {
+    bool boolean_value = 1;
+    sint64 signed_value = 2;
+    uint64 unsigned_value = 3;
+    double float_value = 4;
+    string text_value = 5;
+    ValueList list_value = 6;
+    ValueObject object_value = 7;
+    bool null_value = 8;
+  }
+}
+
+message Request {
+  uint64 id = 1;
+  Method method = 2;
+  Value params = 3;
+}
+
+message Response {
+  uint64 id = 1;
+  bool ok = 2;
+  Value result = 3;
+  string error = 4;
+}

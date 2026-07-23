@@ -6,6 +6,98 @@ use sha2::{Digest, Sha256};
 
 const DATA_SUBDIR: &str = "opencode/memory";
 const CACHE_SUBDIR: &str = "opencode/memory/models";
+const DEFAULT_MODEL_REPO: &str = "Qwen/Qwen3-Embedding-4B-GGUF";
+const DEFAULT_MODEL_FILE: &str = "Qwen3-Embedding-4B-Q4_K_M.gguf";
+const DEFAULT_MODEL_REVISION: &str = "f4602530db1d980e16da9d7d3a70294cf5c190be";
+const DEFAULT_QUERY_TEMPLATE: &str = "Instruct: Given a code search query, retrieve relevant passages that answer the query\nQuery:{text}";
+
+/// Runtime configuration for a llama.cpp-compatible GGUF embedding model.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EmbeddingConfig {
+    pub(crate) model_path: Option<PathBuf>,
+    pub(crate) repo: String,
+    pub(crate) filename: String,
+    pub(crate) revision: String,
+    pub(crate) pooling: String,
+    pub(crate) attention: String,
+    pub(crate) query_template: String,
+    pub(crate) passage_template: String,
+    pub(crate) add_bos: bool,
+    pub(crate) append_eos: bool,
+    pub(crate) normalize: bool,
+    pub(crate) dimension: Option<usize>,
+    pub(crate) context_size: u32,
+    pub(crate) threads: Option<i32>,
+    pub(crate) gpu_layers: Option<u32>,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            repo: DEFAULT_MODEL_REPO.to_string(),
+            filename: DEFAULT_MODEL_FILE.to_string(),
+            revision: DEFAULT_MODEL_REVISION.to_string(),
+            pooling: "last".to_string(),
+            attention: "causal".to_string(),
+            query_template: DEFAULT_QUERY_TEMPLATE.to_string(),
+            passage_template: "{text}".to_string(),
+            add_bos: true,
+            append_eos: true,
+            normalize: true,
+            dimension: None,
+            context_size: 8_192,
+            threads: None,
+            gpu_layers: None,
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    fn discover() -> Result<Self> {
+        let defaults = Self::default();
+        let config = Self {
+            model_path: env_path("OPENCODE_MEMORY_EMBEDDING_MODEL_PATH"),
+            repo: env_string("OPENCODE_MEMORY_EMBEDDING_MODEL_REPO").unwrap_or(defaults.repo),
+            filename: env_string("OPENCODE_MEMORY_EMBEDDING_MODEL_FILE")
+                .unwrap_or(defaults.filename),
+            revision: env_string("OPENCODE_MEMORY_EMBEDDING_MODEL_REVISION")
+                .unwrap_or(defaults.revision),
+            pooling: env_string("OPENCODE_MEMORY_EMBEDDING_POOLING").unwrap_or(defaults.pooling),
+            attention: env_string("OPENCODE_MEMORY_EMBEDDING_ATTENTION")
+                .unwrap_or(defaults.attention),
+            query_template: env_string("OPENCODE_MEMORY_EMBEDDING_QUERY_TEMPLATE")
+                .unwrap_or(defaults.query_template),
+            passage_template: env_string("OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE")
+                .unwrap_or(defaults.passage_template),
+            add_bos: env_bool("OPENCODE_MEMORY_EMBEDDING_ADD_BOS")?.unwrap_or(defaults.add_bos),
+            append_eos: env_bool("OPENCODE_MEMORY_EMBEDDING_APPEND_EOS")?
+                .unwrap_or(defaults.append_eos),
+            normalize: env_bool("OPENCODE_MEMORY_EMBEDDING_NORMALIZE")?
+                .unwrap_or(defaults.normalize),
+            dimension: env_parse("OPENCODE_MEMORY_EMBEDDING_DIMENSION")?,
+            context_size: env_parse("OPENCODE_MEMORY_EMBEDDING_CONTEXT_SIZE")?
+                .unwrap_or(defaults.context_size),
+            threads: env_parse("OPENCODE_MEMORY_EMBEDDING_THREADS")?,
+            gpu_layers: env_parse("OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS")?,
+        };
+        anyhow::ensure!(
+            config.query_template.contains("{text}") && config.passage_template.contains("{text}"),
+            "embedding query and passage templates must contain {{text}}"
+        );
+        anyhow::ensure!(
+            config.context_size > 0,
+            "embedding context size must be greater than zero"
+        );
+        if let Some(dimension) = config.dimension {
+            anyhow::ensure!(
+                dimension > 0,
+                "embedding dimension must be greater than zero"
+            );
+        }
+        Ok(config)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {
@@ -13,6 +105,7 @@ pub struct MemoryConfig {
     project_id: String,
     data_root: PathBuf,
     model_cache: PathBuf,
+    embedding: EmbeddingConfig,
 }
 
 impl MemoryConfig {
@@ -34,7 +127,8 @@ impl MemoryConfig {
         let model_cache = env_path("OPENCODE_MEMORY_MODEL_CACHE")
             .unwrap_or_else(|| default_cache_home().join(CACHE_SUBDIR));
 
-        Ok(Self::new(project_root, data_root, model_cache))
+        Ok(Self::new(project_root, data_root, model_cache)
+            .with_embedding(EmbeddingConfig::discover()?))
     }
 
     #[must_use]
@@ -46,7 +140,15 @@ impl MemoryConfig {
             project_id,
             data_root,
             model_cache,
+            embedding: EmbeddingConfig::default(),
         }
+    }
+
+    /// Override the embedding model configuration.
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: EmbeddingConfig) -> Self {
+        self.embedding = embedding;
+        self
     }
 
     #[must_use]
@@ -62,6 +164,11 @@ impl MemoryConfig {
     #[must_use]
     pub fn model_cache(&self) -> &Path {
         &self.model_cache
+    }
+
+    #[must_use]
+    pub(crate) fn embedding(&self) -> &EmbeddingConfig {
+        &self.embedding
     }
 
     #[must_use]
@@ -84,6 +191,35 @@ fn env_path(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn env_string(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn env_parse<T>(name: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    env_string(name)
+        .map(|value| {
+            value
+                .parse::<T>()
+                .map_err(|error| anyhow::anyhow!("invalid {name}: {value}: {error}"))
+        })
+        .transpose()
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>> {
+    let Some(value) = env_string(name) else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => anyhow::bail!("invalid {name}: expected true or false, received {value}"),
+    }
 }
 
 fn default_data_home() -> PathBuf {

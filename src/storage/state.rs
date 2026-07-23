@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::config::hash_hex;
@@ -884,8 +884,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        memory_fingerprint, v1_backup_path, v2_backup_path, MemoryMetadata, MemoryState,
-        STATE_SCHEMA_VERSION,
+        MemoryMetadata, MemoryState, STATE_SCHEMA_VERSION, memory_fingerprint, v1_backup_path,
+        v2_backup_path,
     };
     use crate::contract::{FeedbackStats, MemoryKind, MemoryOrigin, MemoryScope};
     use crate::lifecycle::default_expiry;
@@ -986,13 +986,15 @@ mod tests {
         assert_eq!(retrieval.events.len(), 1);
         let backup = v1_backup_path(&path);
         assert_eq!(fs::read_to_string(&backup).expect("read backup"), original);
-        assert!(fs::read_dir(temp.path())
-            .expect("list migration directory")
-            .all(|entry| !entry
-                .expect("read migration entry")
-                .file_name()
-                .to_string_lossy()
-                .contains(".tmp-")));
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("list migration directory")
+                .all(|entry| !entry
+                    .expect("read migration entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-"))
+        );
 
         #[cfg(unix)]
         {

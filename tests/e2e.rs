@@ -1,9 +1,9 @@
 use std::fs;
 
-use opencode_native_memory::{
-    FeedbackEvent, FeedbackRequest, ForgetRequest, GetRequest, LifecycleResponse, ListRequest,
-    LockAction, LockRequest, MemoryConfig, MemoryEngine, MemoryKind, MemoryOrigin, MemoryScope,
-    MemoryTaxonomy, PinRequest, SearchRequest, StoreRequest, UpdateRequest,
+use opencode_memory::{
+    FeedbackEvent, FeedbackRequest, ForgetRequest, GetRequest, ListRequest, LockAction,
+    LockRequest, MemoryConfig, MemoryEngine, MemoryKind, MemoryOrigin, MemoryScope, MemoryTaxonomy,
+    PinRequest, SearchRequest, StoreRequest, UpdateRequest,
 };
 
 #[test]
@@ -193,10 +193,12 @@ fn stores_recalls_and_forgets_project_memory() {
             agent_scope_key: None,
         })
         .expect("list matching session family");
-    assert!(visible
-        .memories
-        .iter()
-        .any(|memory| memory.id == session_memory.id));
+    assert!(
+        visible
+            .memories
+            .iter()
+            .any(|memory| memory.id == session_memory.id)
+    );
 
     let forgotten = engine
         .forget(&ForgetRequest {
@@ -212,7 +214,7 @@ fn model_cache() -> std::path::PathBuf {
     std::env::var_os("OPENCODE_MEMORY_MODEL_CACHE").map_or_else(
         || {
             std::env::var_os("HOME").map_or_else(
-                || std::path::PathBuf::from(".fastembed_cache"),
+                || std::path::PathBuf::from(".cache/opencode/memory/models"),
                 |home| std::path::PathBuf::from(home).join(".cache/opencode/memory/models"),
             )
         },
@@ -663,10 +665,12 @@ fn taxonomy_filter_in_search_and_list() {
             agent_scope_key: None,
         })
         .expect("list decisions");
-    assert!(decisions
-        .memories
-        .iter()
-        .all(|m| m.taxonomy == MemoryTaxonomy::Decision));
+    assert!(
+        decisions
+            .memories
+            .iter()
+            .all(|m| m.taxonomy == MemoryTaxonomy::Decision)
+    );
 
     // List with taxonomy filter for WorkflowPref only.
     let prefs = engine
@@ -683,8 +687,10 @@ fn taxonomy_filter_in_search_and_list() {
             agent_scope_key: None,
         })
         .expect("list prefs");
-    assert!(prefs
-        .memories
-        .iter()
-        .all(|m| m.taxonomy == MemoryTaxonomy::WorkflowPref));
+    assert!(
+        prefs
+            .memories
+            .iter()
+            .all(|m| m.taxonomy == MemoryTaxonomy::WorkflowPref)
+    );
 }

@@ -13,8 +13,6 @@ use zvec_rust::{Collection, CollectionSchema, DataType, FieldSchema, IndexParams
 use crate::MemoryConfig;
 
 const COLLECTION_SCHEMA_VERSION: u32 = 1;
-pub(crate) const EMBEDDING_DIMENSION: usize = 384;
-pub(crate) const EMBEDDING_MODEL_NAME: &str = "intfloat/multilingual-e5-small";
 pub(crate) const RESULT_FIELDS: [&str; 8] = [
     "title",
     "content",
@@ -46,7 +44,12 @@ pub(crate) fn initialize() -> Result<()> {
         .map_err(|error| anyhow!("cannot initialize zvec: {error}"))
 }
 
-pub(crate) fn open_collection(config: &MemoryConfig, now_ms: i64) -> Result<Collection> {
+pub(crate) fn open_collection(
+    config: &MemoryConfig,
+    embedding_model: &str,
+    embedding_dimension: usize,
+    now_ms: i64,
+) -> Result<Collection> {
     let collection_path = config.collection_dir();
     let manifest_path = config.project_data_dir().join("manifest.json");
     let collection_path_text = path_text(&collection_path)?;
@@ -62,7 +65,7 @@ pub(crate) fn open_collection(config: &MemoryConfig, now_ms: i64) -> Result<Coll
                 .with_context(|| format!("cannot read {}", manifest_path.display()))?,
         )
         .with_context(|| format!("invalid memory manifest: {}", manifest_path.display()))?;
-        validate_manifest(config, &manifest)?;
+        validate_manifest(config, &manifest, embedding_model, embedding_dimension)?;
         return Collection::open(&collection_path_text, None).map_err(Into::into);
     }
 
@@ -71,14 +74,14 @@ pub(crate) fn open_collection(config: &MemoryConfig, now_ms: i64) -> Result<Coll
         "zvec collection exists without a manifest: {}; move it aside or restore its manifest",
         collection_path.display()
     );
-    let schema = collection_schema()?;
+    let schema = collection_schema(embedding_dimension)?;
     let collection = Collection::create_and_open(&collection_path_text, &schema, None)?;
     let manifest = Manifest {
         schema_version: COLLECTION_SCHEMA_VERSION,
         project_root: config.project_root().display().to_string(),
         project_id: config.project_id().to_string(),
-        embedding_model: EMBEDDING_MODEL_NAME.to_string(),
-        embedding_dimension: EMBEDDING_DIMENSION,
+        embedding_model: embedding_model.to_string(),
+        embedding_dimension,
         zvec_version: zvec_rust::version().clone(),
         created_at_ms: now_ms,
     };
@@ -139,7 +142,7 @@ pub(crate) fn ensure_write_succeeded(
     )
 }
 
-fn collection_schema() -> Result<CollectionSchema> {
+fn collection_schema(embedding_dimension: usize) -> Result<CollectionSchema> {
     Ok(CollectionSchema::builder("opencode_project_memory")
         .add_field(FieldSchema::new("title", DataType::String, false, 0)?)
         .add_field(FieldSchema::new("content", DataType::String, false, 0)?)
@@ -166,14 +169,19 @@ fn collection_schema() -> Result<CollectionSchema> {
         .add_vector_field(
             "embedding",
             DataType::VectorFp32,
-            u32::try_from(EMBEDDING_DIMENSION)?,
+            u32::try_from(embedding_dimension)?,
             IndexParams::hnsw(MetricType::Cosine, 16, 200)?,
         )
         .max_doc_count_per_segment(10_000)
         .build()?)
 }
 
-fn validate_manifest(config: &MemoryConfig, manifest: &Manifest) -> Result<()> {
+fn validate_manifest(
+    config: &MemoryConfig,
+    manifest: &Manifest,
+    embedding_model: &str,
+    embedding_dimension: usize,
+) -> Result<()> {
     ensure!(
         manifest.schema_version == COLLECTION_SCHEMA_VERSION,
         "unsupported memory schema version {}; expected {COLLECTION_SCHEMA_VERSION}",
@@ -184,9 +192,13 @@ fn validate_manifest(config: &MemoryConfig, manifest: &Manifest) -> Result<()> {
         "memory collection belongs to a different project"
     );
     ensure!(
-        manifest.embedding_model == EMBEDDING_MODEL_NAME
-            && manifest.embedding_dimension == EMBEDDING_DIMENSION,
-        "memory embedding model mismatch; migrate or remove the project collection"
+        manifest.embedding_model == embedding_model
+            && manifest.embedding_dimension == embedding_dimension,
+        "memory embedding model mismatch: collection uses {} ({} dimensions), configured model is {} ({} dimensions); changing models requires re-indexing the project collection",
+        manifest.embedding_model,
+        manifest.embedding_dimension,
+        embedding_model,
+        embedding_dimension
     );
     Ok(())
 }

@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile, readdir, realpath, rename, stat, writeFile, mkdir } from "node:fs/promises";
+import {
+  lstat,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  stat,
+  writeFile,
+  mkdir,
+} from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import YAML from "yaml";
 import type { MemoryRecord, SharedMemoryRecord } from "./contracts.js";
@@ -113,10 +122,7 @@ export function parseSharedMemory(source: string, input: string): SharedMemoryRe
   };
 }
 
-export async function writeSharedMemory(
-  worktree: string,
-  memory: MemoryRecord,
-): Promise<string> {
+export async function writeSharedMemory(worktree: string, memory: MemoryRecord): Promise<string> {
   const canonicalRoot = await realpath(worktree);
   const opencodeDirectory = resolve(canonicalRoot, ".opencode");
   await ensureRealDirectory(opencodeDirectory);
@@ -177,18 +183,11 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isStringArray(
-  value: unknown,
-  maxItems: number,
-  maxLength: number,
-): value is string[] {
+function isStringArray(value: unknown, maxItems: number, maxLength: number): value is string[] {
   return (
     Array.isArray(value) &&
     value.length <= maxItems &&
-    value.every(
-      (item) =>
-        typeof item === "string" && item.length > 0 && item.length <= maxLength,
-    )
+    value.every((item) => typeof item === "string" && item.length > 0 && item.length <= maxLength)
   );
 }
 

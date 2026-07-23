@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    name: Native ${{ matrix.package }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            package: darwin-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            package: darwin-x64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: linux-x64-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package: linux-arm64-gnu
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: win32-x64-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+
+      - name: Setup Protobuf
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ github.token }}
+
+      - name: Install dependencies
+        run: bun ci
+
+      - name: Validate versions
+        run: bun run versions:check
+
+      - name: Build native sidecar
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage native npm package
+        run: bun scripts/stage-native.ts --target ${{ matrix.target }} --profile release --destination npm/${{ matrix.package }}
+
+      - name: Pack native npm package
+        working-directory: npm/${{ matrix.package }}
+        run: npm pack --json
+
+      - name: Upload native package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.package }}
+          path: npm/${{ matrix.package }}/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish npm and GitHub release
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Rust metadata toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.88.0
+
+      - name: Setup Protobuf
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ github.token }}
+
+      - name: Download native packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Install dependencies and validate tag
+        run: |
+          bun ci
+          bun run versions:check
+          VERSION=$(node -p "require('./package.json').version")
+          test "$RELEASE_TAG" = "v$VERSION"
+
+      - name: Build and test umbrella package
+        run: bun run build && bun run test:ts && bun run pack:check
+
+      - name: Publish native packages with provenance
+        run: |
+          for TARBALL in artifacts/*.tgz; do
+            PACKAGE=$(tar -xOf "$TARBALL" package/package.json | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).name))')
+            VERSION=$(node -p "require('./package.json').version")
+            npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "$TARBALL" --access public --provenance
+          done
+
+      - name: Pack and publish umbrella package
+        id: pack
+        run: |
+          npm pack --json > npm-pack.json
+          TARBALL=$(node -e "process.stdout.write(require('./npm-pack.json')[0].filename)")
+          VERSION=$(node -p "require('./package.json').version")
+          PACKAGE=$(node -p "require('./package.json').name")
+          npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "$TARBALL" --access public --provenance
+          sha256sum "$TARBALL" > "$TARBALL.sha256"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$TARBALL" "$TARBALL.sha256" artifacts/*.tgz --clobber
+          else
+            gh release create "$RELEASE_TAG" "$TARBALL" "$TARBALL.sha256" artifacts/*.tgz \
+              --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi

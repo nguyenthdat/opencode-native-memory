@@ -1,0 +1,9 @@
+dist/
+target/
+node_modules/
+opencode-memory/src/generated/
+_workspace/
+.opencode/
+.qdrant/
+notices/
+Cargo.lock

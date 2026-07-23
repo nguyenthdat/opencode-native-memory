@@ -1,0 +1,24 @@
+{
+  "name": "@nguyenthdat/opencode-memory-linux-x64-gnu",
+  "version": "0.2.0",
+  "description": "Native OpenCode memory sidecar for Linux x64 glibc",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin",
+    "notices",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -9,6 +9,24 @@ export const MEMORY_KINDS = [
 
 export const MEMORY_SCOPES = ["session", "agent", "project", "repository"] as const;
 
+export const MEMORY_TAXONOMIES = [
+  "task_attempt",
+  "tool_call",
+  "session_summary",
+  "architecture_fact",
+  "codebase_fact",
+  "user_fact",
+  "fix_pattern",
+  "code_template",
+  "tool_heuristic",
+  "code_style",
+  "library_pref",
+  "workflow_pref",
+  "decision",
+  "team_convention",
+  "project_standard",
+] as const;
+
 export const WRITABLE_MEMORY_SCOPES = ["session", "agent", "project"] as const;
 
 export const FEEDBACK_EVENTS = ["used", "ignored", "error"] as const;
@@ -28,6 +46,9 @@ export const UNLOCK_FORBIDDEN_FIELDS = [
   "clear_expiry",
   "code_paths",
   "pinned",
+  "taxonomy",
+  "confidence",
+  "conflict_with",
 ] as const;
 
 export interface MemoryRecord {
@@ -55,6 +76,11 @@ export interface MemoryRecord {
   pinned: boolean;
   locked: boolean;
   lock_reason?: string | null;
+  taxonomy: (typeof MEMORY_TAXONOMIES)[number];
+  confidence: number;
+  superseded_by?: string | null;
+  supersedes?: string[];
+  conflict_with?: string[];
 }
 
 export interface SearchResponse {
@@ -105,14 +131,14 @@ export interface SharedSyncResponse {
 export interface RpcResponse {
   id: number;
   ok: boolean;
-  result?: unknown;
-  error?: string;
+  result?: unknown | undefined;
+  error?: string | undefined;
 }
 
 export interface PendingRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
-  abort?: () => void;
-  signal?: AbortSignal;
+  abort?: (() => void) | undefined;
+  signal?: AbortSignal | undefined;
 }

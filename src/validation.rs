@@ -5,14 +5,14 @@ use std::fs;
 use std::path::{Component, Path};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
+use crate::MemoryConfig;
 use crate::config::hash_hex;
 use crate::contract::{
     CodeAnchor, MemoryKind, MemoryOrigin, MemoryScope, SearchRequest, StoreRequest,
 };
 use crate::taxonomy::MemoryTaxonomy;
-use crate::MemoryConfig;
 
 pub(crate) const MAX_SEARCH_RESULTS: usize = 20;
 pub(crate) const MAX_LIST_RESULTS: usize = 100;
@@ -478,14 +478,9 @@ fn looks_like_secret_value(value: &str) -> bool {
 
 fn contains_instruction_injection(content: &str) -> bool {
     let lower = content.to_lowercase();
-    if [
-        "<memory-policy",
-        "<project-memory",
-        "<system",
-        "<developer",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    if ["<memory-policy", "<project-memory", "<system", "<developer"]
+        .iter()
+        .any(|marker| lower.contains(marker))
     {
         return true;
     }

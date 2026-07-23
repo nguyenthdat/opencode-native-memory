@@ -1,7 +1,20 @@
+import { fileURLToPath } from "node:url";
+import { basename, dirname, resolve } from "node:path";
+import { createMemoryPlugin } from "./plugin.js";
+
+const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+const packageRoot =
+  basename(moduleDirectory) === "dist"
+    ? resolve(moduleDirectory, "..")
+    : resolve(moduleDirectory, "../..");
+
+export default createMemoryPlugin({ root: packageRoot });
+
 // Contracts and constants
 export {
   MEMORY_KINDS,
   MEMORY_SCOPES,
+  MEMORY_TAXONOMIES,
   WRITABLE_MEMORY_SCOPES,
   FEEDBACK_EVENTS,
   LOCK_ACTIONS,
@@ -24,10 +37,14 @@ export {
   NativeMemoryClient,
   resolveNativeMemoryBinary,
   REQUEST_TIMEOUT_MS,
+  INITIALIZATION_TIMEOUT_MS,
   MAX_REQUEST_BYTES,
   MAX_RESPONSE_BYTES,
 } from "./sidecar-client.js";
 export type { SpawnFn } from "./sidecar-client.js";
+
+export { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";
+export type { MemoryMethod } from "./protocol.js";
 
 // Plugin factory
 export { createMemoryPlugin } from "./plugin.js";

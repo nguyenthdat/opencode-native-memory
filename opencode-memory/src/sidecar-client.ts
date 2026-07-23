@@ -1,18 +1,31 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { spawn as nodeSpawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import type { PendingRequest, RpcResponse } from "./contracts.js";
+import { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";
+import type { MemoryMethod } from "./protocol.js";
 
 const MiB = 1024 * 1024;
 
 export const REQUEST_TIMEOUT_MS = 300_000;
+export const INITIALIZATION_TIMEOUT_MS = 30 * 60_000;
 export const MAX_REQUEST_BYTES = 32 * MiB;
 export const MAX_RESPONSE_BYTES = 32 * MiB;
 const MAX_STDERR_BYTES = 8_192;
 const MAX_HANDSHAKE_RESTARTS = 1;
 
-const SUPPORTED_RPC_VERSION = 1;
+const SUPPORTED_RPC_VERSION = 2;
+const require = createRequire(import.meta.url);
+
+const NATIVE_PACKAGES: Partial<Record<string, string>> = {
+  "darwin-arm64": "@nguyenthdat/opencode-memory-darwin-arm64",
+  "darwin-x64": "@nguyenthdat/opencode-memory-darwin-x64",
+  "linux-arm64": "@nguyenthdat/opencode-memory-linux-arm64-gnu",
+  "linux-x64": "@nguyenthdat/opencode-memory-linux-x64-gnu",
+  "win32-x64": "@nguyenthdat/opencode-memory-win32-x64-msvc",
+};
 
 export type SpawnFn = (
   binary: string,
@@ -27,11 +40,14 @@ export type SpawnFn = (
 
 export function resolveNativeMemoryBinary(root: string): string {
   const override = process.env.OPENCODE_NATIVE_MEMORY_BIN;
+  const binaryName = process.platform === "win32" ? "opencode-memory.exe" : "opencode-memory";
+  const packaged = resolvePackagedBinary(binaryName);
   const candidates = override
     ? [resolve(override)]
     : [
-        resolve(root, "target", "release", "opencode-memory"),
-        resolve(root, "target", "debug", "opencode-memory"),
+        resolve(root, "target", "release", binaryName),
+        resolve(root, "target", "debug", binaryName),
+        ...(packaged ? [packaged] : []),
       ];
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
@@ -41,17 +57,25 @@ export function resolveNativeMemoryBinary(root: string): string {
         binary,
         "..",
         "memory-libs",
-        process.platform === "darwin"
-          ? "libzvec_c_api.dylib"
-          : "libzvec_c_api.so",
+        process.platform === "darwin" ? "libzvec_c_api.dylib" : "libzvec_c_api.so",
       );
       if (!existsSync(library)) continue;
     }
     return binary;
   }
   throw new Error(
-    `Native memory binary was not found. Run \`bun run memory:build:release\`. Checked: ${candidates.join(", ")}`,
+    `Native memory binary was not found. Reinstall with optional dependencies or run \`bun run build:native:release\`. Checked: ${candidates.join(", ")}`,
   );
+}
+
+function resolvePackagedBinary(binaryName: string): string | undefined {
+  const packageName = NATIVE_PACKAGES[`${process.platform}-${process.arch}`];
+  if (!packageName) return undefined;
+  try {
+    return require.resolve(`${packageName}/bin/${binaryName}`);
+  } catch {
+    return undefined;
+  }
 }
 
 interface ProcessState {
@@ -90,11 +114,7 @@ export class NativeMemoryClient {
 
   // ---- Public API ---------------------------------------------------------
 
-  async request<T>(
-    method: string,
-    params: unknown = {},
-    signal?: AbortSignal,
-  ): Promise<T> {
+  async request<T>(method: MemoryMethod, params: unknown = {}, signal?: AbortSignal): Promise<T> {
     if (this.disposed) throw new Error("Native memory client is disposed");
     if (signal?.aborted) throw new Error("Native memory request was cancelled");
 
@@ -109,18 +129,14 @@ export class NativeMemoryClient {
       } catch (error) {
         if (error instanceof ProcessReplacedError) {
           if (restart < MAX_HANDSHAKE_RESTARTS) continue;
-          throw new Error(
-            "Native memory sidecar exited repeatedly during protocol handshake",
-          );
+          throw new Error("Native memory sidecar exited repeatedly during protocol handshake");
         }
         throw error;
       }
       if (signal?.aborted) throw new Error("Native memory request was cancelled");
       if (!this.isCurrentAndRunning(process)) {
         if (restart < MAX_HANDSHAKE_RESTARTS) continue;
-        throw new Error(
-          "Native memory sidecar exited repeatedly during protocol handshake",
-        );
+        throw new Error("Native memory sidecar exited repeatedly during protocol handshake");
       }
       return await this.sendRequest<T>(process, method, params, signal);
     }
@@ -173,21 +189,19 @@ export class NativeMemoryClient {
 
   private sendRequest<T>(
     process: ProcessState,
-    method: string,
+    method: MemoryMethod,
     params: unknown = {},
     signal?: AbortSignal,
+    timeoutMs = this.requestTimeoutMs,
   ): Promise<T> {
     if (!this.isCurrentAndRunning(process)) {
-      throw new ProcessReplacedError(
-        "Native memory process changed before the request was sent",
-      );
+      throw new ProcessReplacedError("Native memory process changed before the request was sent");
     }
     if (signal?.aborted) throw new Error("Native memory request was cancelled");
 
     const id = this.nextID++;
-    const payload = `${JSON.stringify({ id, method, params })}\n`;
-
-    const payloadBytes = Buffer.byteLength(payload, "utf8");
+    const payload = encodeRequest(id, method, params);
+    const payloadBytes = payload.byteLength;
     if (payloadBytes > MAX_REQUEST_BYTES) {
       throw new Error(
         `Native memory request payload exceeds ${MAX_REQUEST_BYTES} bytes (was ${payloadBytes})`,
@@ -195,14 +209,12 @@ export class NativeMemoryClient {
     }
 
     return new Promise<T>((resolveRequest, rejectRequest) => {
-      const timeout = this.requestTimeoutMs;
+      const timeout = timeoutMs;
       const timer = setTimeout(() => {
         const active = this.pending.get(id);
         if (!active) return;
         this.finishPending(id, active);
-        rejectRequest(
-          new Error(`Native memory ${method} timed out after ${timeout} ms`),
-        );
+        rejectRequest(new Error(`Native memory ${method} timed out after ${timeout} ms`));
       }, timeout);
       timer.unref?.();
 
@@ -228,19 +240,14 @@ export class NativeMemoryClient {
         const active = this.pending.get(id);
         if (!active) return;
         this.finishPending(id, active);
-        active.reject(
-          new Error(`Cannot write native memory request: ${error.message}`),
-        );
+        active.reject(new Error(`Cannot write native memory request: ${error.message}`));
       });
     });
   }
 
   // ---- Internal: handshake ------------------------------------------------
 
-  private async waitForHandshake(
-    process: ProcessState,
-    signal?: AbortSignal,
-  ): Promise<void> {
+  private async waitForHandshake(process: ProcessState, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) {
       throw new Error("Native memory request was cancelled");
     }
@@ -287,19 +294,19 @@ export class NativeMemoryClient {
     handshake.promise = Promise.resolve().then(async () => {
       const status = await this.sendRequest<{
         rpc_protocol_version: number;
-      }>(process, "status", {});
+      }>(process, "status", {}, undefined, INITIALIZATION_TIMEOUT_MS);
       const protocolVer = status.rpc_protocol_version;
       if (protocolVer !== SUPPORTED_RPC_VERSION) {
         if (protocolVer === undefined || protocolVer === null) {
           throw new Error(
             `Native memory backend does not report its RPC protocol version. ` +
-              `Run \`bun run memory:build:release\` to rebuild the binary.`,
+              `Run \`bun run build:native:release\` to rebuild the binary.`,
           );
         }
         throw new Error(
           `Native memory RPC protocol version mismatch: ` +
             `client supports ${SUPPORTED_RPC_VERSION}, backend reports ${protocolVer}. ` +
-            `Run \`bun run memory:build:release\` to rebuild the binary.`,
+            `Run \`bun run build:native:release\` to rebuild the binary.`,
         );
       }
     });
@@ -330,37 +337,18 @@ export class NativeMemoryClient {
     this.process = { child, generation: gen };
     this.handshake = undefined;
 
-    let stdoutChunks: Buffer[] = [];
-    let stdoutBytes = 0;
+    const frameDecoder = new DelimitedFrameDecoder(MAX_RESPONSE_BYTES);
     let stderr = "";
     const processState = this.process;
 
     child.stdout.on("data", (chunk: Buffer) => {
-      let offset = 0;
-      while (offset < chunk.length) {
-        const newline = chunk.indexOf(0x0a, offset);
-        const end = newline < 0 ? chunk.length : newline;
-        const segment = chunk.subarray(offset, end);
-        if (stdoutBytes + segment.length > MAX_RESPONSE_BYTES) {
-          this.failProcess(
-            processState,
-            new Error(`Native memory response exceeds ${MAX_RESPONSE_BYTES} bytes`),
-          );
-          return;
+      try {
+        for (const frame of frameDecoder.push(chunk)) {
+          this.handleFrame(frame, gen, processState);
         }
-        if (segment.length > 0) {
-          stdoutChunks.push(segment);
-          stdoutBytes += segment.length;
-        }
-        if (newline < 0) return;
-        const frame =
-          stdoutChunks.length === 1
-            ? stdoutChunks[0]!
-            : Buffer.concat(stdoutChunks, stdoutBytes);
-        this.handleLine(frame.toString("utf8"), gen, processState);
-        stdoutChunks = [];
-        stdoutBytes = 0;
-        offset = newline + 1;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.failProcess(processState, new Error(detail));
       }
     });
 
@@ -369,21 +357,12 @@ export class NativeMemoryClient {
     });
 
     child.stdin.on("error", (error: Error) => {
-      this.failProcess(
-        processState,
-        new Error(`Native memory stdin failed: ${error.message}`),
-      );
+      this.failProcess(processState, new Error(`Native memory stdin failed: ${error.message}`));
     });
 
     child.once("error", (error: NodeJS.ErrnoException) => {
-      const hint =
-        error.code === "ENOENT"
-          ? "Run `bun run memory:build:release`."
-          : error.message;
-      this.failProcess(
-        processState,
-        new Error(`Native memory failed to start: ${hint}`),
-      );
+      const hint = error.code === "ENOENT" ? "Run `bun run memory:build:release`." : error.message;
+      this.failProcess(processState, new Error(`Native memory failed to start: ${hint}`));
     });
 
     child.once("exit", (code: number | null, signal: string | null) => {
@@ -391,9 +370,7 @@ export class NativeMemoryClient {
       if (this.handshake?.generation === gen) this.handshake = undefined;
       this.rejectGeneration(
         gen,
-        new ProcessReplacedError(
-          `Native memory exited with ${code ?? signal ?? "unknown status"}`,
-        ),
+        new ProcessReplacedError(`Native memory exited with ${code ?? signal ?? "unknown status"}`),
       );
     });
 
@@ -413,35 +390,26 @@ export class NativeMemoryClient {
     return processState;
   }
 
-  // ---- Internal: line handling (generation-aware) -------------------------
+  // ---- Internal: Protobuf frame handling (generation-aware) ---------------
 
-  private handleLine(line: string, gen: number, process: ProcessState): void {
+  private handleFrame(frame: Uint8Array, gen: number, process: ProcessState): void {
     let response: RpcResponse;
     try {
-      response = JSON.parse(line) as RpcResponse;
+      response = decodeResponse(frame);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      this.failProcess(
-        process,
-        new Error(`Native memory returned invalid JSON: ${detail}`),
-      );
+      this.failProcess(process, new Error(`Native memory returned invalid Protobuf: ${detail}`));
       return;
     }
 
     // An id=0 error applies to the whole protocol generation.
     if (response.id === 0) {
-      this.failProcess(
-        process,
-        new Error(response.error || "Native memory protocol error"),
-      );
+      this.failProcess(process, new Error(response.error || "Native memory protocol error"));
       return;
     }
 
     if (!Number.isSafeInteger(response.id) || typeof response.ok !== "boolean") {
-      this.failProcess(
-        process,
-        new Error("Native memory returned an invalid response"),
-      );
+      this.failProcess(process, new Error("Native memory returned an invalid response"));
       return;
     }
 
@@ -450,16 +418,10 @@ export class NativeMemoryClient {
     if (!pending || pending.generation !== gen) return;
     this.finishPending(response.id, pending);
     if (response.ok) pending.resolve(response.result);
-    else
-      pending.reject(
-        new Error(response.error || "Native memory operation failed"),
-      );
+    else pending.reject(new Error(response.error || "Native memory operation failed"));
   }
 
-  private finishPending(
-    id: number,
-    pending: PendingRequest & { generation: number },
-  ): void {
+  private finishPending(id: number, pending: PendingRequest & { generation: number }): void {
     this.pending.delete(id);
     clearTimeout(pending.timer);
     if (pending.signal && pending.abort) {
@@ -491,10 +453,7 @@ export class NativeMemoryClient {
   }
 }
 
-function stopProcessTree(
-  child: ChildProcessWithoutNullStreams,
-  signal: NodeJS.Signals,
-): void {
+function stopProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
   if (!child.pid) return;
   if (child.exitCode !== null || child.signalCode !== null) return;
   if (process.platform !== "win32") {

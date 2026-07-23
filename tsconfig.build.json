@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./opencode-memory/src",
+    "outDir": "./dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["opencode-memory/src/**/*.ts"],
+  "exclude": ["opencode-memory/src/**/*.test.ts", "tests", "dist", "node_modules"]
+}

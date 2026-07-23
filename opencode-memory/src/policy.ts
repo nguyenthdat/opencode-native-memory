@@ -62,18 +62,14 @@ export function truncateText(value: string, maxCharacters: number): string {
   return `${characters.slice(0, maxCharacters - 16).join("")}\n...[truncated]`;
 }
 
-export function contextBudgetChars(model: {
-  limit?: { context?: number };
-}): number {
+export function contextBudgetChars(model: { limit?: { context?: number } }): number {
   const context = model.limit?.context;
   if (!context || !Number.isFinite(context)) return 6_000;
   return Math.max(2_400, Math.min(12_000, Math.floor(context * 0.08)));
 }
 
 export function safeJson(value: unknown): string {
-  return JSON.stringify(value, null, 2)
-    .replaceAll("<", "\\u003c")
-    .replaceAll(">", "\\u003e");
+  return JSON.stringify(value, null, 2).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e");
 }
 
 export function parseCuratedCandidates(content: string): CuratedCandidate[] {
@@ -91,14 +87,7 @@ export function parseCuratedCandidates(content: string): CuratedCandidate[] {
   const candidates: CuratedCandidate[] = [];
   for (const value of parsed) {
     if (!isObject(value)) return [];
-    const allowed = new Set([
-      "title",
-      "content",
-      "kind",
-      "importance",
-      "tags",
-      "code_paths",
-    ]);
+    const allowed = new Set(["title", "content", "kind", "importance", "tags", "code_paths"]);
     if (Object.keys(value).some((key) => !allowed.has(key))) return [];
     if (
       typeof value.title !== "string" ||
@@ -134,17 +123,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isStringArray(
-  value: unknown,
-  maxItems: number,
-  maxLength: number,
-): value is string[] {
+function isStringArray(value: unknown, maxItems: number, maxLength: number): value is string[] {
   return (
     Array.isArray(value) &&
     value.length <= maxItems &&
-    value.every(
-      (item) =>
-        typeof item === "string" && item.length > 0 && item.length <= maxLength,
-    )
+    value.every((item) => typeof item === "string" && item.length > 0 && item.length <= maxLength)
   );
 }

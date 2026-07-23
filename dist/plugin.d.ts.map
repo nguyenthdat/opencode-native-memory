@@ -1,0 +1,1 @@
+{"version":3,"file":"plugin.d.ts","sourceRoot":"","sources":["../opencode-memory/src/plugin.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,MAAM,EAAc,MAAM,qBAAqB,CAAC;AAkC9D,MAAM,WAAW,mBAAmB;IAClC,IAAI,EAAE,MAAM,CAAC;IACb,MAAM,CAAC,EAAE,OAAO,CAAC;CAClB;AAED,wBAAgB,kBAAkB,CAAC,OAAO,EAAE,mBAAmB,GAAG,MAAM,CA4tBvE"}

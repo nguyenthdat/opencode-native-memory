@@ -5,16 +5,17 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use zvec_rust::{Doc, Fts, SearchQuery};
 
-use super::{decorate_memory, now_ms, stored_memory_from_doc, MemoryEngine, StoredMemory};
+use super::{MemoryEngine, StoredMemory, decorate_memory, now_ms, stored_memory_from_doc};
 use crate::config::hash_hex;
 use crate::contract::{
     MemoryKind, MemoryRecord, MemoryScope, ScoreBreakdown, SearchRequest, SearchResponse,
 };
+use crate::embedding::Embedder;
 use crate::lifecycle::{is_expired, retention_factor};
 use crate::storage::state::{MemoryMetadata, RetrievalRecord};
 use crate::storage::zvec::RESULT_FIELDS;
 use crate::validation::{
-    truncate_chars, validate_search_request, MAX_BUDGET_CHARS, MAX_SEARCH_RESULTS, MIN_BUDGET_CHARS,
+    MAX_BUDGET_CHARS, MAX_SEARCH_RESULTS, MIN_BUDGET_CHARS, truncate_chars, validate_search_request,
 };
 
 const SCORE_VERSION: &str = "hybrid_v3_taxonomy";
@@ -48,7 +49,7 @@ impl MemoryEngine {
             ));
         }
 
-        let query_embedding = self.embed(&format!("query: {query_text}"))?;
+        let query_embedding = self.embedder.embed_query(&query_text)?;
         let candidate_count = usize::try_from(stats.doc_count)
             .unwrap_or(MAX_CANDIDATES)
             .min(MAX_CANDIDATES);
@@ -485,8 +486,8 @@ fn kind_filter(kinds: &[MemoryKind]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deduplicate_layers, kind_filter, lexical_score, logistic, normalized_reciprocal_rank,
-        RankedMemory,
+        RankedMemory, deduplicate_layers, kind_filter, lexical_score, logistic,
+        normalized_reciprocal_rank,
     };
     use crate::contract::{FeedbackStats, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope};
 

@@ -1,56 +1,170 @@
 # OpenCode Native Memory
 
-This crate is the persistent Rust sidecar used by the local OpenCode custom
-plugin. It is not an MCP server.
+Local-first persistent memory for OpenCode. The plugin runs a native Rust sidecar, stores project-scoped memories in zvec, and embeds text locally with llama.cpp. No memory content or embedding request is sent to a hosted inference service.
 
-The process accepts bounded newline-delimited JSON requests on stdin and writes
-one JSON response per line on stdout. It keeps one `zvec` collection, one
-atomic lifecycle-state ledger, and one `multilingual-e5-small` embedding model
-alive for the lifetime of OpenCode. RPC methods cover search, store, get, list,
-update, delete/forget, purge, feedback, shared-Markdown synchronization,
-optimize, doctor, status, and shutdown.
+## Highlights
 
-Data is scoped by the canonical Git worktree and stored under
-`$XDG_DATA_HOME/opencode/memory` (or `~/.local/share/...`). Models are
-cached under `$XDG_CACHE_HOME/opencode/memory/models`.
+- Hybrid dense, lexical, metadata, and feedback-aware retrieval
+- Local GGUF embeddings through `utilityai/llama-cpp-rs`
+- Default pinned `Qwen3-Embedding-4B` model from Hugging Face
+- Session-family, agent, project, and repository scopes
+- Durable taxonomy, confidence, supersession, conflict, pin, lock, expiry, and tombstone metadata
+- Markdown-backed shared repository memory under `.opencode/memory/`
+- Length-delimited Protobuf protocol between TypeScript and Rust
+- Native sidecar packages for macOS, Linux, and Windows
 
-```bash
-bun run memory:build:release
-bun run memory:warmup
+## Install
+
+Add the plugin to `opencode.json` or `opencode.jsonc`:
+
+```json
+{
+  "plugin": ["@nguyenthdat/opencode-memory@0.2.0"]
+}
 ```
 
-The first warmup downloads the local ONNX embedding model. Later starts are
-offline. Override paths with `OPENCODE_MEMORY_DATA_DIR`,
-`OPENCODE_MEMORY_MODEL_CACHE`, and `OPENCODE_MEMORY_PROJECT_ROOT`.
+npm installs one matching optional native package for the current platform. Reinstall without `--omit=optional`; the plugin intentionally has no postinstall script or runtime binary download.
 
-The sidecar rejects likely credentials and instruction-shaped untrusted memory,
-bounds all inputs/results, flushes writes, and holds a per-project single-writer
-lock. Its additive `state.json` tracks session/agent/project/repository scopes,
-per-kind TTL and decay, tombstones, code-file hashes, idempotent retrieval
-feedback, and local lifecycle controls while preserving zvec schema v1
-collections. Status responses include `rpc_protocol_version: 1`.
+Supported packages:
 
-State schema v2 adds `pinned`, `locked`, and `lock_reason` to each lifecycle
-record. Opening a v1 state performs a typed migration before model startup,
-preserves records, tombstones, retrievals, pending deletes, and generation, and
-atomically writes v2 only after creating a private, fsynced,
-non-overwriting `state.v1.backup.json`. Future schema versions are rejected
-without changing `state.json`. The zvec collection manifest and shared Markdown
-format remain schema v1.
+| OS          | Architecture | Native package                                 |
+| ----------- | ------------ | ---------------------------------------------- |
+| macOS       | ARM64        | `@nguyenthdat/opencode-memory-darwin-arm64`    |
+| macOS       | x64          | `@nguyenthdat/opencode-memory-darwin-x64`      |
+| Linux glibc | ARM64        | `@nguyenthdat/opencode-memory-linux-arm64-gnu` |
+| Linux glibc | x64          | `@nguyenthdat/opencode-memory-linux-x64-gnu`   |
+| Windows     | x64 MSVC     | `@nguyenthdat/opencode-memory-win32-x64-msvc`  |
 
-Pinned memories bypass expiry and retention decay, but still pass normal scope,
-staleness, relevance, and safety checks. Locked local memories reject protected
-content/lifecycle changes, store overwrite, delete, and forget until an explicit
-lifecycle-only unlock. Repository-scoped memories cannot be pinned or locked by
-RPC. `optimize` retains pinned and locked entries; project-confirmed `purge`
-remains the explicit store-wide escape hatch.
+The first memory operation downloads the default GGUF model into the local model cache. Override `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH` to use an existing local model and avoid a network download.
 
-Search runs independent dense and lexical channels, calibrates their scores,
-filters expired/stale/wrong-scope records, deduplicates layered copies, applies
-MMR diversity, and packs a variable number of results into a caller-provided
-character budget. Low-confidence searches abstain instead of injecting the
-top-ranked record unconditionally.
+Add `rules/flow.md` to the project instructions if memory tool usage should be explicit for every agent.
 
-The writer lock is held for the engine lifetime. Multiple parent and subagent
-sessions inside one OpenCode process share the sidecar, but a second OpenCode
-process cannot open the same worktree's memory concurrently.
+## Memory Tools
+
+| Tool              | Purpose                                              |
+| ----------------- | ---------------------------------------------------- |
+| `memory_search`   | Retrieve relevant memories within a context budget   |
+| `memory_store`    | Store a verified durable memory                      |
+| `memory_get`      | Fetch complete records by ID                         |
+| `memory_list`     | Review/filter lifecycle-indexed memories             |
+| `memory_update`   | Correct semantic content or lifecycle metadata       |
+| `memory_pin`      | Pin or unpin without re-embedding                    |
+| `memory_lock`     | Lock or unlock without re-embedding                  |
+| `memory_delete`   | Delete records, with tombstones by default           |
+| `memory_promote`  | Promote reviewed local memory to repository Markdown |
+| `memory_feedback` | Record whether recalled memories were useful         |
+| `memory_optimize` | Prune expired records and optimize indexes           |
+| `memory_status`   | Inspect backend, model, and schema status            |
+| `memory_doctor`   | Run shallow or deep integrity checks                 |
+| `memory_purge`    | Confirm and delete the complete project store        |
+
+The 15 stable taxonomy values are `task_attempt`, `tool_call`, `session_summary`, `architecture_fact`, `codebase_fact`, `user_fact`, `fix_pattern`, `code_template`, `tool_heuristic`, `code_style`, `library_pref`, `workflow_pref`, `decision`, `team_convention`, and `project_standard`.
+
+## Embedding Models
+
+The default is:
+
+- Repository: `Qwen/Qwen3-Embedding-4B-GGUF`
+- File: `Qwen3-Embedding-4B-Q4_K_M.gguf`
+- Revision: `f4602530db1d980e16da9d7d3a70294cf5c190be`
+- Native dimension: 2560
+- Pooling: last token
+- Normalization: L2
+
+"Any Hugging Face model" means any **GGUF embedding model compatible with the bundled llama.cpp revision**. Safetensors-only repositories are not loaded directly. Model templates and pooling must match the chosen model.
+
+Changing model identity or embedding dimension requires rebuilding the project's vector index. The sidecar rejects a mismatched existing collection instead of silently mixing incompatible vectors.
+
+### Environment
+
+| Variable                                     | Default / purpose                                                            |
+| -------------------------------------------- | ---------------------------------------------------------------------------- |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH`       | Local GGUF path; bypasses Hugging Face                                       |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_REPO`       | `Qwen/Qwen3-Embedding-4B-GGUF`                                               |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_FILE`       | `Qwen3-Embedding-4B-Q4_K_M.gguf`                                             |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_REVISION`   | Pinned Hugging Face commit                                                   |
+| `OPENCODE_MEMORY_EMBEDDING_POOLING`          | `last`; accepts `unspecified`, `mean`, `cls`, `last`                         |
+| `OPENCODE_MEMORY_EMBEDDING_ATTENTION`        | `causal`; accepts `unspecified`, `causal`, `non_causal`                      |
+| `OPENCODE_MEMORY_EMBEDDING_QUERY_TEMPLATE`   | Query instruction containing `{text}`                                        |
+| `OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE` | `{text}`                                                                     |
+| `OPENCODE_MEMORY_EMBEDDING_ADD_BOS`          | `true`                                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_APPEND_EOS`       | `true`                                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_NORMALIZE`        | `true`                                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_DIMENSION`        | Native model dimension; lower values use MRL truncation then renormalization |
+| `OPENCODE_MEMORY_EMBEDDING_CONTEXT_SIZE`     | `8192`                                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_THREADS`          | Available parallelism                                                        |
+| `OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS`       | All layers when GPU offload is supported, otherwise `0`                      |
+| `OPENCODE_MEMORY_PROJECT_ROOT`               | Override project discovery root                                              |
+| `OPENCODE_MEMORY_DATA_DIR`                   | Override project store base directory                                        |
+| `OPENCODE_MEMORY_MODEL_CACHE`                | Override local Hugging Face model cache                                      |
+| `OPENCODE_NATIVE_MEMORY_BIN`                 | Development/debug sidecar override                                           |
+
+Example local model:
+
+```sh
+export OPENCODE_MEMORY_EMBEDDING_MODEL_PATH="$HOME/models/nomic-embed-text-v1.5.Q5_K_M.gguf"
+export OPENCODE_MEMORY_EMBEDDING_POOLING="mean"
+export OPENCODE_MEMORY_EMBEDDING_QUERY_TEMPLATE="search_query: {text}"
+export OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE="search_document: {text}"
+```
+
+## Storage and Sharing
+
+Private state uses the platform data directory under `opencode/memory/<project-id>/`. Models use the platform cache directory under `opencode/memory/models/`.
+
+Repository memory is canonical Markdown in:
+
+```text
+.opencode/memory/
+  architecture.md
+  conventions.md
+  gotchas.md
+  decisions/
+```
+
+Shared Markdown is treated as untrusted data: paths are contained under `.opencode/memory`, YAML is parsed with a strict schema, instruction-shaped content and likely secrets are rejected, and imported records cannot be pinned or locked through RPC.
+
+## Architecture
+
+```text
+OpenCode plugin (TypeScript)
+  -> length-delimited Protobuf over stdin/stdout
+Rust sidecar
+  -> lifecycle/taxonomy policy
+  -> llama.cpp GGUF embedder
+  -> zvec vector + FTS collection
+  -> atomic JSON lifecycle state
+```
+
+The Protobuf schema is `schema/memory.proto`. Rust bindings are generated at Cargo build time with `prost-build`; TypeScript bindings are committed at `opencode-memory/src/generated/memory_pb.ts` and reproduced with `bun run generate:protocol`.
+
+## Development
+
+Requirements: Bun 1.3+, Rust 1.88+, and `protoc`.
+
+```sh
+bun install
+bun run generate:protocol:check
+bun run typecheck
+bun run test:ts
+cargo test --locked --lib
+cargo clippy --all-targets --locked -- -D warnings
+bun run build
+bun run pack:check
+```
+
+Build the local sidecar:
+
+```sh
+bun run build:native:release
+```
+
+GPU features are opt-in Cargo features: `metal`, `cuda`, `cuda-no-vmm`, `vulkan`, `openmp`, and `static-openmp`.
+
+## Releases
+
+Tags matching `vX.Y.Z` build and package the five native targets, publish native packages first, publish the umbrella plugin with npm provenance, and create a GitHub release containing all tarballs and a checksum for the umbrella package. `package.json`, `Cargo.toml`, and every native package must carry the same version.
+
+## License
+
+MIT. Bundled dependency notices are in `THIRD_PARTY_NOTICES.md` and `notices/`.

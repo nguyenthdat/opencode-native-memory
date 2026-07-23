@@ -6,7 +6,6 @@ use std::fs::File;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use zvec_rust::{Collection, Doc, SearchQuery};
 
 use crate::MemoryConfig;
@@ -19,6 +18,7 @@ use crate::contract::{
     StatusResponse, StoreRequest, StoreResponse, SyncSharedRequest, SyncSharedResponse,
     UpdateRequest, UpdateResponse,
 };
+use crate::embedding::{Embedder, LlamaCppEmbedder};
 use crate::lifecycle::{
     default_expiry, default_half_life_days, ensure_delete_allowed, ensure_store_overwrite_allowed,
     expiry_from_days, is_expired, is_prunable_expired, resolve_update,
@@ -26,9 +26,7 @@ use crate::lifecycle::{
 use crate::storage::state::{
     MemoryMetadata, MemoryState, STATE_SCHEMA_VERSION, Tombstone, memory_fingerprint,
 };
-use crate::storage::zvec::{
-    self, EMBEDDING_DIMENSION, EMBEDDING_MODEL_NAME, RESULT_FIELDS, ensure_write_succeeded,
-};
+use crate::storage::zvec::{self, RESULT_FIELDS, ensure_write_succeeded};
 use crate::taxonomy::MemoryTaxonomy;
 use crate::validation::{
     MAX_ID_COUNT, MAX_LIST_RESULTS, MAX_SHARED_RECORDS, NormalizedStoreRequest, anchors_stale,
@@ -42,7 +40,7 @@ const SESSION_DEFAULT_TTL_DAYS: u32 = 7;
 pub struct MemoryEngine {
     config: MemoryConfig,
     collection: Collection,
-    embedder: TextEmbedding,
+    embedder: LlamaCppEmbedder,
     state: MemoryState,
     _writer_lock: File,
 }
@@ -60,15 +58,14 @@ impl MemoryEngine {
         zvec::secure_create_dir(config.model_cache())?;
 
         let writer_lock = zvec::acquire_writer_lock(&config.project_data_dir())?;
-        let collection = zvec::open_collection(&config, now_ms()?)?;
         let state = MemoryState::load(&config.state_path())?;
-        let embedder = TextEmbedding::try_new(
-            TextInitOptions::new(EmbeddingModel::MultilingualE5Small)
-                .with_cache_dir(config.model_cache().to_path_buf())
-                .with_max_length(512)
-                .with_show_download_progress(false),
-        )
-        .context("cannot initialize the multilingual local embedding model")?;
+        let embedder = LlamaCppEmbedder::load(config.embedding(), config.model_cache())?;
+        let collection = zvec::open_collection(
+            &config,
+            embedder.model_id(),
+            embedder.dimension(),
+            now_ms()?,
+        )?;
 
         let mut engine = Self {
             config,
@@ -334,6 +331,10 @@ impl MemoryEngine {
             existing.importance,
         );
         ensure!(
+            !old_metadata.is_superseded(),
+            "cannot update superseded historical memory; update its active successor"
+        );
+        ensure!(
             management_visible(
                 &old_metadata,
                 request.session_scope_key.as_deref(),
@@ -366,7 +367,7 @@ impl MemoryEngine {
             expires_in_days: request.expires_in_days,
             code_paths,
             revive: false,
-            taxonomy: request.taxonomy,
+            taxonomy: request.taxonomy.or(Some(old_metadata.taxonomy)),
             confidence: request.confidence.or(Some(old_metadata.confidence)),
         })?;
         let new_fingerprint = memory_fingerprint(
@@ -410,12 +411,14 @@ impl MemoryEngine {
             supersedes: old_metadata.supersedes.clone(),
             conflict_with: old_metadata.conflict_with.clone(),
         };
-        let response =
-            self.commit_update(&request.id, existing.created_at_ms, &merged, metadata, now)?;
-        if let Some(ref conflict_ids) = request.conflict_with {
-            self.apply_conflict_update(&response.id, conflict_ids.clone())?;
-        }
-        Ok(response)
+        self.commit_update(
+            &request.id,
+            existing.created_at_ms,
+            &merged,
+            metadata,
+            request.conflict_with,
+            now,
+        )
     }
 
     /// Phase 1 dedicated pin RPC sharing `update`'s optimistic-concurrency
@@ -426,7 +429,7 @@ impl MemoryEngine {
     /// Returns an error for invalid IDs, locked records, repository scope, or
     /// stale timestamps.
     pub fn pin(&mut self, request: &PinRequest) -> Result<LifecycleResponse> {
-        let updated = self.update(UpdateRequest {
+        self.update_lifecycle(UpdateRequest {
             id: request.id.clone(),
             expected_updated_at_ms: request.expected_updated_at_ms,
             content: None,
@@ -447,18 +450,6 @@ impl MemoryEngine {
             conflict_with: None,
             session_scope_key: request.session_scope_key.clone(),
             agent_scope_key: request.agent_scope_key.clone(),
-        })?;
-        let metadata = self
-            .state
-            .records
-            .get(&updated.id)
-            .ok_or_else(|| anyhow!("memory not found after pin: {}", updated.id))?;
-        Ok(LifecycleResponse {
-            id: updated.id,
-            pinned: metadata.pinned,
-            locked: metadata.locked,
-            lock_reason: metadata.lock_reason.clone(),
-            updated_at_ms: updated.updated_at_ms,
         })
     }
 
@@ -470,7 +461,7 @@ impl MemoryEngine {
     /// Returns an error for invalid IDs, repository scope, invalid lock
     /// reason, or stale timestamps.
     pub fn lock(&mut self, request: &LockRequest) -> Result<LifecycleResponse> {
-        let updated = self.update(UpdateRequest {
+        self.update_lifecycle(UpdateRequest {
             id: request.id.clone(),
             expected_updated_at_ms: request.expected_updated_at_ms,
             content: None,
@@ -491,18 +482,62 @@ impl MemoryEngine {
             conflict_with: None,
             session_scope_key: request.session_scope_key.clone(),
             agent_scope_key: request.agent_scope_key.clone(),
-        })?;
-        let metadata = self
-            .state
+        })
+    }
+
+    fn update_lifecycle(&mut self, request: UpdateRequest) -> Result<LifecycleResponse> {
+        validate_ids(std::slice::from_ref(&request.id))?;
+        let documents = self.fetch_documents(std::slice::from_ref(&request.id))?;
+        let document = documents
+            .first()
+            .ok_or_else(|| anyhow!("memory not found: {}", request.id))?;
+        let existing = stored_memory_from_doc(document)?;
+        if let Some(expected) = request.expected_updated_at_ms {
+            ensure!(
+                expected == existing.updated_at_ms,
+                "memory changed since it was read; fetch it again before updating"
+            );
+        }
+        let mut metadata = self.state.metadata(
+            &existing.id,
+            existing.kind,
+            existing.created_at_ms,
+            existing.importance,
+        );
+        ensure!(
+            !metadata.is_superseded(),
+            "cannot change lifecycle state on superseded historical memory"
+        );
+        ensure!(
+            management_visible(
+                &metadata,
+                request.session_scope_key.as_deref(),
+                request.agent_scope_key.as_deref(),
+            ),
+            "memory is not visible to the current session or agent"
+        );
+        ensure!(
+            metadata.scope != MemoryScope::Repository,
+            "repository memory lifecycle is managed through its Markdown source"
+        );
+        let values = resolve_update(&metadata, &request, metadata.scope)?;
+        let previous = metadata.clone();
+        metadata.pinned = values.pinned;
+        metadata.locked = values.locked;
+        metadata.lock_reason = values.lock_reason;
+        self.state
             .records
-            .get(&updated.id)
-            .ok_or_else(|| anyhow!("memory not found after lock: {}", updated.id))?;
+            .insert(existing.id.clone(), metadata.clone());
+        if let Err(error) = self.save_state() {
+            self.state.records.insert(existing.id.clone(), previous);
+            return Err(error);
+        }
         Ok(LifecycleResponse {
-            id: updated.id,
+            id: existing.id,
             pinned: metadata.pinned,
             locked: metadata.locked,
-            lock_reason: metadata.lock_reason.clone(),
-            updated_at_ms: updated.updated_at_ms,
+            lock_reason: metadata.lock_reason,
+            updated_at_ms: existing.updated_at_ms,
         })
     }
 
@@ -766,10 +801,10 @@ impl MemoryEngine {
         Ok(StatusResponse {
             ready: true,
             rpc_protocol_version: crate::rpc::RPC_PROTOCOL_VERSION,
-            backend: "zvec",
+            backend: "zvec+llama.cpp".to_string(),
             zvec_version: zvec_rust::version().clone(),
-            embedding_model: EMBEDDING_MODEL_NAME,
-            embedding_dimension: EMBEDDING_DIMENSION,
+            embedding_model: self.embedder.model_id().to_string(),
+            embedding_dimension: self.embedder.dimension(),
             project_root: self.config.project_root().display().to_string(),
             project_id: self.config.project_id().to_string(),
             collection_path: self.config.collection_dir().display().to_string(),
@@ -786,7 +821,11 @@ impl MemoryEngine {
                     completeness: index.completeness,
                 })
                 .collect(),
-            capabilities: vec!["phase1_taxonomy_lifecycle_v1"],
+            capabilities: vec![
+                "phase1_taxonomy_lifecycle_v1",
+                "llama_cpp_gguf_embeddings_v1",
+                "protobuf_framed_rpc_v1",
+            ],
         })
     }
 
@@ -916,7 +955,7 @@ impl MemoryEngine {
             self.collection.flush()?;
         }
         for id in ids {
-            self.state.records.remove(&id);
+            self.remove_state_record(&id);
             self.state.pending_deletes.remove(&id);
         }
         self.save_state()
@@ -932,9 +971,10 @@ impl MemoryEngine {
         let topk = usize::try_from(stats.doc_count)
             .unwrap_or(MAX_STATE_BACKFILL_RECORDS)
             .min(MAX_STATE_BACKFILL_RECORDS);
-        let dimension = f32::from(u16::try_from(EMBEDDING_DIMENSION)?);
+        let embedding_dimension = self.embedder.dimension();
+        let dimension = embedding_dimension as f32;
         let component = 1.0 / dimension.sqrt();
-        let vector = vec![component; EMBEDDING_DIMENSION];
+        let vector = vec![component; embedding_dimension];
         let mut query = SearchQuery::new("embedding", &vector, i32::try_from(topk)?)?;
         query.set_output_fields(&RESULT_FIELDS)?;
         let mut changed = false;
@@ -974,7 +1014,7 @@ impl MemoryEngine {
             &normalized.tags,
             &normalized.content,
         );
-        let embedding = self.embed(&format!("passage: {search_text}"))?;
+        let embedding = self.embedder.embed_passage(&search_text)?;
         let tags_json = serde_json::to_string(&normalized.tags)?;
 
         let mut doc = Doc::new()?;
@@ -1003,6 +1043,7 @@ impl MemoryEngine {
         created_at_ms: i64,
         merged: &NormalizedStoreRequest,
         mut metadata: MemoryMetadata,
+        conflict_with: Option<Vec<String>>,
         now: i64,
     ) -> Result<UpdateResponse> {
         let target_id = deterministic_memory_id(
@@ -1023,30 +1064,37 @@ impl MemoryEngine {
             metadata.supersedes = vec![previous_id.to_string()];
             metadata.superseded_by = None;
         }
+        let inherited_conflicts = identity_changed.then(|| metadata.conflict_with.clone());
 
-        let previous_target = self
-            .state
-            .records
-            .insert(target_id.clone(), metadata.clone());
-        self.save_state()?;
+        let previous_records = self.state.records.clone();
+        let previous_generation = self.state.generation;
+        self.state.records.insert(target_id.clone(), metadata);
+        if identity_changed {
+            let predecessor =
+                self.state.records.get_mut(previous_id).ok_or_else(|| {
+                    anyhow!("memory lifecycle metadata is missing: {previous_id}")
+                })?;
+            predecessor.superseded_by = Some(target_id.clone());
+        }
+        if let Some(conflicts) = conflict_with.or(inherited_conflicts)
+            && let Err(error) = self.apply_conflict_update_in_memory(&target_id, conflicts)
+        {
+            self.state.records = previous_records;
+            return Err(error);
+        }
+        if let Err(error) = self.save_state() {
+            self.state.records = previous_records;
+            self.state.generation = previous_generation;
+            return Err(error);
+        }
         if let Err(error) = self.write_document(&target_id, merged, created_at_ms, now) {
-            if let Some(previous) = previous_target {
-                self.state.records.insert(target_id.clone(), previous);
-            } else {
-                self.state.records.remove(&target_id);
-            }
+            self.state.records = previous_records;
+            self.state.generation = previous_generation;
             let _ = self.save_state();
             return Err(error);
         }
 
         let superseded_id = identity_changed.then(|| previous_id.to_string());
-        if identity_changed {
-            // Keep predecessor doc+state; mark it superseded by the new ID.
-            if let Some(predecessor) = self.state.records.get_mut(previous_id) {
-                predecessor.superseded_by = Some(target_id.clone());
-            }
-            self.save_state()?;
-        }
         Ok(UpdateResponse {
             id: target_id,
             previous_id: superseded_id,
@@ -1054,7 +1102,11 @@ impl MemoryEngine {
         })
     }
 
-    fn apply_conflict_update(&mut self, id: &str, new_conflicts: Vec<String>) -> Result<()> {
+    fn apply_conflict_update_in_memory(
+        &mut self,
+        id: &str,
+        new_conflicts: Vec<String>,
+    ) -> Result<()> {
         let metadata = self
             .state
             .records
@@ -1090,10 +1142,10 @@ impl MemoryEngine {
 
         // Add symmetric links for new IDs.
         for new_id in &new_set {
-            if let Some(other) = self.state.records.get_mut(new_id) {
-                if !other.conflict_with.contains(&id.to_string()) {
-                    other.conflict_with.push(id.to_string());
-                }
+            if let Some(other) = self.state.records.get_mut(new_id)
+                && !other.conflict_with.contains(&id.to_string())
+            {
+                other.conflict_with.push(id.to_string());
             }
         }
 
@@ -1109,7 +1161,7 @@ impl MemoryEngine {
                 other.confidence = other.confidence.min(0.5);
             }
         }
-        self.save_state()
+        Ok(())
     }
 
     /// Phase 1 engine migration step: enrich v1/v2-migrated records from the
@@ -1237,28 +1289,7 @@ impl MemoryEngine {
         ensure_write_succeeded("delete memory", &write)?;
         self.collection.flush()?;
         for id in &found_ids {
-            // Clean reciprocal conflict and supersession references before
-            // removing the record from state.
-            if let Some(deleted) = self.state.records.get(id).cloned() {
-                for cid in &deleted.conflict_with {
-                    if let Some(other) = self.state.records.get_mut(cid) {
-                        other.conflict_with.retain(|entry| entry != id);
-                    }
-                }
-                for sid in &deleted.supersedes {
-                    if let Some(predecessor) = self.state.records.get_mut(sid) {
-                        if predecessor.superseded_by.as_deref() == Some(id.as_str()) {
-                            predecessor.superseded_by = None;
-                        }
-                    }
-                }
-                if let Some(successor) = deleted.superseded_by.clone() {
-                    if let Some(other) = self.state.records.get_mut(&successor) {
-                        other.supersedes.retain(|entry| entry != id);
-                    }
-                }
-            }
-            self.state.records.remove(id);
+            self.remove_state_record(id);
             self.state.pending_deletes.remove(id);
         }
         self.save_state()?;
@@ -1282,24 +1313,38 @@ impl MemoryEngine {
         Ok(documents)
     }
 
-    fn save_state(&mut self) -> Result<()> {
-        self.state.save(&self.config.state_path())
+    fn remove_state_record(&mut self, id: &str) {
+        let Some(deleted) = self.state.records.get(id).cloned() else {
+            return;
+        };
+        for conflict_id in &deleted.conflict_with {
+            if let Some(other) = self.state.records.get_mut(conflict_id) {
+                other.conflict_with.retain(|entry| entry != id);
+            }
+        }
+        let successor_id = deleted.superseded_by.clone();
+        for predecessor_id in &deleted.supersedes {
+            if let Some(predecessor) = self.state.records.get_mut(predecessor_id)
+                && predecessor.superseded_by.as_deref() == Some(id)
+            {
+                predecessor.superseded_by.clone_from(&successor_id);
+            }
+        }
+        if let Some(successor_id) = successor_id
+            && let Some(successor) = self.state.records.get_mut(&successor_id)
+        {
+            successor.supersedes.retain(|entry| entry != id);
+            for predecessor_id in deleted.supersedes {
+                if !successor.supersedes.contains(&predecessor_id) {
+                    successor.supersedes.push(predecessor_id);
+                }
+            }
+        }
+        self.state.records.remove(id);
     }
 
-    fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
-        let mut embeddings = self
-            .embedder
-            .embed([text], None)
-            .context("local embedding inference failed")?;
-        let embedding = embeddings
-            .pop()
-            .ok_or_else(|| anyhow!("embedding model returned no vector"))?;
-        ensure!(
-            embedding.len() == EMBEDDING_DIMENSION,
-            "embedding dimension mismatch: expected {EMBEDDING_DIMENSION}, received {}",
-            embedding.len()
-        );
-        Ok(embedding)
+    fn save_state(&mut self) -> Result<()> {
+        self.state.save(&self.config.state_path())
     }
 }
 

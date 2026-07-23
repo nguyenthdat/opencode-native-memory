@@ -12,6 +12,7 @@ import {
   WRITABLE_MEMORY_SCOPES,
   FEEDBACK_EVENTS,
   LOCK_ACTIONS,
+  MEMORY_TAXONOMIES,
 } from "./contracts.js";
 import { NativeMemoryClient } from "./sidecar-client.js";
 import {
@@ -56,9 +57,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
           records: loaded.records,
         });
         if (response.rejected > 0) {
-          throw new Error(
-            `Rejected shared memories: ${response.rejected_sources.join(", ")}`,
-          );
+          throw new Error(`Rejected shared memories: ${response.rejected_sources.join(", ")}`);
         }
         sharedSignature = loaded.signature;
         session.recallCache.clear();
@@ -69,9 +68,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     };
 
     if (options.warmup !== false) {
-      void Promise.all([native.request("status"), syncSharedMemories()]).catch(
-        session.warnOnce,
-      );
+      void Promise.all([native.request("status"), syncSharedMemories()]).catch(session.warnOnce);
     }
 
     return {
@@ -101,14 +98,8 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         };
       },
       event: async ({ event }) => {
-        if (
-          event.type === "session.created" ||
-          event.type === "session.updated"
-        ) {
-          session.sessionParents.set(
-            event.properties.info.id,
-            event.properties.info.parentID,
-          );
+        if (event.type === "session.created" || event.type === "session.updated") {
+          session.sessionParents.set(event.properties.info.id, event.properties.info.parentID);
           session.sessionRoots.clear();
           return;
         }
@@ -123,23 +114,14 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           return;
         }
         if (event.type === "session.idle") {
-          await session.closePendingRecall(
-            event.properties.sessionID,
-            "ignored",
-          );
+          await session.closePendingRecall(event.properties.sessionID, "ignored");
           return;
         }
         if (event.type === "session.error" && event.properties.sessionID) {
-          await session.closePendingRecall(
-            event.properties.sessionID,
-            "error",
-          );
+          await session.closePendingRecall(event.properties.sessionID, "error");
           return;
         }
-        if (
-          event.type === "file.edited" ||
-          event.type === "file.watcher.updated"
-        ) {
+        if (event.type === "file.edited" || event.type === "file.watcher.updated") {
           session.recallCache.clear();
           const file = event.properties.file.replaceAll("\\", "/");
           if (file.includes(`/${SHARED_MEMORY_RELATIVE_DIR}/`)) {
@@ -156,16 +138,10 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           });
           const summary = response.data
             ?.toReversed()
-            .find(
-              (message) =>
-                message.info.role === "assistant" &&
-                message.info.summary === true,
-            );
+            .find((message) => message.info.role === "assistant" && message.info.summary === true);
           if (!summary) return;
           const content = summary.parts
-            .flatMap((part) =>
-              part.type === "text" && !part.ignored ? [part.text] : [],
-            )
+            .flatMap((part) => (part.type === "text" && !part.ignored ? [part.text] : []))
             .join("\n")
             .trim();
           if (!content) return;
@@ -192,15 +168,12 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         await session.closePendingRecall(input.sessionID, "ignored");
         const query = output.parts
           .flatMap((part) =>
-            part.type === "text" && !part.synthetic && !part.ignored
-              ? [part.text]
-              : [],
+            part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
           )
           .join("\n")
           .trim();
         if (!query) return;
-        if (input.agent)
-          session.sessionAgents.set(input.sessionID, input.agent);
+        if (input.agent) session.sessionAgents.set(input.sessionID, input.agent);
         session.latestQuery.set(input.sessionID, {
           query: truncateText(query, 2_000),
           agent: input.agent,
@@ -208,9 +181,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         session.recallCache.delete(input.sessionID);
       },
       "experimental.chat.system.transform": async (input, output) => {
-        if (
-          !output.system.some((entry) => entry.includes(MEMORY_POLICY_MARKER))
-        ) {
+        if (!output.system.some((entry) => entry.includes(MEMORY_POLICY_MARKER))) {
           output.system.push(MEMORY_POLICY);
         }
         if (!input.sessionID) return;
@@ -221,13 +192,8 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         } catch (error) {
           session.warnOnce(error);
         }
-        const rootSessionID = await session.resolveSessionRoot(
-          input.sessionID,
-        );
-        const agent =
-          latest.agent ??
-          session.sessionAgents.get(input.sessionID) ??
-          "unknown";
+        const rootSessionID = await session.resolveSessionRoot(input.sessionID);
+        const agent = latest.agent ?? session.sessionAgents.get(input.sessionID) ?? "unknown";
         const budgetChars = contextBudgetChars(input.model);
         const cacheKey = [
           latest.query,
@@ -246,10 +212,12 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               budget_chars: budgetChars,
               kinds: [],
               scopes: [],
+              taxonomies: [],
               session_scope_key: rootSessionID,
               agent_scope_key: agent,
               min_score: 0.42,
               include_stale: false,
+              include_superseded: false,
               track_feedback: true,
             });
             cached = { key: cacheKey, response };
@@ -288,9 +256,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .min(1)
               .max(20)
               .default(20)
-              .describe(
-                "Safety ceiling; context budget normally decides the count.",
-              ),
+              .describe("Safety ceiling; context budget normally decides the count."),
             budget_chars: tool.schema
               .number()
               .int()
@@ -308,6 +274,11 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .max(MEMORY_SCOPES.length)
               .default([])
               .describe("Optional scopes to include."),
+            taxonomies: tool.schema
+              .array(tool.schema.enum(MEMORY_TAXONOMIES))
+              .max(MEMORY_TAXONOMIES.length)
+              .default([])
+              .describe("Optional CoALA-derived taxonomies to include."),
             min_score: tool.schema
               .number()
               .min(0)
@@ -318,13 +289,15 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .boolean()
               .default(false)
               .describe("Include memories whose code anchors changed."),
+            include_superseded: tool.schema
+              .boolean()
+              .default(false)
+              .describe("Include historical memories replaced by a successor."),
           },
           async execute(args, context) {
             await session.closePendingRecall(context.sessionID, "ignored");
             await syncSharedMemories();
-            const rootSessionID = await session.resolveSessionRoot(
-              context.sessionID,
-            );
+            const rootSessionID = await session.resolveSessionRoot(context.sessionID);
             const response = await native.request<SearchResponse>(
               "search",
               {
@@ -333,10 +306,12 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 budget_chars: args.budget_chars,
                 kinds: args.kinds,
                 scopes: args.scopes,
+                taxonomies: args.taxonomies,
                 session_scope_key: rootSessionID,
                 agent_scope_key: context.agent,
                 min_score: args.min_score,
                 include_stale: args.include_stale,
+                include_superseded: args.include_superseded,
                 track_feedback: true,
               },
               context.abort,
@@ -408,6 +383,16 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .boolean()
               .default(false)
               .describe("Revive a tombstoned memory after user approval."),
+            taxonomy: tool.schema
+              .enum(MEMORY_TAXONOMIES)
+              .optional()
+              .describe("Explicit memory taxonomy; inferred when omitted."),
+            confidence: tool.schema
+              .number()
+              .min(0)
+              .max(1)
+              .optional()
+              .describe("Confidence in this memory; defaults from importance."),
           },
           async execute(args, context) {
             if (args.revive) {
@@ -418,11 +403,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 metadata: { operation: "revive", scope: args.scope },
               });
             }
-            const key = await session.scopeKey(
-              args.scope,
-              context.sessionID,
-              context.agent,
-            );
+            const key = await session.scopeKey(args.scope, context.sessionID, context.agent);
             const response = await native.request<Record<string, unknown>>(
               "store",
               {
@@ -441,8 +422,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           },
         }),
         memory_get: tool({
-          description:
-            "Fetch complete durable memories by IDs returned from memory_search.",
+          description: "Fetch complete durable memories by IDs returned from memory_search.",
           args: {
             ids: tool.schema
               .array(tool.schema.string().regex(/^mem_[0-9a-f]{32}$/))
@@ -451,10 +431,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .describe("Memory IDs to fetch."),
           },
           async execute(args, context) {
-            const keys = await session.managementScopeKeys(
-              context.sessionID,
-              context.agent,
-            );
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
             const response = await native.request<MemoryRecord[]>(
               "get",
               { ...args, ...keys },
@@ -477,17 +454,19 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .array(tool.schema.enum(MEMORY_SCOPES))
               .max(MEMORY_SCOPES.length)
               .default([]),
+            taxonomies: tool.schema
+              .array(tool.schema.enum(MEMORY_TAXONOMIES))
+              .max(MEMORY_TAXONOMIES.length)
+              .default([]),
             include_expired: tool.schema.boolean().default(false),
             include_stale: tool.schema.boolean().default(false),
+            include_superseded: tool.schema.boolean().default(false),
             offset: tool.schema.number().int().min(0).default(0),
             limit: tool.schema.number().int().min(1).max(100).default(50),
           },
           async execute(args, context) {
             await syncSharedMemories();
-            const keys = await session.managementScopeKeys(
-              context.sessionID,
-              context.agent,
-            );
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
             const response = await native.request<ListResponse>(
               "list",
               { ...args, ...keys },
@@ -509,49 +488,36 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             title: tool.schema.string().min(1).max(160).optional(),
             kind: tool.schema.enum(MEMORY_KINDS).optional(),
             importance: tool.schema.number().min(0).max(1).optional(),
-            tags: tool.schema
-              .array(tool.schema.string().min(1).max(64))
-              .max(12)
-              .optional(),
+            tags: tool.schema.array(tool.schema.string().min(1).max(64)).max(12).optional(),
             scope: tool.schema.enum(WRITABLE_MEMORY_SCOPES).optional(),
-            expires_in_days: tool.schema
-              .number()
-              .int()
-              .min(1)
-              .max(3_650)
-              .optional(),
+            expires_in_days: tool.schema.number().int().min(1).max(3_650).optional(),
             clear_expiry: tool.schema.boolean().default(false),
-            code_paths: tool.schema
-              .array(tool.schema.string().min(1).max(512))
-              .max(12)
-              .optional(),
+            code_paths: tool.schema.array(tool.schema.string().min(1).max(512)).max(12).optional(),
             pinned: tool.schema
               .boolean()
               .optional()
-              .describe(
-                "Pin the memory so it bypasses expiry and retention decay.",
-              ),
+              .describe("Pin the memory so it bypasses expiry and retention decay."),
             lock_action: tool.schema
               .enum(LOCK_ACTIONS)
               .optional()
-              .describe(
-                "Lock or unlock the memory. Locked records block updates and deletes.",
-              ),
+              .describe("Lock or unlock the memory. Locked records block updates and deletes."),
             lock_reason: tool.schema
               .string()
               .min(1)
               .max(240)
               .optional()
-              .describe(
-                "Reason for locking the memory. Only valid with lock_action='lock'.",
-              ),
+              .describe("Reason for locking the memory. Only valid with lock_action='lock'."),
+            taxonomy: tool.schema.enum(MEMORY_TAXONOMIES).optional(),
+            confidence: tool.schema.number().min(0).max(1).optional(),
+            conflict_with: tool.schema
+              .array(tool.schema.string().regex(/^mem_[0-9a-f]{32}$/))
+              .max(100)
+              .optional()
+              .describe("Symmetric conflict links; pass [] to clear links."),
           },
           async execute(args, context) {
             validateUpdateArgs(args);
-            const keys = await session.managementScopeKeys(
-              context.sessionID,
-              context.agent,
-            );
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
             const existing = await native.request<MemoryRecord[]>(
               "get",
               { ids: [args.id], ...keys },
@@ -565,11 +531,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               );
             }
             const key = args.scope
-              ? await session.scopeKey(
-                  args.scope,
-                  context.sessionID,
-                  context.agent,
-                )
+              ? await session.scopeKey(args.scope, context.sessionID, context.agent)
               : undefined;
             const response = await native.request<Record<string, unknown>>(
               "update",
@@ -578,6 +540,52 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             );
             session.recallCache.clear();
             return result("Updated memory", response, response);
+          },
+        }),
+        memory_pin: tool({
+          description:
+            "Pin or unpin one local memory without re-embedding or refreshing semantic recency.",
+          args: {
+            id: tool.schema.string().regex(/^mem_[0-9a-f]{32}$/),
+            pinned: tool.schema.boolean(),
+            expected_updated_at_ms: tool.schema.number().int().optional(),
+          },
+          async execute(args, context) {
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
+            const response = await native.request<Record<string, unknown>>(
+              "pin",
+              { ...args, ...keys },
+              context.abort,
+            );
+            session.recallCache.clear();
+            return result(args.pinned ? "Pinned memory" : "Unpinned memory", response, response);
+          },
+        }),
+        memory_lock: tool({
+          description:
+            "Lock or unlock one local memory. Unlock is lifecycle-only; locked records reject semantic changes and deletion.",
+          args: {
+            id: tool.schema.string().regex(/^mem_[0-9a-f]{32}$/),
+            lock_action: tool.schema.enum(LOCK_ACTIONS),
+            lock_reason: tool.schema.string().min(1).max(240).optional(),
+            expected_updated_at_ms: tool.schema.number().int().optional(),
+          },
+          async execute(args, context) {
+            if (args.lock_action === "unlock" && args.lock_reason !== undefined) {
+              throw new Error("lock_reason is valid only when locking");
+            }
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
+            const response = await native.request<Record<string, unknown>>(
+              "lock",
+              { ...args, ...keys },
+              context.abort,
+            );
+            session.recallCache.clear();
+            return result(
+              args.lock_action === "lock" ? "Locked memory" : "Unlocked memory",
+              response,
+              response,
+            );
           },
         }),
         memory_delete: tool({
@@ -600,10 +608,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               always: [],
               metadata: { operation: "delete", ...args },
             });
-            const keys = await session.managementScopeKeys(
-              context.sessionID,
-              context.agent,
-            );
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
             const response = await native.request<Record<string, unknown>>(
               "delete",
               { ...args, ...keys },
@@ -621,9 +626,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .string()
               .regex(/^ret_[0-9a-f]{24}$/)
               .optional()
-              .describe(
-                "Defaults to the latest pending retrieval in this session.",
-              ),
+              .describe("Defaults to the latest pending retrieval in this session."),
             event: tool.schema.enum(FEEDBACK_EVENTS),
             memory_ids: tool.schema
               .array(tool.schema.string().regex(/^mem_[0-9a-f]{32}$/))
@@ -634,9 +637,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             const pending = session.pendingRecall.get(context.sessionID);
             const retrievalID = args.retrieval_id ?? pending?.retrievalID;
             if (!retrievalID) {
-              throw new Error(
-                "No pending retrieval is available for this session",
-              );
+              throw new Error("No pending retrieval is available for this session");
             }
             const response = await native.request<Record<string, unknown>>(
               "feedback",
@@ -660,10 +661,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             id: tool.schema.string().regex(/^mem_[0-9a-f]{32}$/),
           },
           async execute(args, context) {
-            const keys = await session.managementScopeKeys(
-              context.sessionID,
-              context.agent,
-            );
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
             const memories = await native.request<MemoryRecord[]>(
               "get",
               { ids: [args.id], ...keys },
@@ -692,11 +690,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             });
             const path = await writeSharedMemory(worktree, memory);
             await syncSharedMemories(true);
-            return result(
-              "Promoted memory",
-              { id: memory.id, path },
-              { id: memory.id, path },
-            );
+            return result("Promoted memory", { id: memory.id, path }, { id: memory.id, path });
           },
         }),
         memory_purge: tool({
@@ -777,11 +771,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
   };
 }
 
-function result(
-  title: string,
-  value: unknown,
-  metadata: Record<string, unknown>,
-): ToolResult {
+function result(title: string, value: unknown, metadata: Record<string, unknown>): ToolResult {
   return {
     title,
     output: JSON.stringify(value, null, 2),

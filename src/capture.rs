@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 
 /// Default significance threshold below which a candidate is skipped.
 pub const DEFAULT_SIGNIFICANCE_THRESHOLD: f32 = 0.5;

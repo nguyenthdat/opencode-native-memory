@@ -549,9 +549,9 @@ pub struct IndexStatus {
 pub struct StatusResponse {
     pub ready: bool,
     pub rpc_protocol_version: u32,
-    pub backend: &'static str,
+    pub backend: String,
     pub zvec_version: String,
-    pub embedding_model: &'static str,
+    pub embedding_model: String,
     pub embedding_dimension: usize,
     pub project_root: String,
     pub project_id: String,

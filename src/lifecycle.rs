@@ -149,17 +149,26 @@ fn has_record_mutation(request: &UpdateRequest) -> bool {
         || request.clear_expiry
         || request.code_paths.is_some()
         || request.pinned.is_some()
+        || request.taxonomy.is_some()
+        || request.confidence.is_some()
+        || request.conflict_with.is_some()
 }
 
 fn has_locked_forbidden_mutation(request: &UpdateRequest) -> bool {
     request.content.is_some()
+        || request.title.is_some()
         || request.kind.is_some()
+        || request.importance.is_some()
+        || request.tags.is_some()
         || request.scope.is_some()
         || request.scope_key.is_some()
         || request.expires_in_days.is_some()
         || request.clear_expiry
         || request.code_paths.is_some()
         || request.pinned.is_some()
+        || request.taxonomy.is_some()
+        || request.confidence.is_some()
+        || request.conflict_with.is_some()
 }
 
 #[cfg(test)]
