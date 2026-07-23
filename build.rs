@@ -1,6 +1,6 @@
 fn main() {
     prost_build::Config::new()
-        .compile_protos(&["schema/memory.proto"], &["schema"])
+        .compile_protos(&["schema/opencode/memory/v1/memory.proto"], &["schema"])
         .expect("compile Protobuf memory protocol schema");
 
     let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -13,6 +13,6 @@ fn main() {
         }
         _ => {}
     }
-    println!("cargo:rerun-if-changed=schema/memory.proto");
+    println!("cargo:rerun-if-changed=schema/opencode/memory/v1/memory.proto");
     println!("cargo:rerun-if-changed=build.rs");
 }

@@ -21,13 +21,14 @@ pub use capture::{
 };
 pub use config::{EmbeddingConfig, MemoryConfig};
 pub use contract::{
-    CodeAnchor, DeleteReason, DeleteRequest, DeleteResponse, DoctorRequest, DoctorResponse,
-    FeedbackEvent, FeedbackRequest, FeedbackResponse, FeedbackStats, ForgetRequest, ForgetResponse,
-    GetRequest, IndexStatus, LifecycleResponse, ListRequest, ListResponse, LockAction, LockRequest,
-    MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, OptimizeResponse, PinRequest,
+    CaptureRequest, CaptureResponse, CodeAnchor, DeleteReason, DeleteRequest, DeleteResponse,
+    DoctorRequest, DoctorResponse, ExportRequest, FeedbackEvent, FeedbackRequest, FeedbackResponse,
+    FeedbackStats, ForgetRequest, ForgetResponse, GetRequest, ImportRequest, ImportResponse,
+    IndexStatus, LifecycleResponse, ListRequest, ListResponse, LockAction, LockRequest, MemoryKind,
+    MemoryOrigin, MemoryRecord, MemoryScope, MemorySnapshot, OptimizeResponse, PinRequest,
     PurgeRequest, PurgeResponse, ScoreBreakdown, SearchRequest, SearchResponse, SharedMemoryInput,
     StatusResponse, StoreRequest, StoreResponse, SyncSharedRequest, SyncSharedResponse,
-    UpdateRequest, UpdateResponse,
+    TombstoneSnapshot, UpdateRequest, UpdateResponse,
 };
 pub use engine::MemoryEngine;
 pub use taxonomy::{MemoryFamily, MemoryTaxonomy, RetrievalProfile};

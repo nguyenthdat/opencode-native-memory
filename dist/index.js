@@ -12,7 +12,7 @@ export { MEMORY_KINDS, MEMORY_SCOPES, MEMORY_TAXONOMIES, WRITABLE_MEMORY_SCOPES,
 export { NativeMemoryClient, resolveNativeMemoryBinary, REQUEST_TIMEOUT_MS, INITIALIZATION_TIMEOUT_MS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, } from "./sidecar-client.js";
 export { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";
 // Plugin factory
-export { createMemoryPlugin } from "./plugin.js";
+export { createMemoryPlugin, resolveMemoryPluginOptions } from "./plugin.js";
 // Session context (testable abstraction)
 export { SessionContext } from "./session-context.js";
 // Lifecycle validation

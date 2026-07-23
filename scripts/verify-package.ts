@@ -16,7 +16,7 @@ const files = new Set(pack.files.map((entry) => entry.path));
 const required = [
   "dist/index.js",
   "dist/index.d.ts",
-  "dist/generated/memory_pb.js",
+  "dist/generated/opencode/memory/v1/memory_pb.js",
   "rules/flow.md",
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",

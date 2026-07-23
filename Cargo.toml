@@ -1,9 +1,9 @@
 [package]
 name = "opencode-memory"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.89"
+rust-version = "1.97"
 description = "Native zvec-backed project memory sidecar for OpenCode plugins"
 repository = "https://github.com/nguyenthdat/opencode-native-memory"
 readme = "README.md"

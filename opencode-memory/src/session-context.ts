@@ -10,6 +10,12 @@ export class SessionContext {
   readonly sessionRoots = new Map<string, string>();
   readonly sessionAgents = new Map<string, string>();
   readonly warnings = new Set<string>();
+  private recallEpoch = 0;
+  private readonly sessionRecallEpochs = new Map<string, number>();
+  private readonly automaticRecallSearches = new Map<
+    string,
+    { key: string; promise: Promise<SearchResponse> }
+  >();
 
   constructor(
     private readonly native: NativeMemoryClient,
@@ -101,5 +107,55 @@ export class SessionContext {
     if (!pending) return;
     this.pendingRecall.delete(sessionID);
     await this.recordFeedback(pending, event);
+  }
+
+  async openPendingRecall(
+    sessionID: string,
+    pending: PendingRecall,
+    isCurrent: () => boolean = () => true,
+  ): Promise<boolean> {
+    while (this.pendingRecall.has(sessionID)) {
+      await this.closePendingRecall(sessionID, "ignored");
+      if (!isCurrent()) return false;
+    }
+    if (!isCurrent()) return false;
+    this.pendingRecall.set(sessionID, pending);
+    await this.recordFeedback(pending, "injected");
+    if (isCurrent()) return true;
+    if (this.pendingRecall.get(sessionID) === pending) {
+      await this.closePendingRecall(sessionID, "ignored");
+    }
+    return false;
+  }
+
+  invalidateRecall(sessionID?: string): void {
+    if (sessionID === undefined) {
+      this.recallEpoch += 1;
+      this.recallCache.clear();
+      return;
+    }
+    this.sessionRecallEpochs.set(sessionID, (this.sessionRecallEpochs.get(sessionID) ?? 0) + 1);
+    this.recallCache.delete(sessionID);
+  }
+
+  recallGeneration(sessionID: string): string {
+    return `${this.recallEpoch}:${this.sessionRecallEpochs.get(sessionID) ?? 0}`;
+  }
+
+  async searchRecallOnce(
+    sessionID: string,
+    key: string,
+    search: () => Promise<SearchResponse>,
+  ): Promise<SearchResponse> {
+    const current = this.automaticRecallSearches.get(sessionID);
+    if (current?.key === key) return await current.promise;
+
+    const promise = search().finally(() => {
+      if (this.automaticRecallSearches.get(sessionID)?.promise === promise) {
+        this.automaticRecallSearches.delete(sessionID);
+      }
+    });
+    this.automaticRecallSearches.set(sessionID, { key, promise });
+    return await promise;
   }
 }

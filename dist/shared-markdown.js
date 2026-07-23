@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, readdir, realpath, rename, stat, writeFile, mkdir, } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import YAML from "yaml";
 import { MEMORY_KINDS } from "./contracts.js";
 export const SHARED_MEMORY_RELATIVE_DIR = ".opencode/memory";
@@ -9,53 +9,93 @@ const MAX_SHARED_FILE_BYTES = 64 * 1_024;
 export async function loadSharedMemories(worktree) {
     const directory = resolve(worktree, SHARED_MEMORY_RELATIVE_DIR);
     const canonicalRoot = await realpath(worktree);
-    let entries;
+    let canonicalDirectory;
     try {
         const directoryInfo = await lstat(directory);
         if (directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory()) {
             throw new Error("Shared memory directory must be a real directory, not a symlink");
         }
-        const canonicalDirectory = await realpath(directory);
+        canonicalDirectory = await realpath(directory);
         if (!isPathWithin(canonicalRoot, canonicalDirectory)) {
             throw new Error("Shared memory directory escaped the project worktree");
         }
-        entries = await readdir(directory, { withFileTypes: true });
     }
     catch (error) {
         if (isNodeError(error) && error.code === "ENOENT") {
-            return { records: [], signature: createHash("sha256").digest("hex") };
+            return { records: [], signature: createHash("sha256").digest("hex"), errors: [] };
         }
         throw error;
     }
-    const names = entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
-        .map((entry) => entry.name)
-        .sort();
-    if (names.length > MAX_SHARED_FILES) {
+    const errors = [];
+    const files = await collectSharedMemoryFiles(canonicalDirectory, canonicalDirectory, "", errors);
+    files.sort((left, right) => left.source.localeCompare(right.source));
+    if (files.length > MAX_SHARED_FILES) {
         throw new Error(`At most ${MAX_SHARED_FILES} shared memory files are allowed`);
     }
     const hash = createHash("sha256");
     const records = [];
-    for (const name of names) {
-        const path = resolve(directory, name);
-        const linkInfo = await lstat(path);
-        if (linkInfo.isSymbolicLink() || !linkInfo.isFile()) {
-            throw new Error(`Shared memory must be a regular file: ${name}`);
+    for (const file of files) {
+        hash.update(file.source).update("\0");
+        try {
+            const linkInfo = await lstat(file.path);
+            if (linkInfo.isSymbolicLink() || !linkInfo.isFile()) {
+                throw new Error(`Shared memory must be a regular file: ${file.source}`);
+            }
+            const canonicalPath = await realpath(file.path);
+            if (!isPathWithin(canonicalDirectory, canonicalPath)) {
+                throw new Error(`Shared memory file escaped its directory: ${file.source}`);
+            }
+            const info = await stat(canonicalPath);
+            if (info.size > MAX_SHARED_FILE_BYTES) {
+                throw new Error(`Shared memory file exceeds ${MAX_SHARED_FILE_BYTES} bytes: ${file.source}`);
+            }
+            const bytes = await readFile(canonicalPath);
+            if (bytes.byteLength > MAX_SHARED_FILE_BYTES) {
+                throw new Error(`Shared memory file exceeds ${MAX_SHARED_FILE_BYTES} bytes: ${file.source}`);
+            }
+            const content = bytes.toString("utf8");
+            hash.update(content);
+            records.push(parseSharedMemory(file.source, content));
         }
-        const canonicalPath = await realpath(path);
-        if (!isPathWithin(canonicalRoot, canonicalPath)) {
-            throw new Error(`Shared memory file escaped the project worktree: ${name}`);
+        catch (error) {
+            const message = errorMessage(error);
+            hash.update(`!error:${message}`);
+            errors.push({ source: file.source, message });
         }
-        const info = await stat(canonicalPath);
-        if (info.size > MAX_SHARED_FILE_BYTES) {
-            throw new Error(`Shared memory file exceeds ${MAX_SHARED_FILE_BYTES} bytes: ${name}`);
-        }
-        const source = `${SHARED_MEMORY_RELATIVE_DIR}/${name}`;
-        const content = await readFile(canonicalPath, "utf8");
-        hash.update(source).update("\0").update(content).update("\0");
-        records.push(parseSharedMemory(source, content));
+        hash.update("\0");
     }
-    return { records, signature: hash.digest("hex") };
+    return { records, signature: hash.digest("hex"), errors };
+}
+async function collectSharedMemoryFiles(directory, canonicalRoot, relativeDirectory, errors) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    const files = [];
+    for (const entry of entries) {
+        const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+        const source = `${SHARED_MEMORY_RELATIVE_DIR}/${relativePath}`;
+        const path = resolve(directory, entry.name);
+        const info = await lstat(path);
+        if (info.isSymbolicLink()) {
+            errors.push({ source, message: `Shared memory path must not be a symlink: ${source}` });
+            continue;
+        }
+        if (info.isDirectory()) {
+            const canonicalPath = await realpath(path);
+            if (!isPathWithin(canonicalRoot, canonicalPath)) {
+                throw new Error(`Shared memory directory escaped its root: ${source}`);
+            }
+            files.push(...(await collectSharedMemoryFiles(canonicalPath, canonicalRoot, relativePath, errors)));
+            continue;
+        }
+        if (!entry.name.endsWith(".md"))
+            continue;
+        if (!info.isFile()) {
+            errors.push({ source, message: `Shared memory must be a regular file: ${source}` });
+            continue;
+        }
+        files.push({ path, source });
+    }
+    return files;
 }
 export function parseSharedMemory(source, input) {
     if (!input.startsWith("---\n")) {
@@ -162,7 +202,7 @@ export async function ensureRealDirectory(path) {
 }
 export function isPathWithin(root, candidate) {
     const path = relative(root, candidate);
-    return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+    return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }
 function isObject(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -174,5 +214,8 @@ function isStringArray(value, maxItems, maxLength) {
 }
 function isNodeError(error) {
     return error instanceof Error && "code" in error;
+}
+function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
 }
 //# sourceMappingURL=shared-markdown.js.map

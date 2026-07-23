@@ -10,9 +10,9 @@ use serde_json::{Map, Number, Value as JsonValue, json};
 
 use crate::memory_proto::{Method, Request, Response, Value, ValueList, ValueObject, value};
 use crate::{
-    DeleteRequest, DoctorRequest, FeedbackRequest, ForgetRequest, GetRequest, ListRequest,
-    LockRequest, MemoryConfig, MemoryEngine, PinRequest, PurgeRequest, SearchRequest, StoreRequest,
-    SyncSharedRequest, UpdateRequest,
+    CaptureRequest, DeleteRequest, DoctorRequest, ExportRequest, FeedbackRequest, ForgetRequest,
+    GetRequest, ImportRequest, ListRequest, LockRequest, MemoryConfig, MemoryEngine, PinRequest,
+    PurgeRequest, SearchRequest, StoreRequest, SyncSharedRequest, UpdateRequest,
 };
 
 /// Incremented because version 2 replaces JSON-lines with Protobuf framing.
@@ -62,6 +62,18 @@ impl Service {
             Method::Store => serde_json::to_value(
                 self.engine()?
                     .store(serde_json::from_value::<StoreRequest>(params)?)?,
+            )?,
+            Method::Capture => serde_json::to_value(
+                self.engine()?
+                    .capture(serde_json::from_value::<CaptureRequest>(params)?)?,
+            )?,
+            Method::Export => {
+                let request = serde_json::from_value::<ExportRequest>(params)?;
+                serde_json::to_value(self.engine()?.export_snapshot(&request)?)?
+            }
+            Method::Import => serde_json::to_value(
+                self.engine()?
+                    .import_snapshot(serde_json::from_value::<ImportRequest>(params)?)?,
             )?,
             Method::Get => {
                 let request = serde_json::from_value::<GetRequest>(params)?;

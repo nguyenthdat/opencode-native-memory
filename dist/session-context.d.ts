@@ -18,6 +18,9 @@ export declare class SessionContext {
     readonly sessionRoots: Map<string, string>;
     readonly sessionAgents: Map<string, string>;
     readonly warnings: Set<string>;
+    private recallEpoch;
+    private readonly sessionRecallEpochs;
+    private readonly automaticRecallSearches;
     constructor(native: NativeMemoryClient, getSessionAPI: (path: {
         id: string;
     }, query: {
@@ -36,5 +39,9 @@ export declare class SessionContext {
     }>;
     recordFeedback(pending: PendingRecall, event: "injected" | (typeof FEEDBACK_EVENTS)[number], memoryIDs?: string[]): Promise<void>;
     closePendingRecall(sessionID: string, event: "ignored" | "error"): Promise<void>;
+    openPendingRecall(sessionID: string, pending: PendingRecall, isCurrent?: () => boolean): Promise<boolean>;
+    invalidateRecall(sessionID?: string): void;
+    recallGeneration(sessionID: string): string;
+    searchRecallOnce(sessionID: string, key: string, search: () => Promise<SearchResponse>): Promise<SearchResponse>;
 }
 //# sourceMappingURL=session-context.d.ts.map

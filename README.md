@@ -9,6 +9,8 @@ Local-first persistent memory for OpenCode. The plugin runs a native Rust sideca
 - Default pinned `Qwen3-Embedding-4B` model from Hugging Face
 - Session-family, agent, project, and repository scopes
 - Durable taxonomy, confidence, supersession, conflict, pin, lock, expiry, and tombstone metadata
+- Deterministic capture gate with quarantine, skip, duplicate, supersession, and conflict outcomes
+- Crash-recoverable batch upsert journal and portable export/import snapshots
 - Markdown-backed shared repository memory under `.opencode/memory/`
 - Length-delimited Protobuf protocol between TypeScript and Rust
 - Native sidecar packages for macOS, Linux, and Windows
@@ -19,7 +21,7 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@nguyenthdat/opencode-memory@0.2.0"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.3.0"]
 }
 ```
 
@@ -52,6 +54,8 @@ Add `rules/flow.md` to the project instructions if memory tool usage should be e
 | `memory_lock`     | Lock or unlock without re-embedding                  |
 | `memory_delete`   | Delete records, with tombstones by default           |
 | `memory_promote`  | Promote reviewed local memory to repository Markdown |
+| `memory_export`   | Export records, lifecycle relations, and tombstones  |
+| `memory_import`   | Validate and restore a portable JSON snapshot        |
 | `memory_feedback` | Record whether recalled memories were useful         |
 | `memory_optimize` | Prune expired records and optimize indexes           |
 | `memory_status`   | Inspect backend, model, and schema status            |
@@ -98,6 +102,12 @@ Changing model identity or embedding dimension requires rebuilding the project's
 | `OPENCODE_MEMORY_DATA_DIR`                   | Override project store base directory                                        |
 | `OPENCODE_MEMORY_MODEL_CACHE`                | Override local Hugging Face model cache                                      |
 | `OPENCODE_NATIVE_MEMORY_BIN`                 | Development/debug sidecar override                                           |
+| `OPENCODE_MEMORY_WARMUP`                     | Enable model/shared-memory warmup; default `true`                            |
+| `OPENCODE_MEMORY_AUTO_RECALL`                | Enable automatic contextual recall; default `true`                           |
+| `OPENCODE_MEMORY_AUTO_CAPTURE`               | Evaluate compaction candidates through the capture gate; default `true`      |
+| `OPENCODE_MEMORY_SHARED_SYNC`                | Synchronize `.opencode/memory/**/*.md`; default `true`                       |
+| `OPENCODE_MEMORY_FEEDBACK_TRACKING`          | Track retrieval feedback; default `true`                                     |
+| `OPENCODE_MEMORY_MIN_SCORE`                  | Default calibrated search threshold; default `0.42`                          |
 
 Example local model:
 
@@ -136,15 +146,18 @@ Rust sidecar
   -> atomic JSON lifecycle state
 ```
 
-The Protobuf schema is `schema/memory.proto`. Rust bindings are generated at Cargo build time with `prost-build`; TypeScript bindings are committed at `opencode-memory/src/generated/memory_pb.ts` and reproduced with `bun run generate:protocol`.
+The Protobuf schema is `schema/opencode/memory/v1/memory.proto`. Rust bindings are generated at Cargo build time with `prost-build`; TypeScript bindings are committed under `opencode-memory/src/generated/opencode/memory/v1/` and reproduced with `bun run generate:protocol`.
+
+Lifecycle state schema v4 is intentionally new-only. Older state schemas are rejected instead of migrated; move or purge an older project store before using this build. Upserts are journaled before zvec mutation and replayed as an order-independent batch when the engine opens.
 
 ## Development
 
-Requirements: Bun 1.3+, Rust 1.89+, and `protoc`.
+Requirements: Bun 1.3+, Rust 1.97+, `protoc`, and Buf.
 
 ```sh
 bun install
 bun run generate:protocol:check
+bun run lint:proto
 bun run typecheck
 bun run test:ts
 cargo test --locked --lib

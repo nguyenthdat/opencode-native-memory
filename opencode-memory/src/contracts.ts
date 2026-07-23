@@ -62,6 +62,7 @@ export interface MemoryRecord {
   created_at_ms: number;
   updated_at_ms: number;
   scope: (typeof MEMORY_SCOPES)[number];
+  scope_key?: string | null;
   origin: "manual" | "auto_compaction" | "shared_markdown" | "legacy";
   expires_at_ms?: number | null;
   stale: boolean;
@@ -93,6 +94,7 @@ export interface SearchResponse {
   abstained: boolean;
   abstention_reason?: string | null;
   score_version: string;
+  warnings: string[];
   memories: MemoryRecord[];
 }
 
@@ -117,8 +119,35 @@ export interface CuratedCandidate {
   code_paths: string[];
 }
 
+export interface CaptureResponse {
+  decision: {
+    outcome: "skip" | "quarantine" | "accept";
+    reason?: string;
+    confidence?: number;
+    confidence_capped?: boolean;
+  };
+  stored?: {
+    id: string;
+    inserted: boolean;
+    content_hash: string;
+    updated_at_ms: number;
+    scope: (typeof MEMORY_SCOPES)[number];
+  };
+}
+
 export interface SharedMemoryRecord extends CuratedCandidate {
   source: string;
+}
+
+export interface SharedMemoryLoadError {
+  source: string;
+  message: string;
+}
+
+export interface SharedMemoryLoadResult {
+  records: SharedMemoryRecord[];
+  signature: string;
+  errors: SharedMemoryLoadError[];
 }
 
 export interface SharedSyncResponse {

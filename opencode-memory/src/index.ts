@@ -47,7 +47,7 @@ export { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol
 export type { MemoryMethod } from "./protocol.js";
 
 // Plugin factory
-export { createMemoryPlugin } from "./plugin.js";
+export { createMemoryPlugin, resolveMemoryPluginOptions } from "./plugin.js";
 export type { MemoryPluginOptions } from "./plugin.js";
 
 // Session context (testable abstraction)

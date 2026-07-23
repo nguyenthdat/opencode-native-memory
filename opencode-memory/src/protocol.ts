@@ -6,8 +6,8 @@ import {
   ValueListSchema,
   ValueObjectSchema,
   ValueSchema,
-} from "./generated/memory_pb.js";
-import type { Response, Value } from "./generated/memory_pb.js";
+} from "./generated/opencode/memory/v1/memory_pb.js";
+import type { Response, Value } from "./generated/opencode/memory/v1/memory_pb.js";
 import type { RpcResponse } from "./contracts.js";
 
 const MAX_VALUE_DEPTH = 64;
@@ -15,6 +15,9 @@ const MAX_VALUE_DEPTH = 64;
 const METHODS = {
   search: Method.SEARCH,
   store: Method.STORE,
+  capture: Method.CAPTURE,
+  export: Method.EXPORT,
+  import: Method.IMPORT,
   get: Method.GET,
   list: Method.LIST,
   update: Method.UPDATE,

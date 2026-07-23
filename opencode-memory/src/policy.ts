@@ -20,7 +20,50 @@ export const COMPACTION_CONTEXT = `Preserve durable project knowledge across com
 ${CANDIDATES_OPEN}
 [{"title":"...","content":"...","kind":"decision|preference|fact|pattern|gotcha","importance":0.0,"tags":["..."],"code_paths":["relative/path"]}]
 ${CANDIDATES_CLOSE}
-Facts require at least one code_paths entry. Do not include Markdown fences.`;
+Importance must be between 0 and 0.6 inclusive. Facts require at least one code_paths entry. Do not include Markdown fences.`;
+
+interface RecallQueryPart {
+  type: string;
+  text?: unknown;
+  synthetic?: unknown;
+  ignored?: unknown;
+  filename?: unknown;
+  mime?: unknown;
+  url?: unknown;
+  source?: unknown;
+}
+
+export function deriveRecallQuery(parts: readonly RecallQueryPart[]): string | undefined {
+  const text = parts
+    .flatMap((part) =>
+      part.type === "text" &&
+      typeof part.text === "string" &&
+      part.synthetic !== true &&
+      part.ignored !== true
+        ? [part.text]
+        : [],
+    )
+    .join("\n")
+    .trim();
+  if (text) return text;
+
+  const metadata = parts.flatMap((part) => {
+    if (part.type !== "file") return [];
+    if (isObject(part.source)) {
+      const path = safeMetadataText(part.source.path);
+      if (part.source.type === "symbol") {
+        const name = safeMetadataText(part.source.name);
+        if (name && path) return [`Symbol: ${name} (${path})`];
+        if (name) return [`Symbol: ${name}`];
+      }
+      if (path) return [`File: ${path}`];
+    }
+    const filename = safeMetadataText(part.filename);
+    return filename ? [`File: ${filename}`] : [];
+  });
+  const query = metadata.join("\n").trim();
+  return query || undefined;
+}
 
 export function formatRecalledMemories(
   response: SearchResponse,
@@ -83,40 +126,47 @@ export function parseCuratedCandidates(content: string): CuratedCandidate[] {
   } catch {
     return [];
   }
-  if (!Array.isArray(parsed) || parsed.length > 3) return [];
+  if (!Array.isArray(parsed)) return [];
   const candidates: CuratedCandidate[] = [];
   for (const value of parsed) {
-    if (!isObject(value)) return [];
-    const allowed = new Set(["title", "content", "kind", "importance", "tags", "code_paths"]);
-    if (Object.keys(value).some((key) => !allowed.has(key))) return [];
-    if (
-      typeof value.title !== "string" ||
-      value.title.length === 0 ||
-      value.title.length > 160 ||
-      typeof value.content !== "string" ||
-      value.content.length === 0 ||
-      value.content.length > 6_000 ||
-      !MEMORY_KINDS.includes(value.kind as (typeof MEMORY_KINDS)[number]) ||
-      value.kind === "summary" ||
-      typeof value.importance !== "number" ||
-      value.importance < 0 ||
-      value.importance > 0.6 ||
-      !isStringArray(value.tags, 12, 64) ||
-      !isStringArray(value.code_paths, 12, 512) ||
-      (value.kind === "fact" && value.code_paths.length === 0)
-    ) {
-      return [];
-    }
-    candidates.push({
-      title: value.title,
-      content: value.content,
-      kind: value.kind as CuratedCandidate["kind"],
-      importance: value.importance,
-      tags: value.tags,
-      code_paths: value.code_paths,
-    });
+    const candidate = parseCuratedCandidate(value);
+    if (candidate) candidates.push(candidate);
+    if (candidates.length === 3) break;
   }
   return candidates;
+}
+
+function parseCuratedCandidate(value: unknown): CuratedCandidate | undefined {
+  if (!isObject(value)) return undefined;
+  const allowed = new Set(["title", "content", "kind", "importance", "tags", "code_paths"]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) return undefined;
+  if (
+    typeof value.title !== "string" ||
+    value.title.length === 0 ||
+    value.title.length > 160 ||
+    typeof value.content !== "string" ||
+    value.content.length === 0 ||
+    value.content.length > 6_000 ||
+    !MEMORY_KINDS.includes(value.kind as (typeof MEMORY_KINDS)[number]) ||
+    value.kind === "summary" ||
+    typeof value.importance !== "number" ||
+    !Number.isFinite(value.importance) ||
+    value.importance < 0 ||
+    value.importance > 0.6 ||
+    !isStringArray(value.tags, 12, 64) ||
+    !isStringArray(value.code_paths, 12, 512) ||
+    (value.kind === "fact" && value.code_paths.length === 0)
+  ) {
+    return undefined;
+  }
+  return {
+    title: value.title,
+    content: value.content,
+    kind: value.kind as CuratedCandidate["kind"],
+    importance: value.importance,
+    tags: value.tags,
+    code_paths: value.code_paths,
+  };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -129,4 +179,10 @@ function isStringArray(value: unknown, maxItems: number, maxLength: number): val
     value.length <= maxItems &&
     value.every((item) => typeof item === "string" && item.length > 0 && item.length <= maxLength)
   );
+}
+
+function safeMetadataText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  return text ? truncateText(text, 512) : undefined;
 }

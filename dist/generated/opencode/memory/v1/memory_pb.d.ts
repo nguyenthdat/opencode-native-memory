@@ -1,9 +1,9 @@
 import type { GenEnum, GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
 /**
- * Describes the file memory.proto.
+ * Describes the file opencode/memory/v1/memory.proto.
  */
-export declare const file_memory: GenFile;
+export declare const file_opencode_memory_v1_memory: GenFile;
 /**
  * @generated from message opencode.memory.v1.ValueList
  */
@@ -218,7 +218,19 @@ export declare enum Method {
     /**
      * @generated from enum value: METHOD_SHUTDOWN = 16;
      */
-    SHUTDOWN = 16
+    SHUTDOWN = 16,
+    /**
+     * @generated from enum value: METHOD_CAPTURE = 17;
+     */
+    CAPTURE = 17,
+    /**
+     * @generated from enum value: METHOD_EXPORT = 18;
+     */
+    EXPORT = 18,
+    /**
+     * @generated from enum value: METHOD_IMPORT = 19;
+     */
+    IMPORT = 19
 }
 /**
  * Describes the enum opencode.memory.v1.Method.

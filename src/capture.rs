@@ -192,6 +192,7 @@ impl Default for CaptureGate {
             DEFAULT_ACTIONABILITY_THRESHOLD,
             AUTO_COMPACTION_CONFIDENCE_CAP,
         )
+        .expect("default capture thresholds are valid")
     }
 }
 
@@ -201,20 +202,22 @@ impl CaptureGate {
     /// # Errors
     ///
     /// Returns an error if any threshold is non-finite or outside `[0, 1]`.
-    #[must_use]
     pub fn new(
         significance_threshold: f32,
         actionability_threshold: f32,
         auto_compaction_confidence_cap: f32,
-    ) -> Self {
-        debug_assert!(significance_threshold.is_finite());
-        debug_assert!(actionability_threshold.is_finite());
-        debug_assert!(auto_compaction_confidence_cap.is_finite());
-        Self {
+    ) -> Result<Self> {
+        validate_unit_finite("significance_threshold", significance_threshold)?;
+        validate_unit_finite("actionability_threshold", actionability_threshold)?;
+        validate_unit_finite(
+            "auto_compaction_confidence_cap",
+            auto_compaction_confidence_cap,
+        )?;
+        Ok(Self {
             significance_threshold,
             actionability_threshold,
             auto_compaction_confidence_cap,
-        }
+        })
     }
 
     /// Significance threshold.
@@ -378,6 +381,13 @@ mod tests {
             suggested_supersession_ids: Vec::new(),
             suggested_conflict_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn rejects_invalid_custom_thresholds() {
+        assert!(CaptureGate::new(f32::NAN, 0.5, 0.6).is_err());
+        assert!(CaptureGate::new(0.5, 1.1, 0.6).is_err());
+        assert!(CaptureGate::new(0.5, 0.5, -0.1).is_err());
     }
 
     #[test]

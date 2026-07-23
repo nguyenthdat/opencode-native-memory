@@ -5,6 +5,7 @@ import type {
   ListResponse,
   SearchResponse,
   SharedSyncResponse,
+  CaptureResponse,
 } from "./contracts.js";
 import {
   MEMORY_KINDS,
@@ -23,6 +24,7 @@ import {
   truncateText,
   contextBudgetChars,
   parseCuratedCandidates,
+  deriveRecallQuery,
 } from "./policy.js";
 import {
   SHARED_MEMORY_RELATIVE_DIR,
@@ -30,15 +32,21 @@ import {
   writeSharedMemory,
 } from "./shared-markdown.js";
 import { SessionContext } from "./session-context.js";
-import { validateUpdateArgs } from "./validation.js";
+import { validateDeleteRecords, validateUpdateArgs } from "./validation.js";
 
 export interface MemoryPluginOptions {
   root: string;
   warmup?: boolean;
+  automaticRecall?: boolean;
+  automaticCapture?: boolean;
+  sharedSync?: boolean;
+  feedbackTracking?: boolean;
+  minScore?: number;
 }
 
 export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
   return async ({ client: opencode, directory, worktree }) => {
+    const settings = resolveMemoryPluginOptions(options);
     const native = new NativeMemoryClient(options.root, worktree);
     const session = new SessionContext(
       native,
@@ -49,9 +57,13 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     let sharedSync: Promise<void> | undefined;
 
     const syncSharedMemories = async (force = false): Promise<void> => {
+      if (!settings.sharedSync) return;
       if (sharedSync) return await sharedSync;
       sharedSync = (async () => {
         const loaded = await loadSharedMemories(worktree);
+        for (const error of loaded.errors) {
+          session.warnOnce(new Error(`${error.source}: ${error.message}`));
+        }
         if (!force && loaded.signature === sharedSignature) return;
         const response = await native.request<SharedSyncResponse>("sync_shared", {
           records: loaded.records,
@@ -60,14 +72,14 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
           throw new Error(`Rejected shared memories: ${response.rejected_sources.join(", ")}`);
         }
         sharedSignature = loaded.signature;
-        session.recallCache.clear();
+        session.invalidateRecall();
       })().finally(() => {
         sharedSync = undefined;
       });
       await sharedSync;
     };
 
-    if (options.warmup !== false) {
+    if (settings.warmup) {
       void Promise.all([native.request("status"), syncSharedMemories()]).catch(session.warnOnce);
     }
 
@@ -79,7 +91,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
           ),
         );
         session.latestQuery.clear();
-        session.recallCache.clear();
+        session.invalidateRecall();
         session.pendingRecall.clear();
         session.sessionParents.clear();
         session.sessionRoots.clear();
@@ -107,7 +119,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           const sessID = event.properties.info.id;
           await session.closePendingRecall(sessID, "ignored");
           session.latestQuery.delete(sessID);
-          session.recallCache.delete(sessID);
+          session.invalidateRecall(sessID);
           session.sessionParents.delete(sessID);
           session.sessionRoots.delete(sessID);
           session.sessionAgents.delete(sessID);
@@ -122,7 +134,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           return;
         }
         if (event.type === "file.edited" || event.type === "file.watcher.updated") {
-          session.recallCache.clear();
+          session.invalidateRecall();
           const file = event.properties.file.replaceAll("\\", "/");
           if (file.includes(`/${SHARED_MEMORY_RELATIVE_DIR}/`)) {
             sharedSignature = undefined;
@@ -130,6 +142,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           return;
         }
         if (event.type !== "session.compacted") return;
+        if (!settings.automaticCapture) return;
 
         try {
           const response = await opencode.session.messages({
@@ -146,80 +159,109 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             .trim();
           if (!content) return;
           const candidates = parseCuratedCandidates(content);
+          let storedAny = false;
           for (const candidate of candidates) {
             try {
-              await native.request("store", {
-                ...candidate,
-                source: `session:${event.properties.sessionID}:compaction`,
-                scope: "project",
-                origin: "auto_compaction",
-                revive: false,
+              const response = await native.request<CaptureResponse>("capture", {
+                candidate: {
+                  ...candidate,
+                  source: `session:${event.properties.sessionID}:compaction`,
+                  scope: "project",
+                  origin: "auto_compaction",
+                  revive: false,
+                },
+                significance: candidate.importance,
+                impact: candidate.kind === "decision" || candidate.kind === "gotcha" ? 0.8 : 0.6,
+                rarity: candidate.code_paths.length > 0 ? 0.7 : 0.5,
+                source_trust: "agent",
+                has_valid_evidence: candidate.code_paths.length > 0,
+                suggested_supersession_ids: [],
+                suggested_conflict_ids: [],
               });
+              storedAny ||= response.stored !== undefined;
             } catch (error) {
               session.warnOnce(error);
             }
           }
-          if (candidates.length > 0) session.recallCache.clear();
+          if (storedAny) session.invalidateRecall();
         } catch (error) {
           session.warnOnce(error);
         }
       },
       "chat.message": async (input, output) => {
+        session.latestQuery.delete(input.sessionID);
+        session.invalidateRecall(input.sessionID);
         await session.closePendingRecall(input.sessionID, "ignored");
-        const query = output.parts
-          .flatMap((part) =>
-            part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
-          )
-          .join("\n")
-          .trim();
+        const query = deriveRecallQuery(output.parts);
         if (!query) return;
         if (input.agent) session.sessionAgents.set(input.sessionID, input.agent);
         session.latestQuery.set(input.sessionID, {
           query: truncateText(query, 2_000),
           agent: input.agent,
         });
-        session.recallCache.delete(input.sessionID);
       },
       "experimental.chat.system.transform": async (input, output) => {
         if (!output.system.some((entry) => entry.includes(MEMORY_POLICY_MARKER))) {
           output.system.push(MEMORY_POLICY);
         }
         if (!input.sessionID) return;
-        const latest = session.latestQuery.get(input.sessionID);
+        if (!settings.automaticRecall) return;
+        const sessionID = input.sessionID;
+        const latest = session.latestQuery.get(sessionID);
         if (!latest) return;
         try {
           await syncSharedMemories();
         } catch (error) {
           session.warnOnce(error);
         }
+        if (session.latestQuery.get(input.sessionID) !== latest) return;
         const rootSessionID = await session.resolveSessionRoot(input.sessionID);
         const agent = latest.agent ?? session.sessionAgents.get(input.sessionID) ?? "unknown";
         const budgetChars = contextBudgetChars(input.model);
+        const recallGeneration = session.recallGeneration(input.sessionID);
         const cacheKey = [
           latest.query,
           rootSessionID,
           agent,
           budgetChars,
           sharedSignature ?? "none",
+          recallGeneration,
         ].join("\0");
 
         let cached = session.recallCache.get(input.sessionID);
         if (!cached || cached.key !== cacheKey) {
+          await session.closePendingRecall(input.sessionID, "ignored");
+          if (
+            session.latestQuery.get(input.sessionID) !== latest ||
+            session.recallGeneration(input.sessionID) !== recallGeneration
+          ) {
+            return;
+          }
           try {
-            const response = await native.request<SearchResponse>("search", {
-              query: latest.query,
-              max_results: 20,
-              budget_chars: budgetChars,
-              kinds: [],
-              scopes: [],
-              taxonomies: [],
-              session_scope_key: rootSessionID,
-              agent_scope_key: agent,
-              min_score: 0.42,
-              include_stale: false,
-              include_superseded: false,
-              track_feedback: true,
+            const response = await session.searchRecallOnce(input.sessionID, cacheKey, async () => {
+              const response = await native.request<SearchResponse>("search", {
+                query: latest.query,
+                max_results: 20,
+                budget_chars: budgetChars,
+                kinds: [],
+                scopes: [],
+                taxonomies: [],
+                session_scope_key: rootSessionID,
+                agent_scope_key: agent,
+                min_score: settings.minScore,
+                include_stale: false,
+                include_superseded: false,
+                track_feedback: settings.feedbackTracking,
+              });
+              for (const warning of response.warnings) session.warnOnce(new Error(warning));
+              return response;
             });
+            if (
+              session.latestQuery.get(input.sessionID) !== latest ||
+              session.recallGeneration(input.sessionID) !== recallGeneration
+            ) {
+              return;
+            }
             cached = { key: cacheKey, response };
             session.recallCache.set(input.sessionID, cached);
           } catch (error) {
@@ -228,14 +270,22 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           }
         }
         const formatted = formatRecalledMemories(cached.response, budgetChars);
-        if (!formatted || !cached.response.retrieval_id) return;
-        output.system.push(formatted.text);
+        if (!formatted) return;
+        if (!settings.feedbackTracking || !cached.response.retrieval_id) {
+          output.system.push(formatted.text);
+          return;
+        }
         const pending = {
           retrievalID: cached.response.retrieval_id,
           memoryIDs: formatted.memoryIDs,
         };
-        await session.recordFeedback(pending, "injected");
-        session.pendingRecall.set(input.sessionID, pending);
+        const opened = await session.openPendingRecall(sessionID, pending, () => {
+          return (
+            session.latestQuery.get(sessionID) === latest &&
+            session.recallGeneration(sessionID) === recallGeneration
+          );
+        });
+        if (opened) output.system.push(formatted.text);
       },
       "experimental.session.compacting": async (_input, output) => {
         output.context.push(COMPACTION_CONTEXT);
@@ -283,7 +333,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .number()
               .min(0)
               .max(1)
-              .default(0.42)
+              .default(settings.minScore)
               .describe("Minimum calibrated relevance score."),
             include_stale: tool.schema
               .boolean()
@@ -312,17 +362,21 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 min_score: args.min_score,
                 include_stale: args.include_stale,
                 include_superseded: args.include_superseded,
-                track_feedback: true,
+                track_feedback: settings.feedbackTracking,
               },
               context.abort,
             );
-            if (response.retrieval_id && response.memories.length > 0) {
+            for (const warning of response.warnings) session.warnOnce(new Error(warning));
+            if (
+              settings.feedbackTracking &&
+              response.retrieval_id &&
+              response.memories.length > 0
+            ) {
               const pending = {
                 retrievalID: response.retrieval_id,
                 memoryIDs: response.memories.map((memory) => memory.id),
               };
-              await session.recordFeedback(pending, "injected");
-              session.pendingRecall.set(context.sessionID, pending);
+              await session.openPendingRecall(context.sessionID, pending);
             }
             return result("Memory search", response, {
               count: response.count,
@@ -414,7 +468,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               },
               context.abort,
             );
-            session.recallCache.clear();
+            session.invalidateRecall();
             return result("Stored memory", response, {
               id: response.id,
               inserted: response.inserted,
@@ -538,7 +592,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               { ...args, scope_key: key, ...keys },
               context.abort,
             );
-            session.recallCache.clear();
+            session.invalidateRecall();
             return result("Updated memory", response, response);
           },
         }),
@@ -557,7 +611,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               { ...args, ...keys },
               context.abort,
             );
-            session.recallCache.clear();
+            session.invalidateRecall();
             return result(args.pinned ? "Pinned memory" : "Unpinned memory", response, response);
           },
         }),
@@ -580,7 +634,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               { ...args, ...keys },
               context.abort,
             );
-            session.recallCache.clear();
+            session.invalidateRecall();
             return result(
               args.lock_action === "lock" ? "Locked memory" : "Unlocked memory",
               response,
@@ -602,19 +656,25 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .default("user_deleted"),
           },
           async execute(args, context) {
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
+            const records = await native.request<MemoryRecord[]>(
+              "get",
+              { ids: args.ids, ...keys },
+              context.abort,
+            );
+            validateDeleteRecords(records);
             await context.ask({
               permission: "memory_delete",
               patterns: args.ids,
               always: [],
               metadata: { operation: "delete", ...args },
             });
-            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
             const response = await native.request<Record<string, unknown>>(
               "delete",
               { ...args, ...keys },
               context.abort,
             );
-            session.recallCache.clear();
+            session.invalidateRecall();
             return result("Deleted memories", response, response);
           },
         }),
@@ -693,6 +753,61 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             return result("Promoted memory", { id: memory.id, path }, { id: memory.id, path });
           },
         }),
+        memory_export: tool({
+          description:
+            "Export visible memories, lifecycle relations, and tombstones as a portable JSON snapshot.",
+          args: {
+            include_expired: tool.schema.boolean().default(true),
+            include_superseded: tool.schema.boolean().default(true),
+          },
+          async execute(args, context) {
+            const keys = await session.managementScopeKeys(context.sessionID, context.agent);
+            const snapshot = await native.request<Record<string, unknown>>(
+              "export",
+              { ...args, ...keys },
+              context.abort,
+            );
+            return result("Memory snapshot", snapshot, {
+              format_version: snapshot.format_version,
+              source_project_id: snapshot.source_project_id,
+            });
+          },
+        }),
+        memory_import: tool({
+          description:
+            "Import a native-memory JSON snapshot after validating IDs, relations, lifecycle metadata, and content safety.",
+          args: {
+            snapshot_json: tool.schema
+              .string()
+              .min(2)
+              .max(4_000_000)
+              .describe("Exact JSON returned by memory_export."),
+          },
+          async execute(args, context) {
+            let snapshot: unknown;
+            try {
+              snapshot = JSON.parse(args.snapshot_json);
+            } catch (error) {
+              throw new Error("snapshot_json is not valid JSON", { cause: error });
+            }
+            if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
+              throw new Error("snapshot_json must contain a snapshot object");
+            }
+            await context.ask({
+              permission: "memory_import",
+              patterns: ["native-memory-snapshot"],
+              always: [],
+              metadata: { operation: "import" },
+            });
+            const response = await native.request<Record<string, unknown>>(
+              "import",
+              { snapshot },
+              context.abort,
+            );
+            session.invalidateRecall();
+            return result("Imported memory snapshot", response, response);
+          },
+        }),
         memory_purge: tool({
           description:
             "Delete all local indexed memories for the current project. Shared Markdown files are preserved.",
@@ -715,7 +830,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               args,
               context.abort,
             );
-            session.recallCache.clear();
+            session.invalidateRecall();
             session.pendingRecall.clear();
             sharedSignature = undefined;
             return result("Purged memory", response, response);
@@ -731,7 +846,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               {},
               context.abort,
             );
-            session.recallCache.clear();
+            session.invalidateRecall();
             return result("Optimized memory", response, response);
           },
         }),
@@ -769,6 +884,49 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
       },
     };
   };
+}
+
+interface ResolvedMemoryPluginOptions {
+  warmup: boolean;
+  automaticRecall: boolean;
+  automaticCapture: boolean;
+  sharedSync: boolean;
+  feedbackTracking: boolean;
+  minScore: number;
+}
+
+export function resolveMemoryPluginOptions(
+  options: MemoryPluginOptions,
+): ResolvedMemoryPluginOptions {
+  const minScore = options.minScore ?? envNumber("OPENCODE_MEMORY_MIN_SCORE", 0.42);
+  if (!Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
+    throw new Error("memory minScore must be between 0 and 1");
+  }
+  return {
+    warmup: options.warmup ?? envBoolean("OPENCODE_MEMORY_WARMUP", true),
+    automaticRecall: options.automaticRecall ?? envBoolean("OPENCODE_MEMORY_AUTO_RECALL", true),
+    automaticCapture: options.automaticCapture ?? envBoolean("OPENCODE_MEMORY_AUTO_CAPTURE", true),
+    sharedSync: options.sharedSync ?? envBoolean("OPENCODE_MEMORY_SHARED_SYNC", true),
+    feedbackTracking:
+      options.feedbackTracking ?? envBoolean("OPENCODE_MEMORY_FEEDBACK_TRACKING", true),
+    minScore,
+  };
+}
+
+function envBoolean(name: string, fallback: boolean): boolean {
+  const value = process.env[name];
+  if (value === undefined || value === "") return fallback;
+  if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
+  if (["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
+  throw new Error(`${name} must be a boolean`);
+}
+
+function envNumber(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error(`${name} must be a finite number`);
+  return parsed;
 }
 
 function result(title: string, value: unknown, metadata: Record<string, unknown>): ToolResult {

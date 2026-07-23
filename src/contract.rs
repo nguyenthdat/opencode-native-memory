@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::capture::{CaptureDecision, SourceTrust};
 use crate::taxonomy::MemoryTaxonomy;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -122,7 +123,7 @@ pub struct FeedbackStats {
     pub error: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScoreBreakdown {
     pub dense: f32,
     pub reciprocal_rank: f32,
@@ -167,6 +168,27 @@ pub struct StoreRequest {
     /// defaults to `importance` (capped at 0.6 for auto-compaction).
     #[serde(default)]
     pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRequest {
+    pub candidate: StoreRequest,
+    pub significance: f32,
+    pub impact: f32,
+    pub rarity: f32,
+    #[serde(default)]
+    pub source_trust: SourceTrust,
+    #[serde(default)]
+    pub has_valid_evidence: bool,
+    #[serde(default)]
+    pub suggested_supersession_ids: Vec<String>,
+    #[serde(default)]
+    pub suggested_conflict_ids: Vec<String>,
+    #[serde(default)]
+    pub session_scope_key: Option<String>,
+    #[serde(default)]
+    pub agent_scope_key: Option<String>,
 }
 
 const fn default_importance() -> f32 {
@@ -388,7 +410,7 @@ pub struct DoctorRequest {
     pub deep: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemoryRecord {
     pub id: String,
     pub title: String,
@@ -400,6 +422,8 @@ pub struct MemoryRecord {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub scope: MemoryScope,
+    #[serde(default)]
+    pub scope_key: Option<String>,
     pub origin: MemoryOrigin,
     pub expires_at_ms: Option<i64>,
     pub pinned: bool,
@@ -427,6 +451,54 @@ pub struct MemoryRecord {
     pub score_breakdown: Option<ScoreBreakdown>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportRequest {
+    #[serde(default)]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub include_superseded: bool,
+    #[serde(default)]
+    pub session_scope_key: Option<String>,
+    #[serde(default)]
+    pub agent_scope_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TombstoneSnapshot {
+    pub fingerprint: String,
+    pub kind: MemoryKind,
+    pub scope: MemoryScope,
+    #[serde(default)]
+    pub scope_key: Option<String>,
+    pub deleted_at_ms: i64,
+    pub reason: DeleteReason,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySnapshot {
+    pub format_version: u32,
+    pub source_project_id: String,
+    pub exported_at_ms: i64,
+    pub memories: Vec<MemoryRecord>,
+    #[serde(default)]
+    pub tombstones: Vec<TombstoneSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportRequest {
+    pub snapshot: MemorySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportResponse {
+    pub imported: usize,
+    pub tombstones_imported: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreResponse {
     pub id: String,
@@ -434,6 +506,13 @@ pub struct StoreResponse {
     pub content_hash: String,
     pub updated_at_ms: i64,
     pub scope: MemoryScope,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CaptureResponse {
+    pub decision: CaptureDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored: Option<StoreResponse>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -447,6 +526,7 @@ pub struct SearchResponse {
     pub abstained: bool,
     pub abstention_reason: Option<String>,
     pub score_version: &'static str,
+    pub warnings: Vec<String>,
     pub memories: Vec<MemoryRecord>,
 }
 
@@ -561,6 +641,8 @@ pub struct StatusResponse {
     pub metadata_count: usize,
     pub tombstone_count: usize,
     pub retrieval_count: usize,
+    pub pending_upsert_count: usize,
+    pub pending_delete_count: usize,
     pub indexes: Vec<IndexStatus>,
     /// Phase 1 capability strings advertised to the TypeScript client. The
     /// current set is `["phase1_taxonomy_lifecycle_v1"]`.
@@ -589,6 +671,8 @@ pub struct DoctorResponse {
     pub expired_count: usize,
     pub tombstone_count: usize,
     pub retrieval_count: usize,
+    pub pending_upsert_count: usize,
+    pub pending_delete_count: usize,
     pub git_sha: Option<String>,
     pub warnings: Vec<String>,
 }

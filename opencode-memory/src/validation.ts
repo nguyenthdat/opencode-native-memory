@@ -1,3 +1,4 @@
+import type { MemoryRecord } from "./contracts.js";
 import { LOCK_ACTIONS, LOCK_REASON_MAX, UNLOCK_FORBIDDEN_FIELDS } from "./contracts.js";
 
 export function validateUpdateArgs(args: Record<string, unknown>): void {
@@ -35,4 +36,16 @@ export function validateUpdateArgs(args: Record<string, unknown>): void {
       }
     }
   }
+}
+
+export function validateDeleteRecords(
+  records: readonly Pick<MemoryRecord, "id" | "scope" | "source">[],
+): void {
+  const repositoryRecords = records.filter((record) => record.scope === "repository");
+  if (repositoryRecords.length === 0) return;
+  const details = repositoryRecords.map((record) => `${record.id} (${record.source})`).join(", ");
+  throw new Error(
+    `Repository memories are canonical Markdown and cannot be deleted with memory_delete: ${details}. ` +
+      "Edit or remove their .opencode/memory files instead.",
+  );
 }

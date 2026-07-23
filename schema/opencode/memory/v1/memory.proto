@@ -20,6 +20,9 @@ enum Method {
   METHOD_OPTIMIZE = 14;
   METHOD_DOCTOR = 15;
   METHOD_SHUTDOWN = 16;
+  METHOD_CAPTURE = 17;
+  METHOD_EXPORT = 18;
+  METHOD_IMPORT = 19;
 }
 
 message ValueList {

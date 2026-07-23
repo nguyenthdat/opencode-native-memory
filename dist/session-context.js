@@ -10,6 +10,9 @@ export class SessionContext {
     sessionRoots = new Map();
     sessionAgents = new Map();
     warnings = new Set();
+    recallEpoch = 0;
+    sessionRecallEpochs = new Map();
+    automaticRecallSearches = new Map();
     constructor(native, getSessionAPI, directory) {
         this.native = native;
         this.getSessionAPI = getSessionAPI;
@@ -87,6 +90,47 @@ export class SessionContext {
             return;
         this.pendingRecall.delete(sessionID);
         await this.recordFeedback(pending, event);
+    }
+    async openPendingRecall(sessionID, pending, isCurrent = () => true) {
+        while (this.pendingRecall.has(sessionID)) {
+            await this.closePendingRecall(sessionID, "ignored");
+            if (!isCurrent())
+                return false;
+        }
+        if (!isCurrent())
+            return false;
+        this.pendingRecall.set(sessionID, pending);
+        await this.recordFeedback(pending, "injected");
+        if (isCurrent())
+            return true;
+        if (this.pendingRecall.get(sessionID) === pending) {
+            await this.closePendingRecall(sessionID, "ignored");
+        }
+        return false;
+    }
+    invalidateRecall(sessionID) {
+        if (sessionID === undefined) {
+            this.recallEpoch += 1;
+            this.recallCache.clear();
+            return;
+        }
+        this.sessionRecallEpochs.set(sessionID, (this.sessionRecallEpochs.get(sessionID) ?? 0) + 1);
+        this.recallCache.delete(sessionID);
+    }
+    recallGeneration(sessionID) {
+        return `${this.recallEpoch}:${this.sessionRecallEpochs.get(sessionID) ?? 0}`;
+    }
+    async searchRecallOnce(sessionID, key, search) {
+        const current = this.automaticRecallSearches.get(sessionID);
+        if (current?.key === key)
+            return await current.promise;
+        const promise = search().finally(() => {
+            if (this.automaticRecallSearches.get(sessionID)?.promise === promise) {
+                this.automaticRecallSearches.delete(sessionID);
+            }
+        });
+        this.automaticRecallSearches.set(sessionID, { key, promise });
+        return await promise;
     }
 }
 //# sourceMappingURL=session-context.js.map

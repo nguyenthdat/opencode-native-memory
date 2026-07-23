@@ -1,8 +1,11 @@
-import { Method } from "./generated/memory_pb.js";
+import { Method } from "./generated/opencode/memory/v1/memory_pb.js";
 import type { RpcResponse } from "./contracts.js";
 declare const METHODS: {
     readonly search: Method.SEARCH;
     readonly store: Method.STORE;
+    readonly capture: Method.CAPTURE;
+    readonly export: Method.EXPORT;
+    readonly import: Method.IMPORT;
     readonly get: Method.GET;
     readonly list: Method.LIST;
     readonly update: Method.UPDATE;

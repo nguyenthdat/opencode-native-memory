@@ -6,7 +6,7 @@ import {
   ResponseSchema,
   ValueObjectSchema,
   ValueSchema,
-} from "./generated/memory_pb.js";
+} from "./generated/opencode/memory/v1/memory_pb.js";
 import { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";
 
 describe("Protobuf memory protocol", () => {

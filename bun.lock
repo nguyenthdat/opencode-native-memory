@@ -17,11 +17,11 @@
         "typescript": "^5.9.3",
       },
       "optionalDependencies": {
-        "@nguyenthdat/opencode-memory-darwin-arm64": "0.2.0",
-        "@nguyenthdat/opencode-memory-darwin-x64": "0.2.0",
-        "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.2.0",
-        "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.2.0",
-        "@nguyenthdat/opencode-memory-win32-x64-msvc": "0.2.0",
+        "@nguyenthdat/opencode-memory-darwin-arm64": "0.3.0",
+        "@nguyenthdat/opencode-memory-darwin-x64": "0.3.0",
+        "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.3.0",
+        "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.0",
+        "@nguyenthdat/opencode-memory-win32-x64-msvc": "0.3.0",
       },
       "peerDependencies": {
         "@opencode-ai/plugin": ">=1.18.4 <2",

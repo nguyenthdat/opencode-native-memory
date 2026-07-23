@@ -1,9 +1,12 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { Method, RequestSchema, ResponseSchema, ValueListSchema, ValueObjectSchema, ValueSchema, } from "./generated/memory_pb.js";
+import { Method, RequestSchema, ResponseSchema, ValueListSchema, ValueObjectSchema, ValueSchema, } from "./generated/opencode/memory/v1/memory_pb.js";
 const MAX_VALUE_DEPTH = 64;
 const METHODS = {
     search: Method.SEARCH,
     store: Method.STORE,
+    capture: Method.CAPTURE,
+    export: Method.EXPORT,
+    import: Method.IMPORT,
     get: Method.GET,
     list: Method.LIST,
     update: Method.UPDATE,

@@ -1,6 +1,6 @@
 {
   "name": "@nguyenthdat/opencode-memory-win32-x64-msvc",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Native OpenCode memory sidecar for Windows x64 MSVC",
   "os": [
     "win32"

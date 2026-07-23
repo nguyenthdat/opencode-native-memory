@@ -6,7 +6,7 @@ export { NativeMemoryClient, resolveNativeMemoryBinary, REQUEST_TIMEOUT_MS, INIT
 export type { SpawnFn } from "./sidecar-client.js";
 export { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";
 export type { MemoryMethod } from "./protocol.js";
-export { createMemoryPlugin } from "./plugin.js";
+export { createMemoryPlugin, resolveMemoryPluginOptions } from "./plugin.js";
 export type { MemoryPluginOptions } from "./plugin.js";
 export { SessionContext } from "./session-context.js";
 export { validateUpdateArgs } from "./validation.js";

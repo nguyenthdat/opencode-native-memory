@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use zvec_rust::{Doc, Fts, SearchQuery};
 
 use super::{MemoryEngine, StoredMemory, decorate_memory, now_ms, stored_memory_from_doc};
@@ -56,13 +56,21 @@ impl MemoryEngine {
         let filter = kind_filter(&request.kinds);
         let dense_documents =
             self.dense_query(&query_embedding, candidate_count, filter.as_deref())?;
-        let lexical_documents = self
-            .lexical_query(&query_text, candidate_count, filter.as_deref())
-            .unwrap_or_default();
+        let (lexical_documents, warnings) =
+            match self.lexical_query(&query_text, candidate_count, filter.as_deref()) {
+                Ok(documents) => (documents, Vec::new()),
+                Err(error) => (
+                    Vec::new(),
+                    vec![format!(
+                        "lexical retrieval degraded to dense-only: {error:#}"
+                    )],
+                ),
+            };
         let candidates = merge_candidates(&dense_documents, &lexical_documents)?;
         let considered = candidates.len();
         let now = now_ms()?;
-        let (ranked, mut state_dirty) = self.rank_candidates(candidates, request, &query_text, now);
+        let ranked = self.rank_candidates(candidates, request, &query_text, now)?;
+        let mut state_dirty = false;
 
         let ranked = deduplicate_layers(ranked);
         let (memories, used_chars) = select_mmr(ranked, max_results, budget_chars);
@@ -105,6 +113,7 @@ impl MemoryEngine {
             abstained,
             abstention_reason,
             score_version: SCORE_VERSION,
+            warnings,
             memories,
         })
     }
@@ -115,25 +124,23 @@ impl MemoryEngine {
         request: &SearchRequest,
         query_text: &str,
         now: i64,
-    ) -> (Vec<RankedMemory>, bool) {
+    ) -> Result<Vec<RankedMemory>> {
         let mut ranked = Vec::with_capacity(candidates.len());
-        let mut state_dirty = false;
         for candidate in candidates.into_values() {
             if self.state.pending_deletes.contains(&candidate.memory.id) {
                 continue;
             }
-            let metadata = self.state.metadata(
-                &candidate.memory.id,
-                candidate.memory.kind,
-                candidate.memory.created_at_ms,
-                candidate.memory.importance,
-            );
-            if !self.state.records.contains_key(&candidate.memory.id) {
-                self.state
-                    .records
-                    .insert(candidate.memory.id.clone(), metadata.clone());
-                state_dirty = true;
-            }
+            let metadata = self
+                .state
+                .records
+                .get(&candidate.memory.id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "zvec memory {} has no lifecycle metadata; run memory_doctor",
+                        candidate.memory.id
+                    )
+                })?;
             if !scope_visible(&metadata, request) || is_expired(&metadata, now) {
                 continue;
             }
@@ -176,7 +183,10 @@ impl MemoryEngine {
             if score < request.min_score.max(ABSTENTION_THRESHOLD) {
                 continue;
             }
-            let mut memory = decorate_memory(candidate.memory, metadata, stale);
+            let revision = self
+                .state
+                .record_revision(&candidate.memory.id, candidate.memory.updated_at_ms);
+            let mut memory = decorate_memory(candidate.memory, metadata, stale, revision);
             memory.content = truncate_chars(&memory.content, MAX_EXCERPT_CHARS);
             memory.score = Some(score);
             memory.score_breakdown = Some(ScoreBreakdown {
@@ -190,7 +200,7 @@ impl MemoryEngine {
             });
             ranked.push(RankedMemory { memory, score });
         }
-        (ranked, state_dirty)
+        Ok(ranked)
     }
 
     fn dense_query(
@@ -435,6 +445,7 @@ fn empty_search_response(query: String, budget_chars: usize, reason: &str) -> Se
         abstained: true,
         abstention_reason: Some(reason.to_string()),
         score_version: SCORE_VERSION,
+        warnings: Vec::new(),
         memories: Vec::new(),
     }
 }
@@ -526,6 +537,7 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 1,
                 scope,
+                scope_key: None,
                 origin: MemoryOrigin::Manual,
                 expires_at_ms: None,
                 pinned: false,

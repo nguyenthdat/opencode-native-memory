@@ -1,6 +1,6 @@
 {
   "name": "@nguyenthdat/opencode-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local-first persistent memory for OpenCode with a Rust, zvec, and llama.cpp sidecar",
   "type": "module",
   "packageManager": "bun@1.3.14",
@@ -26,8 +26,9 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "generate:protocol": "protoc --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --es_out=opencode-memory/src/generated --es_opt=target=ts,import_extension=js -I schema schema/memory.proto",
+    "generate:protocol": "protoc --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --es_out=opencode-memory/src/generated --es_opt=target=ts,import_extension=js -I schema schema/opencode/memory/v1/memory.proto",
     "generate:protocol:check": "bun run generate:protocol && git diff --exit-code -- opencode-memory/src/generated",
+    "lint:proto": "buf lint",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:ts": "tsc -p tsconfig.build.json",
     "build": "bun run clean && bun run typecheck && bun run build:ts",
@@ -52,11 +53,11 @@
     "@opencode-ai/plugin": ">=1.18.4 <2"
   },
   "optionalDependencies": {
-    "@nguyenthdat/opencode-memory-darwin-arm64": "0.2.0",
-    "@nguyenthdat/opencode-memory-darwin-x64": "0.2.0",
-    "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.2.0",
-    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.2.0",
-    "@nguyenthdat/opencode-memory-win32-x64-msvc": "0.2.0"
+    "@nguyenthdat/opencode-memory-darwin-arm64": "0.3.0",
+    "@nguyenthdat/opencode-memory-darwin-x64": "0.3.0",
+    "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.3.0",
+    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.0",
+    "@nguyenthdat/opencode-memory-win32-x64-msvc": "0.3.0"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.4",
