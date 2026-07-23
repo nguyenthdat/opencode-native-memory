@@ -39,6 +39,7 @@ export declare class SessionContext {
     }>;
     recordFeedback(pending: PendingRecall, event: "injected" | (typeof FEEDBACK_EVENTS)[number], memoryIDs?: string[]): Promise<void>;
     closePendingRecall(sessionID: string, event: "ignored" | "error"): Promise<void>;
+    discardPendingRecall(sessionID: string): void;
     openPendingRecall(sessionID: string, pending: PendingRecall, isCurrent?: () => boolean): Promise<boolean>;
     invalidateRecall(sessionID?: string): void;
     recallGeneration(sessionID: string): string;

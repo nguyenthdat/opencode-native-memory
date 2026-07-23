@@ -17,8 +17,10 @@ export { createMemoryPlugin, resolveMemoryPluginOptions } from "./plugin.js";
 export { SessionContext } from "./session-context.js";
 // Lifecycle validation
 export { validateUpdateArgs } from "./validation.js";
+// Managed instruction asset
+export { MEMORY_INSTRUCTIONS_MARKER, loadMemoryInstructions, registerMemoryInstructions, } from "./instructions.js";
 // Policy helpers
-export { formatRecalledMemories, parseCuratedCandidates, truncateText, contextBudgetChars, safeJson, MEMORY_POLICY_MARKER, MEMORY_POLICY, COMPACTION_CONTEXT, CANDIDATES_OPEN, CANDIDATES_CLOSE, } from "./policy.js";
+export { formatRecalledMemories, parseCuratedCandidates, truncateText, contextBudgetChars, safeJson, COMPACTION_CONTEXT, CANDIDATES_OPEN, CANDIDATES_CLOSE, } from "./policy.js";
 // Shared-markdown helpers
 export { loadSharedMemories, parseSharedMemory, writeSharedMemory, SHARED_MEMORY_RELATIVE_DIR, } from "./shared-markdown.js";
 //# sourceMappingURL=index.js.map

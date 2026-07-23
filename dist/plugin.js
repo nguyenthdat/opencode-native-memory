@@ -1,7 +1,8 @@
 import { tool } from "@opencode-ai/plugin";
 import { MEMORY_KINDS, MEMORY_SCOPES, WRITABLE_MEMORY_SCOPES, FEEDBACK_EVENTS, LOCK_ACTIONS, MEMORY_TAXONOMIES, } from "./contracts.js";
 import { NativeMemoryClient } from "./sidecar-client.js";
-import { MEMORY_POLICY, MEMORY_POLICY_MARKER, COMPACTION_CONTEXT, formatRecalledMemories, truncateText, contextBudgetChars, parseCuratedCandidates, deriveRecallQuery, } from "./policy.js";
+import { COMPACTION_CONTEXT, formatRecalledMemories, truncateText, contextBudgetChars, parseCuratedCandidates, deriveRecallQuery, } from "./policy.js";
+import { MEMORY_INSTRUCTIONS_MARKER, loadMemoryInstructions, registerMemoryInstructions, } from "./instructions.js";
 import { SHARED_MEMORY_RELATIVE_DIR, loadSharedMemories, writeSharedMemory, } from "./shared-markdown.js";
 import { SessionContext } from "./session-context.js";
 import { validateDeleteRecords, validateUpdateArgs } from "./validation.js";
@@ -9,6 +10,7 @@ export function createMemoryPlugin(options) {
     return async ({ client: opencode, directory, worktree }) => {
         const settings = resolveMemoryPluginOptions(options);
         const memoryProjectRoot = options.projectRoot ?? worktree;
+        const memoryInstructions = await loadMemoryInstructions(options.root);
         const native = new NativeMemoryClient(options.root, memoryProjectRoot);
         const session = new SessionContext(native, (path, query) => opencode.session.get({ path, query }), directory);
         let sharedSignature;
@@ -45,7 +47,8 @@ export function createMemoryPlugin(options) {
         }
         return {
             dispose: async () => {
-                await Promise.all([...session.pendingRecall.keys()].map((sessID) => session.closePendingRecall(sessID, "ignored")));
+                for (const sessID of session.pendingRecall.keys())
+                    session.discardPendingRecall(sessID);
                 session.latestQuery.clear();
                 session.invalidateRecall();
                 session.pendingRecall.clear();
@@ -55,6 +58,7 @@ export function createMemoryPlugin(options) {
                 await native.dispose();
             },
             config: async (config) => {
+                await registerMemoryInstructions(config, memoryInstructions, directory);
                 config.command ??= {};
                 config.command.memory ??= {
                     description: "Inspect and manage project memory",
@@ -73,7 +77,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 }
                 if (event.type === "session.deleted") {
                     const sessID = event.properties.info.id;
-                    await session.closePendingRecall(sessID, "ignored");
+                    session.discardPendingRecall(sessID);
                     session.latestQuery.delete(sessID);
                     session.invalidateRecall(sessID);
                     session.sessionParents.delete(sessID);
@@ -82,7 +86,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                     return;
                 }
                 if (event.type === "session.idle") {
-                    await session.closePendingRecall(event.properties.sessionID, "ignored");
+                    session.discardPendingRecall(event.properties.sessionID);
                     return;
                 }
                 if (event.type === "session.error" && event.properties.sessionID) {
@@ -153,7 +157,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             "chat.message": async (input, output) => {
                 session.latestQuery.delete(input.sessionID);
                 session.invalidateRecall(input.sessionID);
-                await session.closePendingRecall(input.sessionID, "ignored");
+                session.discardPendingRecall(input.sessionID);
                 const query = deriveRecallQuery(output.parts);
                 if (!query)
                     return;
@@ -165,8 +169,8 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 });
             },
             "experimental.chat.system.transform": async (input, output) => {
-                if (!output.system.some((entry) => entry.includes(MEMORY_POLICY_MARKER))) {
-                    output.system.push(MEMORY_POLICY);
+                if (!output.system.some((entry) => entry.includes(MEMORY_INSTRUCTIONS_MARKER))) {
+                    output.system.push(memoryInstructions.content);
                 }
                 if (!input.sessionID)
                     return;
@@ -198,7 +202,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 ].join("\0");
                 let cached = session.recallCache.get(input.sessionID);
                 if (!cached || cached.key !== cacheKey) {
-                    await session.closePendingRecall(input.sessionID, "ignored");
+                    session.discardPendingRecall(input.sessionID);
                     if (session.latestQuery.get(input.sessionID) !== latest ||
                         session.recallGeneration(input.sessionID) !== recallGeneration) {
                         return;
@@ -310,7 +314,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                             .describe("Include historical memories replaced by a successor."),
                     },
                     async execute(args, context) {
-                        await session.closePendingRecall(context.sessionID, "ignored");
+                        session.discardPendingRecall(context.sessionID);
                         await syncSharedMemories();
                         const rootSessionID = await session.resolveSessionRoot(context.sessionID);
                         const response = await native.request("search", {
@@ -600,8 +604,9 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                         event: tool.schema.enum(FEEDBACK_EVENTS),
                         memory_ids: tool.schema
                             .array(tool.schema.string().regex(/^mem_[0-9a-f]{32}$/))
+                            .min(1)
                             .max(100)
-                            .default([]),
+                            .describe("Exact recalled memory IDs affected by this feedback."),
                     },
                     async execute(args, context) {
                         const pending = session.pendingRecall.get(context.sessionID);
@@ -738,6 +743,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                             .describe("Hash all code anchors to detect staleness."),
                     },
                     async execute(args, context) {
+                        await syncSharedMemories();
                         const response = await native.request("doctor", args, context.abort);
                         return result("Memory doctor", response, response);
                     },
@@ -746,6 +752,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                     description: "Inspect the current project's native memory backend, collection, embedding model, indexes, and document count.",
                     args: {},
                     async execute(_args, context) {
+                        await syncSharedMemories();
                         const response = await native.request("status", {}, context.abort);
                         return result("Memory status", response, response);
                     },

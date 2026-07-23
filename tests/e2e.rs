@@ -214,8 +214,14 @@ fn model_cache() -> std::path::PathBuf {
     std::env::var_os("OPENCODE_MEMORY_MODEL_CACHE").map_or_else(
         || {
             std::env::var_os("HOME").map_or_else(
-                || std::path::PathBuf::from(".cache/opencode/memory/models"),
-                |home| std::path::PathBuf::from(home).join(".cache/opencode/memory/models"),
+                || std::path::PathBuf::from(
+                    ".local/share/opencode/memory/models/f4602530db1d980e16da9d7d3a70294cf5c190be",
+                ),
+                |home| {
+                    std::path::PathBuf::from(home).join(
+                        ".local/share/opencode/memory/models/f4602530db1d980e16da9d7d3a70294cf5c190be",
+                    )
+                },
             )
         },
         std::path::PathBuf::from,

@@ -11,19 +11,28 @@ const rustPackage = metadata.packages.find((entry) => entry.name === "opencode-m
 if (!rustPackage) throw new Error("Cannot find opencode-memory in Cargo metadata");
 
 const nativePackages = [
-  "darwin-arm64",
-  "darwin-x64",
-  "linux-arm64-gnu",
-  "linux-x64-gnu",
-  "win32-x64-msvc",
-];
+  ["darwin-arm64", "@nguyenthdat/opencode-memory-darwin-arm64"],
+  ["darwin-x64", "@nguyenthdat/opencode-memory-darwin-x64"],
+  ["linux-arm64-gnu", "@nguyenthdat/opencode-memory-linux-arm64-gnu"],
+  ["linux-x64-gnu", "@nguyenthdat/opencode-memory-linux-x64-gnu"],
+] as const;
 const versions = new Map<string, string>([
   [rootPackage.name, rootPackage.version],
   [rustPackage.name, rustPackage.version],
 ]);
-for (const directory of nativePackages) {
+for (const [directory, expectedName] of nativePackages) {
   const pkg = await readPackage(join("npm", directory, "package.json"));
+  if (pkg.name !== expectedName) {
+    throw new Error(`${directory} package name must be ${expectedName}, received ${pkg.name}`);
+  }
   versions.set(pkg.name, pkg.version);
+}
+const expectedOptionalDependencies = nativePackages.map(([, name]) => name).sort();
+const actualOptionalDependencies = Object.keys(rootPackage.optionalDependencies ?? {}).sort();
+if (JSON.stringify(actualOptionalDependencies) !== JSON.stringify(expectedOptionalDependencies)) {
+  throw new Error(
+    `Native optional dependencies differ: expected ${expectedOptionalDependencies.join(", ")}; received ${actualOptionalDependencies.join(", ")}`,
+  );
 }
 const mismatches = [...versions].filter(([, version]) => version !== rootPackage.version);
 if (mismatches.length > 0) {
@@ -35,9 +44,14 @@ if (mismatches.length > 0) {
 }
 console.log(`All package versions match ${rootPackage.version}`);
 
-async function readPackage(path: string): Promise<{ name: string; version: string }> {
+async function readPackage(path: string): Promise<{
+  name: string;
+  version: string;
+  optionalDependencies?: Record<string, string>;
+}> {
   return JSON.parse(await readFile(path, "utf8")) as {
     name: string;
     version: string;
+    optionalDependencies?: Record<string, string>;
   };
 }

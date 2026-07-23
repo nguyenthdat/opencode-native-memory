@@ -13,7 +13,7 @@ Local-first persistent memory for OpenCode. The plugin runs a native Rust sideca
 - Crash-recoverable batch upsert journal and portable export/import snapshots
 - Markdown-backed shared repository memory under `.opencode/memory/`
 - Length-delimited Protobuf protocol between TypeScript and Rust
-- Native sidecar packages for macOS, Linux, and Windows
+- Native sidecar packages for macOS and glibc Linux
 
 ## Install
 
@@ -35,11 +35,10 @@ Supported packages:
 | macOS       | x64          | `@nguyenthdat/opencode-memory-darwin-x64`      |
 | Linux glibc | ARM64        | `@nguyenthdat/opencode-memory-linux-arm64-gnu` |
 | Linux glibc | x64          | `@nguyenthdat/opencode-memory-linux-x64-gnu`   |
-| Windows     | x64 MSVC     | `@nguyenthdat/opencode-memory-win32-x64-msvc`  |
 
-The first memory operation downloads the default GGUF model into the local model cache. Override `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH` to use an existing local model and avoid a network download.
+The first memory operation downloads the default GGUF model under `~/.local/share/opencode/memory/models/<model-revision>/` (or `$XDG_DATA_HOME/opencode/memory/models/<model-revision>/`). Override `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH` to use an existing local model and avoid a network download.
 
-Add `rules/flow.md` to the project instructions if memory tool usage should be explicit for every agent.
+The plugin automatically registers its packaged `rules/flow.md` as an OpenCode instruction while preserving existing project instructions. It never overwrites a project-owned rule file.
 
 ## Memory Tools
 
@@ -100,7 +99,7 @@ Changing model identity or embedding dimension requires rebuilding the project's
 | `OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS`       | All layers when GPU offload is supported, otherwise `0`                      |
 | `OPENCODE_MEMORY_PROJECT_ROOT`               | Override project discovery root                                              |
 | `OPENCODE_MEMORY_DATA_DIR`                   | Override project store base directory                                        |
-| `OPENCODE_MEMORY_MODEL_CACHE`                | Override local Hugging Face model cache                                      |
+| `OPENCODE_MEMORY_MODEL_CACHE`                | Replace the complete local Hugging Face model-cache path                     |
 | `OPENCODE_NATIVE_MEMORY_BIN`                 | Development/debug sidecar override                                           |
 | `OPENCODE_MEMORY_WARMUP`                     | Enable model/shared-memory warmup; default `true`                            |
 | `OPENCODE_MEMORY_AUTO_RECALL`                | Enable automatic contextual recall; default `true`                           |
@@ -120,7 +119,7 @@ export OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE="search_document: {text}"
 
 ## Storage and Sharing
 
-Private state uses the platform data directory under `opencode/memory/<project-id>/`. Models use the platform cache directory under `opencode/memory/models/`.
+Private state uses the data directory under `opencode/memory/<project-id>/`. Downloaded models use OpenCode's data home under `opencode/memory/models/<model-revision>/`; versioning by immutable model revision avoids downloading the same multi-gigabyte GGUF again on plugin-only upgrades. Existing downloads under `~/.cache/opencode/memory/models/` are not moved automatically; point `OPENCODE_MEMORY_MODEL_CACHE` there to reuse them.
 
 Repository memory is canonical Markdown in:
 
@@ -186,7 +185,7 @@ GPU features are opt-in Cargo features: `metal`, `cuda`, `cuda-no-vmm`, `vulkan`
 
 ## Releases
 
-Tags matching `vX.Y.Z` build and package the five native targets, publish native packages first, publish the umbrella plugin with npm provenance, and create a GitHub release containing all tarballs and a checksum for the umbrella package. `package.json`, `Cargo.toml`, and every native package must carry the same version.
+Tags matching `vX.Y.Z` build and package four native targets for macOS and glibc Linux, publish native packages first, publish the umbrella plugin with npm provenance, and create a GitHub release containing all tarballs and a checksum for the umbrella package. `package.json`, `Cargo.toml`, and every native package must carry the same version.
 
 ## License
 

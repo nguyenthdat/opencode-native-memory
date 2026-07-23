@@ -661,6 +661,7 @@ pub struct OptimizeResponse {
     pub document_count: u64,
     pub pruned_expired: usize,
     pub pruned_retrievals: usize,
+    pub indexes: Vec<IndexStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]

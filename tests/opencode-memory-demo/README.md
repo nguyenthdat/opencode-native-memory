@@ -12,7 +12,7 @@ bun run start
 
 Quit and restart OpenCode after changing `opencode.jsonc`, `memory-plugin.ts`, or the plugin source because OpenCode loads configuration and plugins only at startup.
 
-The first run may download the default `Qwen3-Embedding-4B-Q4_K_M.gguf` model. To reuse an existing cache:
+The first run may download the default `Qwen3-Embedding-4B-Q4_K_M.gguf` model under `~/.local/share/opencode/memory/models/<model-revision>/`. To reuse an existing cache:
 
 ```sh
 export OPENCODE_MEMORY_MODEL_CACHE=/absolute/path/to/model-cache
@@ -24,6 +24,8 @@ Inside OpenCode, run:
 ```text
 /memory-smoke
 ```
+
+The plugin automatically registers its packaged `rules/flow.md`; the demo config intentionally lists only `AGENTS.md` to exercise that integration.
 
 Useful manual checks:
 

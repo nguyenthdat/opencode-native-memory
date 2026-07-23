@@ -1,0 +1,5 @@
+.memory-data/
+.opencode/node_modules/
+.opencode/cache/
+node_modules/
+target/

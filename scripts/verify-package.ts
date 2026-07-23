@@ -37,4 +37,22 @@ const forbidden = [...files].filter(
 if (forbidden.length > 0) {
   throw new Error(`npm package contains forbidden files: ${forbidden.join(", ")}`);
 }
+const allowedExact = new Set([
+  "package.json",
+  "README.md",
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+  "notices/ZVEC_NOTICE",
+  "rules/flow.md",
+]);
+const unexpected = [...files].filter(
+  (file) => !file.startsWith("dist/") && !allowedExact.has(file),
+);
+if (unexpected.length > 0) {
+  throw new Error(`npm package contains files outside the allowlist: ${unexpected.join(", ")}`);
+}
+const instructions = await Bun.file("rules/flow.md").text();
+if (!instructions.includes("<!-- opencode-memory-instructions:v1 -->")) {
+  throw new Error("rules/flow.md is missing the managed instruction marker");
+}
 console.log(`npm package contains ${files.size} allowlisted files`);

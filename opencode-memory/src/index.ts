@@ -56,6 +56,13 @@ export { SessionContext } from "./session-context.js";
 // Lifecycle validation
 export { validateUpdateArgs } from "./validation.js";
 
+// Managed instruction asset
+export {
+  MEMORY_INSTRUCTIONS_MARKER,
+  loadMemoryInstructions,
+  registerMemoryInstructions,
+} from "./instructions.js";
+
 // Policy helpers
 export {
   formatRecalledMemories,
@@ -63,8 +70,6 @@ export {
   truncateText,
   contextBudgetChars,
   safeJson,
-  MEMORY_POLICY_MARKER,
-  MEMORY_POLICY,
   COMPACTION_CONTEXT,
   CANDIDATES_OPEN,
   CANDIDATES_CLOSE,

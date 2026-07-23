@@ -1190,11 +1190,20 @@ impl MemoryEngine {
         self.collection.optimize()?;
         self.collection.flush()?;
         self.save_state()?;
+        let stats = self.collection.stats()?;
         Ok(OptimizeResponse {
             optimized: true,
-            document_count: self.collection.stats()?.doc_count,
+            document_count: stats.doc_count,
             pruned_expired,
             pruned_retrievals,
+            indexes: stats
+                .indexes
+                .into_iter()
+                .map(|index| IndexStatus {
+                    name: index.name,
+                    completeness: index.completeness,
+                })
+                .collect(),
         })
     }
 
@@ -1263,7 +1272,7 @@ impl MemoryEngine {
         for index in &stats.indexes {
             if index.completeness < 1.0 {
                 warnings.push(format!(
-                    "index {} is only {:.1}% complete",
+                    "index {} is only {:.1}% complete; run memory_optimize during explicit maintenance to rebuild indexes",
                     index.name,
                     index.completeness * 100.0
                 ));

@@ -22,14 +22,14 @@ class FeedbackClient extends NativeMemoryClient {
 }
 
 describe("SessionContext recall state", () => {
-  test("closes an existing pending recall before opening its replacement", async () => {
+  test("discards an unresolved recall before opening its replacement", async () => {
     const native = new FeedbackClient();
     const session = createSession(native);
     session.pendingRecall.set("session", pending("old"));
 
     await session.openPendingRecall("session", pending("new"));
 
-    expect(native.requests.map(feedbackEvent)).toEqual(["ignored", "injected"]);
+    expect(native.requests.map(feedbackEvent)).toEqual(["injected"]);
     expect(session.pendingRecall.get("session")).toEqual(pending("new"));
   });
 
@@ -41,7 +41,7 @@ describe("SessionContext recall state", () => {
     const opened = await session.openPendingRecall("session", pending("new"), () => false);
 
     expect(opened).toBe(false);
-    expect(native.requests.map(feedbackEvent)).toEqual(["ignored"]);
+    expect(native.requests.map(feedbackEvent)).toEqual([]);
     expect(session.pendingRecall.has("session")).toBe(false);
   });
 
@@ -55,7 +55,7 @@ describe("SessionContext recall state", () => {
     const opened = await session.openPendingRecall("session", pending("new"), () => current);
 
     expect(opened).toBe(false);
-    expect(native.requests.map(feedbackEvent)).toEqual(["injected", "ignored"]);
+    expect(native.requests.map(feedbackEvent)).toEqual(["injected"]);
     expect(session.pendingRecall.has("session")).toBe(false);
   });
 

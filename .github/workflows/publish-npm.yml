@@ -36,9 +36,6 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             package: linux-arm64-gnu
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            package: win32-x64-msvc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -80,7 +77,9 @@ jobs:
 
       - name: Pack native npm package
         working-directory: npm/${{ matrix.package }}
-        run: npm pack --json
+        run: |
+          bun ../../scripts/verify-native-package.ts .
+          npm pack --json
 
       - name: Upload native package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

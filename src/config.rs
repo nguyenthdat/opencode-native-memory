@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 const DATA_SUBDIR: &str = "opencode/memory";
-const CACHE_SUBDIR: &str = "opencode/memory/models";
+const MODEL_CACHE_SUBDIR: &str = "opencode/memory/models";
 const DEFAULT_MODEL_REPO: &str = "Qwen/Qwen3-Embedding-4B-GGUF";
 const DEFAULT_MODEL_FILE: &str = "Qwen3-Embedding-4B-Q4_K_M.gguf";
 const DEFAULT_MODEL_REVISION: &str = "f4602530db1d980e16da9d7d3a70294cf5c190be";
@@ -123,13 +123,17 @@ impl MemoryConfig {
             ),
         };
 
-        let data_root = env_path("OPENCODE_MEMORY_DATA_DIR")
-            .unwrap_or_else(|| default_data_home().join(DATA_SUBDIR));
-        let model_cache = env_path("OPENCODE_MEMORY_MODEL_CACHE")
-            .unwrap_or_else(|| default_cache_home().join(CACHE_SUBDIR));
+        let embedding = EmbeddingConfig::discover()?;
+        let data_home = default_data_home();
+        let data_root =
+            env_path("OPENCODE_MEMORY_DATA_DIR").unwrap_or_else(|| data_home.join(DATA_SUBDIR));
+        let model_cache = resolve_model_cache(
+            env_path("OPENCODE_MEMORY_MODEL_CACHE"),
+            &data_home,
+            &embedding.revision,
+        );
 
-        Ok(Self::new(project_root, data_root, model_cache)
-            .with_embedding(EmbeddingConfig::discover()?))
+        Ok(Self::new(project_root, data_root, model_cache).with_embedding(embedding))
     }
 
     #[must_use]
@@ -230,11 +234,33 @@ fn default_data_home() -> PathBuf {
     home_dir().join(".local/share")
 }
 
-fn default_cache_home() -> PathBuf {
-    if let Some(path) = env_path("XDG_CACHE_HOME") {
-        return path;
+fn default_model_cache(data_home: &Path, revision: &str) -> PathBuf {
+    data_home
+        .join(MODEL_CACHE_SUBDIR)
+        .join(revision_cache_component(revision))
+}
+
+fn resolve_model_cache(
+    override_path: Option<PathBuf>,
+    data_home: &Path,
+    revision: &str,
+) -> PathBuf {
+    override_path.unwrap_or_else(|| default_model_cache(data_home, revision))
+}
+
+fn revision_cache_component(revision: &str) -> String {
+    if !revision.is_empty()
+        && revision != "."
+        && revision != ".."
+        && revision.len() <= 128
+        && revision.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+    {
+        revision.to_string()
+    } else {
+        format!("revision-{}", &hash_hex(revision.as_bytes())[..16])
     }
-    home_dir().join(".cache")
 }
 
 fn home_dir() -> PathBuf {
@@ -265,7 +291,10 @@ pub(crate) fn hash_hex(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryConfig, discover_project_root, resolve_project_root};
+    use super::{
+        MemoryConfig, default_model_cache, discover_project_root, resolve_model_cache,
+        resolve_project_root, revision_cache_component,
+    };
     use std::fs;
 
     #[test]
@@ -309,5 +338,34 @@ mod tests {
         let expected = nested.canonicalize().expect("canonicalize nested project");
 
         assert_eq!(resolve_project_root(nested, false), expected);
+    }
+
+    #[test]
+    fn default_model_cache_is_versioned_by_model_revision() {
+        assert_eq!(
+            default_model_cache(std::path::Path::new("/data"), "abc123"),
+            std::path::Path::new("/data/opencode/memory/models/abc123")
+        );
+    }
+
+    #[test]
+    fn explicit_model_cache_is_used_without_appending_revision() {
+        assert_eq!(
+            resolve_model_cache(
+                Some(std::path::PathBuf::from("/custom/cache")),
+                std::path::Path::new("/data"),
+                "abc123",
+            ),
+            std::path::Path::new("/custom/cache")
+        );
+    }
+
+    #[test]
+    fn unsafe_model_revision_is_confined_to_one_cache_component() {
+        let component = revision_cache_component("../../outside");
+
+        assert!(component.starts_with("revision-"));
+        assert!(!component.contains('/'));
+        assert!(!component.contains(".."));
     }
 }

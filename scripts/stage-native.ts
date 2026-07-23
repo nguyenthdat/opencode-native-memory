@@ -10,26 +10,23 @@ interface Options {
 
 async function main(): Promise<void> {
   const options = parseOptions(process.argv.slice(2));
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    throw new Error(`Native staging supports only macOS and Linux, not ${process.platform}`);
+  }
   const targetPrefix = options.target ? join("target", options.target) : "target";
   const buildRoot = resolve(targetPrefix, options.profile);
-  const executable = process.platform === "win32" ? "opencode-memory.exe" : "opencode-memory";
+  const executable = "opencode-memory";
   const sourceBinary = join(buildRoot, executable);
   const destination = resolve(options.destination);
   const binaryDirectory = join(destination, "bin");
   const libraryDirectory = join(binaryDirectory, "memory-libs");
 
-  const libraryName =
-    process.platform === "darwin"
-      ? "libzvec_c_api.dylib"
-      : process.platform === "win32"
-        ? "zvec_c_api.dll"
-        : "libzvec_c_api.so";
+  const libraryName = process.platform === "darwin" ? "libzvec_c_api.dylib" : "libzvec_c_api.so";
   const library = await findFile(join(buildRoot, "build"), libraryName);
   if (!library) throw new Error(`Cannot find ${libraryName} below ${buildRoot}`);
 
   if (options.runtime) {
-    const runtimeLibraryDirectory =
-      process.platform === "win32" ? destination : join(destination, "memory-libs");
+    const runtimeLibraryDirectory = join(destination, "memory-libs");
     await mkdir(runtimeLibraryDirectory, { recursive: true });
     await cp(library, join(runtimeLibraryDirectory, libraryName));
     return;
@@ -39,11 +36,7 @@ async function main(): Promise<void> {
   await mkdir(libraryDirectory, { recursive: true });
   await cp(sourceBinary, join(binaryDirectory, executable));
 
-  const libraryDestination =
-    process.platform === "win32"
-      ? join(binaryDirectory, libraryName)
-      : join(libraryDirectory, libraryName);
-  await cp(library, libraryDestination);
+  await cp(library, join(libraryDirectory, libraryName));
   await Promise.all(
     ["LICENSE", "THIRD_PARTY_NOTICES.md"].map((file) =>
       cp(resolve(file), join(destination, basename(file))),

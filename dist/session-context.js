@@ -91,9 +91,12 @@ export class SessionContext {
         this.pendingRecall.delete(sessionID);
         await this.recordFeedback(pending, event);
     }
+    discardPendingRecall(sessionID) {
+        this.pendingRecall.delete(sessionID);
+    }
     async openPendingRecall(sessionID, pending, isCurrent = () => true) {
         while (this.pendingRecall.has(sessionID)) {
-            await this.closePendingRecall(sessionID, "ignored");
+            this.discardPendingRecall(sessionID);
             if (!isCurrent())
                 return false;
         }
@@ -104,7 +107,7 @@ export class SessionContext {
         if (isCurrent())
             return true;
         if (this.pendingRecall.get(sessionID) === pending) {
-            await this.closePendingRecall(sessionID, "ignored");
+            this.discardPendingRecall(sessionID);
         }
         return false;
     }

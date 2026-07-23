@@ -18,7 +18,7 @@
   },
   "files": [
     "dist",
-    "rules",
+    "rules/flow.md",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
@@ -56,8 +56,7 @@
     "@nguyenthdat/opencode-memory-darwin-arm64": "0.3.0",
     "@nguyenthdat/opencode-memory-darwin-x64": "0.3.0",
     "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.3.0",
-    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.0",
-    "@nguyenthdat/opencode-memory-win32-x64-msvc": "0.3.0"
+    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.0"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.4",

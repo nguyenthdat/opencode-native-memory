@@ -24,7 +24,6 @@ const NATIVE_PACKAGES: Partial<Record<string, string>> = {
   "darwin-x64": "@nguyenthdat/opencode-memory-darwin-x64",
   "linux-arm64": "@nguyenthdat/opencode-memory-linux-arm64-gnu",
   "linux-x64": "@nguyenthdat/opencode-memory-linux-x64-gnu",
-  "win32-x64": "@nguyenthdat/opencode-memory-win32-x64-msvc",
 };
 
 export type SpawnFn = (
@@ -39,9 +38,16 @@ export type SpawnFn = (
 ) => ChildProcessWithoutNullStreams;
 
 export function resolveNativeMemoryBinary(root: string): string {
+  const platform = `${process.platform}-${process.arch}`;
+  const packageName = NATIVE_PACKAGES[platform];
+  if (!packageName) {
+    throw new Error(
+      `Native memory supports only macOS and glibc Linux on arm64 or x64, not ${platform}`,
+    );
+  }
   const override = process.env.OPENCODE_NATIVE_MEMORY_BIN;
-  const binaryName = process.platform === "win32" ? "opencode-memory.exe" : "opencode-memory";
-  const packaged = resolvePackagedBinary(binaryName);
+  const binaryName = "opencode-memory";
+  const packaged = resolvePackagedBinary(packageName, binaryName);
   const candidates = override
     ? [resolve(override)]
     : [
@@ -52,7 +58,7 @@ export function resolveNativeMemoryBinary(root: string): string {
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
     const binary = realpathSync(candidate);
-    if (!override && process.platform !== "win32") {
+    if (!override) {
       const library = resolve(
         binary,
         "..",
@@ -68,9 +74,7 @@ export function resolveNativeMemoryBinary(root: string): string {
   );
 }
 
-function resolvePackagedBinary(binaryName: string): string | undefined {
-  const packageName = NATIVE_PACKAGES[`${process.platform}-${process.arch}`];
-  if (!packageName) return undefined;
+function resolvePackagedBinary(packageName: string, binaryName: string): string | undefined {
   try {
     return require.resolve(`${packageName}/bin/${binaryName}`);
   } catch {
@@ -324,7 +328,7 @@ export class NativeMemoryClient {
       : resolveNativeMemoryBinary(this.root);
     const child = this.spawnFn(binary, [], {
       cwd: this.worktree,
-      detached: process.platform !== "win32",
+      detached: true,
       env: {
         ...process.env,
         OPENCODE_MEMORY_PROJECT_ROOT: this.worktree,
@@ -456,13 +460,11 @@ export class NativeMemoryClient {
 function stopProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
   if (!child.pid) return;
   if (child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // Fall back to the direct child.
-    }
+  try {
+    process.kill(-child.pid, signal);
+    return;
+  } catch {
+    // Fall back to the direct child.
   }
   try {
     child.kill(signal);
