@@ -140,7 +140,7 @@ The Protobuf schema is `schema/memory.proto`. Rust bindings are generated at Car
 
 ## Development
 
-Requirements: Bun 1.3+, Rust 1.88+, and `protoc`.
+Requirements: Bun 1.3+, Rust 1.89+, and `protoc`.
 
 ```sh
 bun install

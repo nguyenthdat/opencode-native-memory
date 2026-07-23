@@ -57,7 +57,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          toolchain: 1.88.0
+          toolchain: 1.89.0
           targets: ${{ matrix.target }}
 
       - name: Setup Protobuf
@@ -121,7 +121,7 @@ jobs:
       - name: Setup Rust metadata toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          toolchain: 1.88.0
+          toolchain: 1.89.0
 
       - name: Setup Protobuf
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
