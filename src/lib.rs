@@ -27,8 +27,8 @@ pub use contract::{
     IndexStatus, LifecycleResponse, ListRequest, ListResponse, LockAction, LockRequest, MemoryKind,
     MemoryOrigin, MemoryRecord, MemoryScope, MemorySnapshot, OptimizeResponse, PinRequest,
     PurgeRequest, PurgeResponse, ScoreBreakdown, SearchRequest, SearchResponse, SharedMemoryInput,
-    StatusResponse, StoreRequest, StoreResponse, SyncSharedRequest, SyncSharedResponse,
-    TombstoneSnapshot, UpdateRequest, UpdateResponse,
+    SharedMemoryRejection, StatusResponse, StoreRequest, StoreResponse, SyncSharedRequest,
+    SyncSharedResponse, TombstoneSnapshot, UpdateRequest, UpdateResponse,
 };
 pub use engine::MemoryEngine;
 pub use taxonomy::{MemoryFamily, MemoryTaxonomy, RetrievalProfile};

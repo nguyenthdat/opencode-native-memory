@@ -612,11 +612,17 @@ pub struct FeedbackResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SharedMemoryRejection {
+    pub source: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SyncSharedResponse {
     pub imported: usize,
     pub removed: usize,
     pub rejected: usize,
-    pub rejected_sources: Vec<String>,
+    pub rejections: Vec<SharedMemoryRejection>,
 }
 
 #[derive(Debug, Clone, Serialize)]

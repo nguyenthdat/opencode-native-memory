@@ -1,0 +1,12 @@
+{
+  "name": "opencode-native-memory-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "build:plugin": "bun run --cwd ../.. build",
+    "build:native": "cargo +1.97.0 build --release --locked --manifest-path ../../Cargo.toml && bun run --cwd ../.. scripts/stage-native.ts --profile release --runtime --destination target/release",
+    "prepare": "bun run typecheck && bun run build:plugin && bun run build:native",
+    "start": "opencode ."
+  }
+}

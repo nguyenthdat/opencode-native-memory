@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["../memory-plugin.ts"],
+  "instructions": ["AGENTS.md", "../../rules/flow.md"],
+  "permission": "allow",
+  "compaction": {
+    "auto": true,
+    "tail_turns": 3,
+  },
+}

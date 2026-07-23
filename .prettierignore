@@ -7,3 +7,4 @@ _workspace/
 .qdrant/
 notices/
 Cargo.lock
+tests/opencode-memory-demo/.memory-data/

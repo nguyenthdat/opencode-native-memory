@@ -16,9 +16,9 @@ use crate::contract::{
     DoctorResponse, ExportRequest, FeedbackEvent, FeedbackRequest, FeedbackResponse, ForgetRequest,
     ForgetResponse, GetRequest, ImportRequest, ImportResponse, IndexStatus, LifecycleResponse,
     ListRequest, ListResponse, LockRequest, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope,
-    MemorySnapshot, OptimizeResponse, PinRequest, PurgeRequest, PurgeResponse, StatusResponse,
-    StoreRequest, StoreResponse, SyncSharedRequest, SyncSharedResponse, TombstoneSnapshot,
-    UpdateRequest, UpdateResponse,
+    MemorySnapshot, OptimizeResponse, PinRequest, PurgeRequest, PurgeResponse,
+    SharedMemoryRejection, StatusResponse, StoreRequest, StoreResponse, SyncSharedRequest,
+    SyncSharedResponse, TombstoneSnapshot, UpdateRequest, UpdateResponse,
 };
 use crate::embedding::{Embedder, LlamaCppEmbedder};
 use crate::lifecycle::{
@@ -45,6 +45,7 @@ pub struct MemoryEngine {
     collection: Collection,
     embedder: LlamaCppEmbedder,
     state: MemoryState,
+    shared_sync_rejections: Vec<SharedMemoryRejection>,
     _writer_lock: File,
 }
 
@@ -75,6 +76,7 @@ impl MemoryEngine {
             collection,
             embedder,
             state,
+            shared_sync_rejections: Vec::new(),
             _writer_lock: writer_lock,
         };
         engine.recover_pending_upserts()?;
@@ -1028,6 +1030,7 @@ impl MemoryEngine {
     ///
     /// Returns an error when the request is oversized or storage fails.
     pub fn sync_shared(&mut self, request: SyncSharedRequest) -> Result<SyncSharedResponse> {
+        self.shared_sync_rejections.clear();
         ensure!(
             request.records.len() <= MAX_SHARED_RECORDS,
             "at most {MAX_SHARED_RECORDS} shared memories are allowed"
@@ -1066,7 +1069,7 @@ impl MemoryEngine {
         }
 
         let mut imported = 0;
-        let mut rejected_sources = Vec::new();
+        let mut rejections = Vec::new();
         for record in request.records {
             let shared_source = record.source.clone();
             let stored = self.store(StoreRequest {
@@ -1101,15 +1104,19 @@ impl MemoryEngine {
                     }
                     imported += 1;
                 }
-                Err(_) => rejected_sources.push(shared_source),
+                Err(error) => rejections.push(SharedMemoryRejection {
+                    source: shared_source,
+                    message: format!("{error:#}"),
+                }),
             }
         }
-        let rejected = rejected_sources.len();
+        let rejected = rejections.len();
+        self.shared_sync_rejections.clone_from(&rejections);
         Ok(SyncSharedResponse {
             imported,
             removed,
             rejected,
-            rejected_sources,
+            rejections,
         })
     }
 
@@ -1246,6 +1253,12 @@ impl MemoryEngine {
         }
         if stale_count > 0 {
             warnings.push(format!("{stale_count} memories have stale code anchors"));
+        }
+        for rejection in &self.shared_sync_rejections {
+            warnings.push(format!(
+                "shared memory {} was rejected: {}",
+                rejection.source, rejection.message
+            ));
         }
         for index in &stats.indexes {
             if index.completeness < 1.0 {

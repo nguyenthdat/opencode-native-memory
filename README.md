@@ -166,6 +166,16 @@ bun run build
 bun run pack:check
 ```
 
+### OpenCode Demo Project
+
+An isolated project fixture is available at `tests/opencode-memory-demo`. Its config lives at `.opencode/opencode.jsonc`; it loads the local `dist/` plugin, uses the local release sidecar, keeps data under its own `.memory-data/`, and includes a `/memory-smoke` command.
+
+```sh
+cd tests/opencode-memory-demo
+bun run prepare
+bun run start
+```
+
 Build the local sidecar:
 
 ```sh

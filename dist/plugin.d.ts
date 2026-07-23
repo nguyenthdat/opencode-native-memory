@@ -7,6 +7,7 @@ export interface MemoryPluginOptions {
     sharedSync?: boolean;
     feedbackTracking?: boolean;
     minScore?: number;
+    projectRoot?: string;
 }
 export declare function createMemoryPlugin(options: MemoryPluginOptions): Plugin;
 interface ResolvedMemoryPluginOptions {

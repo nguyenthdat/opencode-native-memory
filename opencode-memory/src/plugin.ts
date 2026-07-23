@@ -42,12 +42,14 @@ export interface MemoryPluginOptions {
   sharedSync?: boolean;
   feedbackTracking?: boolean;
   minScore?: number;
+  projectRoot?: string;
 }
 
 export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
   return async ({ client: opencode, directory, worktree }) => {
     const settings = resolveMemoryPluginOptions(options);
-    const native = new NativeMemoryClient(options.root, worktree);
+    const memoryProjectRoot = options.projectRoot ?? worktree;
+    const native = new NativeMemoryClient(options.root, memoryProjectRoot);
     const session = new SessionContext(
       native,
       (path, query) => opencode.session.get({ path, query }),
@@ -60,7 +62,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
       if (!settings.sharedSync) return;
       if (sharedSync) return await sharedSync;
       sharedSync = (async () => {
-        const loaded = await loadSharedMemories(worktree);
+        const loaded = await loadSharedMemories(memoryProjectRoot);
         for (const error of loaded.errors) {
           session.warnOnce(new Error(`${error.source}: ${error.message}`));
         }
@@ -69,7 +71,11 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
           records: loaded.records,
         });
         if (response.rejected > 0) {
-          throw new Error(`Rejected shared memories: ${response.rejected_sources.join(", ")}`);
+          throw new Error(
+            `Rejected shared memories: ${response.rejections
+              .map((rejection) => `${rejection.source}: ${rejection.message}`)
+              .join(", ")}`,
+          );
         }
         sharedSignature = loaded.signature;
         session.invalidateRecall();
@@ -748,7 +754,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 destination,
               },
             });
-            const path = await writeSharedMemory(worktree, memory);
+            const path = await writeSharedMemory(memoryProjectRoot, memory);
             await syncSharedMemories(true);
             return result("Promoted memory", { id: memory.id, path }, { id: memory.id, path });
           },

@@ -104,7 +104,7 @@ export interface SharedSyncResponse {
     imported: number;
     removed: number;
     rejected: number;
-    rejected_sources: string[];
+    rejections: SharedMemoryLoadError[];
 }
 export interface RpcResponse {
     id: number;

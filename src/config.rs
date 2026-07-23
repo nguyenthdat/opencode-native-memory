@@ -115,12 +115,13 @@ impl MemoryConfig {
     ///
     /// Returns an error when the current working directory cannot be determined.
     pub fn discover() -> Result<Self> {
-        let current = match env::var_os("OPENCODE_MEMORY_PROJECT_ROOT") {
-            Some(value) => PathBuf::from(value),
-            None => env::current_dir().context("cannot determine the current project directory")?,
+        let project_root = match env::var_os("OPENCODE_MEMORY_PROJECT_ROOT") {
+            Some(value) => resolve_project_root(PathBuf::from(value), false),
+            None => resolve_project_root(
+                env::current_dir().context("cannot determine the current project directory")?,
+                true,
+            ),
         };
-        let canonical = current.canonicalize().unwrap_or(current);
-        let project_root = discover_project_root(&canonical);
 
         let data_root = env_path("OPENCODE_MEMORY_DATA_DIR")
             .unwrap_or_else(|| default_data_home().join(DATA_SUBDIR));
@@ -249,13 +250,22 @@ fn discover_project_root(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
+fn resolve_project_root(start: PathBuf, discover_git: bool) -> PathBuf {
+    let canonical = start.canonicalize().unwrap_or(start);
+    if discover_git {
+        discover_project_root(&canonical)
+    } else {
+        canonical
+    }
+}
+
 pub(crate) fn hash_hex(input: &[u8]) -> String {
     hex::encode(Sha256::digest(input))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryConfig, discover_project_root};
+    use super::{MemoryConfig, discover_project_root, resolve_project_root};
     use std::fs;
 
     #[test]
@@ -287,5 +297,17 @@ mod tests {
         fs::create_dir_all(&nested).expect("create nested path");
 
         assert_eq!(discover_project_root(&nested), root);
+    }
+
+    #[test]
+    fn explicit_project_root_does_not_expand_to_parent_git_repository() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("repo");
+        let nested = root.join("tests/demo");
+        fs::create_dir_all(root.join(".git")).expect("create git marker");
+        fs::create_dir_all(&nested).expect("create nested project");
+        let expected = nested.canonicalize().expect("canonicalize nested project");
+
+        assert_eq!(resolve_project_root(nested, false), expected);
     }
 }
