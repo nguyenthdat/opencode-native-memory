@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "mcps": {
+    "docs.rs": {
+      "appliedHash": "b2955838789b9e1d8b5fa2e65f724c8837a51d7348513fb1365770d41040344a"
+    },
+    "crates.io": {
+      "appliedHash": "bbf9f369c49be549fe9846226d9234c5cfffb566c31d4b19936967eaaa7ba668"
+    },
+    "cargo": {
+      "appliedHash": "ed63e73d91532afa8094c7748f54fa1ef33a03c747dcb6351752fcc2e9e85282"
+    },
+    "ferroscope": {
+      "appliedHash": "bd5e2ba1b6f2d8f208bba4fed119630461ecfbf6baefb962efc1b4e897541a87"
+    }
+  },
+  "skills": {
+    "custom:rust-coding": {
+      "source": "custom",
+      "sourcePath": "rust-coding",
+      "name": "rust-coding",
+      "digest": "0370f85d71d7b4aa1854225cf77bf22657f183af5367d07fd682d6a502b1a8de"
+    },
+    "custom:typescript-coding": {
+      "source": "custom",
+      "sourcePath": "typescript-coding",
+      "name": "typescript-coding",
+      "digest": "69a49dc45760a4230823f31d7b705d4e26d8de960ca98f03a1d31e9a15d5e686"
+    }
+  },
+  "rules": {
+    "parallel-agents": {
+      "title": "Parallel Agent Orchestration",
+      "description": "Fan out independent workstreams to focused subagents and reconcile results through the primary agent.",
+      "tags": [
+        "agents",
+        "orchestration"
+      ],
+      "path": "rules/parallel-agents.md",
+      "digest": "ccdd1933067dc0091d9a4e1ff1ee1f893252763ee9b9ef013586cbecfa3ef380",
+      "configFile": ".opencode/opencode.jsonc"
+    }
+  },
+  "agents": {}
+}

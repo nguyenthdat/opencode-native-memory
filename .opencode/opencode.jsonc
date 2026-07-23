@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "docs.rs": {
+      "type": "local",
+      "command": ["bunx", "-y", "@nuskey8/docs-rs-mcp@latest"],
+      "enabled": true,
+    },
+    "crates.io": { "type": "local", "command": ["cratesio-mcp"], "enabled": true },
+    "cargo": { "type": "local", "command": ["cargo-mcp", "serve"], "enabled": true },
+    "ferroscope": { "type": "local", "command": ["ferroscope"], "enabled": true },
+  },
+  "instructions": [".opencode/instructions/parallel-agents.md"],
+}
