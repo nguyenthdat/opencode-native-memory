@@ -1,4 +1,4 @@
-import { cp, mkdir, readdir, rm } from "node:fs/promises";
+import { access, cp, mkdir, readdir, rm } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 interface Options {
@@ -22,7 +22,7 @@ async function main(): Promise<void> {
   const libraryDirectory = join(binaryDirectory, "memory-libs");
 
   const libraryName = process.platform === "darwin" ? "libzvec_c_api.dylib" : "libzvec_c_api.so";
-  const library = await findFile(join(buildRoot, "build"), libraryName);
+  const library = await findNativeLibrary(buildRoot, libraryName);
   if (!library) throw new Error(`Cannot find ${libraryName} below ${buildRoot}`);
 
   if (options.runtime) {
@@ -73,6 +73,22 @@ async function findFile(root: string, name: string): Promise<string | undefined>
     .filter((entry) => entry.isFile() && entry.name === name)
     .map((entry) => join(entry.parentPath, entry.name))
     .at(0);
+}
+
+async function findNativeLibrary(
+  buildRoot: string,
+  libraryName: string,
+): Promise<string | undefined> {
+  if (process.env.ZVEC_LIB_DIR) {
+    const candidate = join(process.env.ZVEC_LIB_DIR, libraryName);
+    if (
+      await access(candidate)
+        .then(() => true)
+        .catch(() => false)
+    )
+      return candidate;
+  }
+  return await findFile(join(buildRoot, "build"), libraryName);
 }
 
 await main();
