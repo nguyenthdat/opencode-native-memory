@@ -43,18 +43,6 @@
     }
   },
   "agents": {
-    "search": {
-      "type": "single",
-      "title": "Search Researcher",
-      "description": "Collects, validates, and summarizes current external information with source evidence.",
-      "tags": [
-        "research",
-        "web"
-      ],
-      "path": "agents/search.md",
-      "digest": "c4eca6cbfb7a2df6b7db5959242946b04ea958f898754b728012896aa032bd67",
-      "members": 1
-    },
     "researcher": {
       "title": "Research Team",
       "description": "Orchestrated web, academic, community, validation, and synthesis research team.",
