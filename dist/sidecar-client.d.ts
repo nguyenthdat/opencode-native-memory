@@ -10,6 +10,11 @@ export type SpawnFn = (binary: string, args: string[], opts: {
     env: NodeJS.ProcessEnv | undefined;
     stdio: ["pipe", "pipe", "pipe"];
 }) => ChildProcessWithoutNullStreams;
+type NativeMemoryClientFactory = (root: string, worktree: string) => NativeMemoryClient;
+export interface NativeMemoryClientLease {
+    readonly client: NativeMemoryClient;
+    release(): Promise<void>;
+}
 export declare function resolveNativeMemoryBinary(root: string): string;
 export declare class NativeMemoryClient {
     private readonly root;
@@ -36,4 +41,13 @@ export declare class NativeMemoryClient {
     private failProcess;
     private isCurrentAndRunning;
 }
+export declare class NativeMemoryClientPool {
+    private readonly createClient;
+    private readonly entries;
+    constructor(createClient?: NativeMemoryClientFactory);
+    acquire(root: string, worktree: string): Promise<NativeMemoryClientLease>;
+    private createLease;
+}
+export declare function acquireNativeMemoryClient(root: string, worktree: string): Promise<NativeMemoryClientLease>;
+export {};
 //# sourceMappingURL=sidecar-client.d.ts.map

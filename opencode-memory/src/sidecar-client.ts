@@ -36,6 +36,19 @@ export type SpawnFn = (
   },
 ) => ChildProcessWithoutNullStreams;
 
+type NativeMemoryClientFactory = (root: string, worktree: string) => NativeMemoryClient;
+
+interface NativeMemoryClientPoolEntry {
+  readonly client: NativeMemoryClient;
+  leases: number;
+  closing?: Promise<void>;
+}
+
+export interface NativeMemoryClientLease {
+  readonly client: NativeMemoryClient;
+  release(): Promise<void>;
+}
+
 export function resolveNativeMemoryBinary(root: string): string {
   const platform = `${process.platform}-${process.arch}`;
   const packageName = NATIVE_PACKAGES[platform];
@@ -454,6 +467,82 @@ export class NativeMemoryClient {
       process.child.signalCode === null
     );
   }
+}
+
+export class NativeMemoryClientPool {
+  private readonly entries = new Map<string, NativeMemoryClientPoolEntry>();
+
+  constructor(
+    private readonly createClient: NativeMemoryClientFactory = (root, worktree) =>
+      new NativeMemoryClient(root, worktree),
+  ) {}
+
+  async acquire(root: string, worktree: string): Promise<NativeMemoryClientLease> {
+    const key = sidecarPoolKey(worktree);
+    for (;;) {
+      const current = this.entries.get(key);
+      if (current?.closing) {
+        await current.closing;
+        continue;
+      }
+      if (current) {
+        current.leases += 1;
+        return this.createLease(key, current);
+      }
+
+      const entry: NativeMemoryClientPoolEntry = {
+        client: this.createClient(root, worktree),
+        leases: 1,
+      };
+      this.entries.set(key, entry);
+      return this.createLease(key, entry);
+    }
+  }
+
+  private createLease(key: string, entry: NativeMemoryClientPoolEntry): NativeMemoryClientLease {
+    let released = false;
+    return {
+      client: entry.client,
+      release: async () => {
+        if (released) return;
+        released = true;
+        entry.leases -= 1;
+        if (entry.leases > 0) return;
+
+        const closing = entry.client.dispose().finally(() => {
+          if (this.entries.get(key) === entry) this.entries.delete(key);
+        });
+        entry.closing = closing;
+        await closing;
+      },
+    };
+  }
+}
+
+const SHARED_SIDECAR_POOL = Symbol.for("@nguyenthdat/opencode-memory/sidecar-pool/v1");
+const sidecarPoolGlobal = globalThis as typeof globalThis & {
+  [key: symbol]: NativeMemoryClientPool | undefined;
+};
+const sharedNativeMemoryClientPool =
+  sidecarPoolGlobal[SHARED_SIDECAR_POOL] ?? new NativeMemoryClientPool();
+sidecarPoolGlobal[SHARED_SIDECAR_POOL] = sharedNativeMemoryClientPool;
+
+export function acquireNativeMemoryClient(
+  root: string,
+  worktree: string,
+): Promise<NativeMemoryClientLease> {
+  return sharedNativeMemoryClientPool.acquire(root, worktree);
+}
+
+function sidecarPoolKey(worktree: string): string {
+  const absolute = resolve(worktree);
+  let canonical = absolute;
+  try {
+    canonical = realpathSync(absolute);
+  } catch {
+    // Preserve lazy startup when the host provides a path that is not ready yet.
+  }
+  return `${canonical}\0${process.env.OPENCODE_MEMORY_DATA_DIR ?? ""}`;
 }
 
 function stopProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {

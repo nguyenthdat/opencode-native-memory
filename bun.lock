@@ -17,9 +17,9 @@
         "typescript": "^5.9.3",
       },
       "optionalDependencies": {
-        "@nguyenthdat/opencode-memory-darwin-arm64": "0.3.2",
-        "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.3.2",
-        "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.2",
+        "@nguyenthdat/opencode-memory-darwin-arm64": "0.3.3",
+        "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.3.3",
+        "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.3",
       },
       "peerDependencies": {
         "@opencode-ai/plugin": ">=1.18.4 <2",

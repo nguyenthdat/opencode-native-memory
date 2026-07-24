@@ -15,7 +15,7 @@ import {
   LOCK_ACTIONS,
   MEMORY_TAXONOMIES,
 } from "./contracts.js";
-import { NativeMemoryClient } from "./sidecar-client.js";
+import { acquireNativeMemoryClient } from "./sidecar-client.js";
 import {
   COMPACTION_CONTEXT,
   formatRecalledMemories,
@@ -53,7 +53,8 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     const settings = resolveMemoryPluginOptions(options);
     const memoryProjectRoot = options.projectRoot ?? worktree;
     const memoryInstructions = await loadMemoryInstructions(options.root);
-    const native = new NativeMemoryClient(options.root, memoryProjectRoot);
+    const nativeLease = await acquireNativeMemoryClient(options.root, memoryProjectRoot);
+    const native = nativeLease.client;
     const session = new SessionContext(
       native,
       (path, query) => opencode.session.get({ path, query }),
@@ -102,7 +103,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
         session.sessionParents.clear();
         session.sessionRoots.clear();
         session.sessionAgents.clear();
-        await native.dispose();
+        await nativeLease.release();
       },
       config: async (config) => {
         await registerMemoryInstructions(config, memoryInstructions, directory);
