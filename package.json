@@ -1,6 +1,6 @@
 {
   "name": "@nguyenthdat/opencode-memory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local-first persistent memory for OpenCode with a Rust, zvec, and llama.cpp sidecar",
   "type": "module",
   "packageManager": "bun@1.3.14",
@@ -14,6 +14,11 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js",
+      "default": "./dist/server.js"
     }
   },
   "files": [
@@ -53,10 +58,10 @@
     "@opencode-ai/plugin": ">=1.18.4 <2"
   },
   "optionalDependencies": {
-    "@nguyenthdat/opencode-memory-darwin-arm64": "0.3.0",
-    "@nguyenthdat/opencode-memory-darwin-x64": "0.3.0",
-    "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.3.0",
-    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.0"
+    "@nguyenthdat/opencode-memory-darwin-arm64": "0.3.1",
+    "@nguyenthdat/opencode-memory-darwin-x64": "0.3.1",
+    "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.3.1",
+    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.1"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.4",
