@@ -27,9 +27,6 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             package: darwin-arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            package: darwin-x64
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: linux-x64-gnu
@@ -68,30 +65,6 @@ jobs:
 
       - name: Validate versions
         run: bun run versions:check
-
-      - name: Checkout zvec source for Intel macOS
-        if: matrix.target == 'x86_64-apple-darwin'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: zvec-ai/zvec-rust
-          ref: f8e81a1645db9e5004fddc2e3f2160e0a512bfce # v0.6.0
-          path: target/zvec-rust
-          submodules: recursive
-
-      - name: Build zvec C library for Intel macOS
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: |
-          NPROC=$(sysctl -n hw.ncpu 2>/dev/null || echo 2)
-          cmake -S target/zvec-rust/vendor/zvec -B target/zvec-x64-build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-            -DBUILD_C_BINDINGS=ON \
-            -DBUILD_TOOLS=OFF
-          cmake --build target/zvec-x64-build --config Release --parallel "$NPROC" --target zvec_c_api
-          ZVEC_LIB_DIR=$(find target/zvec-x64-build -name libzvec_c_api.dylib -exec dirname {} \; | head -1)
-          test -n "$ZVEC_LIB_DIR"
-          echo "ZVEC_LIB_DIR=$GITHUB_WORKSPACE/$ZVEC_LIB_DIR" >> "$GITHUB_ENV"
 
       - name: Build native sidecar
         run: cargo build --release --locked --target ${{ matrix.target }}

@@ -14,7 +14,6 @@ const SUPPORTED_RPC_VERSION = 2;
 const require = createRequire(import.meta.url);
 const NATIVE_PACKAGES = {
     "darwin-arm64": "@nguyenthdat/opencode-memory-darwin-arm64",
-    "darwin-x64": "@nguyenthdat/opencode-memory-darwin-x64",
     "linux-arm64": "@nguyenthdat/opencode-memory-linux-arm64-gnu",
     "linux-x64": "@nguyenthdat/opencode-memory-linux-x64-gnu",
 };
@@ -22,7 +21,7 @@ export function resolveNativeMemoryBinary(root) {
     const platform = `${process.platform}-${process.arch}`;
     const packageName = NATIVE_PACKAGES[platform];
     if (!packageName) {
-        throw new Error(`Native memory supports only macOS and glibc Linux on arm64 or x64, not ${platform}`);
+        throw new Error(`Native memory supports only macOS arm64 and glibc Linux arm64/x64, not ${platform}`);
     }
     const override = process.env.OPENCODE_NATIVE_MEMORY_BIN;
     const binaryName = "opencode-memory";

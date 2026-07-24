@@ -12,7 +12,6 @@ if (!rustPackage) throw new Error("Cannot find opencode-memory in Cargo metadata
 
 const nativePackages = [
   ["darwin-arm64", "@nguyenthdat/opencode-memory-darwin-arm64"],
-  ["darwin-x64", "@nguyenthdat/opencode-memory-darwin-x64"],
   ["linux-arm64-gnu", "@nguyenthdat/opencode-memory-linux-arm64-gnu"],
   ["linux-x64-gnu", "@nguyenthdat/opencode-memory-linux-x64-gnu"],
 ] as const;

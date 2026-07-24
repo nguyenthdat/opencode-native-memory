@@ -13,7 +13,7 @@ Local-first persistent memory for OpenCode. The plugin runs a native Rust sideca
 - Crash-recoverable batch upsert journal and portable export/import snapshots
 - Markdown-backed shared repository memory under `.opencode/memory/`
 - Length-delimited Protobuf protocol between TypeScript and Rust
-- Native sidecar packages for macOS and glibc Linux
+- Native sidecar packages for Apple Silicon macOS and glibc Linux
 
 ## Install
 
@@ -21,20 +21,21 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@nguyenthdat/opencode-memory@0.3.1"]
+  "plugin": ["@nguyenthdat/opencode-memory/server"]
 }
 ```
 
-npm installs one matching optional native package for the current platform. Reinstall without `--omit=optional`; the plugin intentionally has no postinstall script or runtime binary download.
+On a supported platform, npm installs one matching optional native package. Reinstall without `--omit=optional`; the plugin intentionally has no postinstall script or runtime binary download.
 
 Supported packages:
 
 | OS          | Architecture | Native package                                 |
 | ----------- | ------------ | ---------------------------------------------- |
 | macOS       | ARM64        | `@nguyenthdat/opencode-memory-darwin-arm64`    |
-| macOS       | x64          | `@nguyenthdat/opencode-memory-darwin-x64`      |
 | Linux glibc | ARM64        | `@nguyenthdat/opencode-memory-linux-arm64-gnu` |
 | Linux glibc | x64          | `@nguyenthdat/opencode-memory-linux-x64-gnu`   |
+
+**Roadmap:** Native packages for Windows ARM64 and Windows x64 (AMD64) are planned.
 
 The first memory operation downloads the default GGUF model under `~/.local/share/opencode/memory/models/<model-revision>/` (or `$XDG_DATA_HOME/opencode/memory/models/<model-revision>/`). Override `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH` to use an existing local model and avoid a network download.
 
@@ -185,7 +186,7 @@ GPU features are opt-in Cargo features: `metal`, `cuda`, `cuda-no-vmm`, `vulkan`
 
 ## Releases
 
-Tags matching `vX.Y.Z` build and package four native targets for macOS and glibc Linux, publish native packages first, publish the umbrella plugin with npm provenance, and create a GitHub release containing all tarballs and a checksum for the umbrella package. `package.json`, `Cargo.toml`, and every native package must carry the same version.
+Tags matching `vX.Y.Z` build and package three native targets for Apple Silicon macOS and glibc Linux, publish native packages first, publish the umbrella plugin with npm provenance, and create a GitHub release containing all tarballs and a checksum for the umbrella package. `package.json`, `Cargo.toml`, and every native package must carry the same version.
 
 ## License
 
