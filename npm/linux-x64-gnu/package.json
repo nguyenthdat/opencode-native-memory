@@ -18,6 +18,10 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nguyenthdat/opencode-native-memory.git"
+  },
   "publishConfig": {
     "access": "public"
   }

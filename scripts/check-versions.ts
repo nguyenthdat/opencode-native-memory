@@ -16,6 +16,8 @@ const nativePackages = [
   ["linux-arm64-gnu", "@nguyenthdat/opencode-memory-linux-arm64-gnu"],
   ["linux-x64-gnu", "@nguyenthdat/opencode-memory-linux-x64-gnu"],
 ] as const;
+const expectedRepositoryUrl = rootPackage.repository?.url;
+if (!expectedRepositoryUrl) throw new Error("Root package repository URL is required");
 const versions = new Map<string, string>([
   [rootPackage.name, rootPackage.version],
   [rustPackage.name, rustPackage.version],
@@ -24,6 +26,11 @@ for (const [directory, expectedName] of nativePackages) {
   const pkg = await readPackage(join("npm", directory, "package.json"));
   if (pkg.name !== expectedName) {
     throw new Error(`${directory} package name must be ${expectedName}, received ${pkg.name}`);
+  }
+  if (pkg.repository?.url !== expectedRepositoryUrl) {
+    throw new Error(
+      `${directory} repository URL must be ${expectedRepositoryUrl}, received ${pkg.repository?.url ?? "none"}`,
+    );
   }
   versions.set(pkg.name, pkg.version);
 }
@@ -48,10 +55,12 @@ async function readPackage(path: string): Promise<{
   name: string;
   version: string;
   optionalDependencies?: Record<string, string>;
+  repository?: { type: string; url: string };
 }> {
   return JSON.parse(await readFile(path, "utf8")) as {
     name: string;
     version: string;
     optionalDependencies?: Record<string, string>;
+    repository?: { type: string; url: string };
   };
 }
