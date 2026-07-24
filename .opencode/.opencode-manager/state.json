@@ -14,6 +14,7 @@
       "appliedHash": "bd5e2ba1b6f2d8f208bba4fed119630461ecfbf6baefb962efc1b4e897541a87"
     }
   },
+  "plugins": {},
   "skills": {
     "custom:rust-coding": {
       "source": "custom",
@@ -41,5 +42,30 @@
       "configFile": ".opencode/opencode.jsonc"
     }
   },
-  "agents": {}
+  "agents": {
+    "search": {
+      "type": "single",
+      "title": "Search Researcher",
+      "description": "Collects, validates, and summarizes current external information with source evidence.",
+      "tags": [
+        "research",
+        "web"
+      ],
+      "path": "agents/search.md",
+      "digest": "c4eca6cbfb7a2df6b7db5959242946b04ea958f898754b728012896aa032bd67",
+      "members": 1
+    },
+    "researcher": {
+      "title": "Research Team",
+      "description": "Orchestrated web, academic, community, validation, and synthesis research team.",
+      "tags": [
+        "research",
+        "deep-research"
+      ],
+      "path": "agents/researcher",
+      "type": "team",
+      "digest": "9d9f7f757cf284e2919dcc5d64da8188102dbd6eff28c6a7062fbdec6ebc3bfc",
+      "members": 6
+    }
+  }
 }
