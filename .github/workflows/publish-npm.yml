@@ -174,7 +174,7 @@ jobs:
           for TARBALL in artifacts/*.tgz; do
             PACKAGE=$(tar -xOf "$TARBALL" package/package.json | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).name))')
             VERSION=$(node -p "require('./package.json').version")
-            npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "$TARBALL" --access public --provenance
+            npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "./$TARBALL" --access public --provenance
           done
 
       - name: Pack and publish umbrella package
@@ -184,7 +184,7 @@ jobs:
           TARBALL=$(node -e "process.stdout.write(require('./npm-pack.json')[0].filename)")
           VERSION=$(node -p "require('./package.json').version")
           PACKAGE=$(node -p "require('./package.json').name")
-          npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "$TARBALL" --access public --provenance
+          npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "./$TARBALL" --access public --provenance
           sha256sum "$TARBALL" > "$TARBALL.sha256"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
 
