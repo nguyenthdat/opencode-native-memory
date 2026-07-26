@@ -73,6 +73,13 @@ describe("parseCuratedCandidates", () => {
   test("states the automatic importance ceiling in the compaction prompt", () => {
     expect(COMPACTION_CONTEXT).toContain("Importance must be between 0 and 0.6 inclusive");
   });
+
+  test("forbids guessed code paths in the compaction prompt", () => {
+    expect(COMPACTION_CONTEXT).not.toContain('"code_paths":["relative/path"]');
+    expect(COMPACTION_CONTEXT).toContain("verified existing regular files");
+    expect(COMPACTION_CONTEXT).toContain("never infer or guess a path");
+    expect(COMPACTION_CONTEXT).toContain("omit a fact candidate when no verified file applies");
+  });
 });
 
 function candidateBlock(candidates: unknown[]): string {

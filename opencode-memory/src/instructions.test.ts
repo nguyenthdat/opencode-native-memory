@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   MEMORY_INSTRUCTIONS_MARKER,
   loadMemoryInstructions,
@@ -22,6 +23,15 @@ describe("memory instructions", () => {
 
     expect(asset.path).toBe(await realpath(join(root, "rules", "flow.md")));
     expect(asset.content).toContain(MEMORY_INSTRUCTIONS_MARKER);
+  });
+
+  test("the packaged workflow forbids guessed code paths", async () => {
+    const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+
+    const asset = await loadMemoryInstructions(packageRoot);
+
+    expect(asset.content).toContain("Never guess `code_paths`");
+    expect(asset.content).toContain("existing regular files verified relative to the project root");
   });
 
   test("registers once while preserving existing instructions", async () => {

@@ -351,7 +351,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                     },
                 }),
                 memory_store: tool({
-                    description: "Store one distilled, durable project memory. Never store secrets, raw conversations, temporary logs, or unverified guesses.",
+                    description: "Store one distilled, durable project memory. Never store secrets, raw conversations, temporary logs, unverified guesses, or guessed code_paths.",
                     args: {
                         content: tool.schema
                             .string()
@@ -394,7 +394,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                             .array(tool.schema.string().min(1).max(512))
                             .max(12)
                             .default([])
-                            .describe("Relative files that validate this memory."),
+                            .describe("Existing regular files relative to the project root that verify this memory. Never guess paths; leave empty when no verified file applies. Any invalid path rejects the store."),
                         revive: tool.schema
                             .boolean()
                             .default(false)
@@ -402,7 +402,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                         taxonomy: tool.schema
                             .enum(MEMORY_TAXONOMIES)
                             .optional()
-                            .describe("Explicit memory taxonomy; inferred when omitted."),
+                            .describe("Explicit memory taxonomy; usually omit so it is inferred."),
                         confidence: tool.schema
                             .number()
                             .min(0)
@@ -494,7 +494,11 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                         scope: tool.schema.enum(WRITABLE_MEMORY_SCOPES).optional(),
                         expires_in_days: tool.schema.number().int().min(1).max(3_650).optional(),
                         clear_expiry: tool.schema.boolean().default(false),
-                        code_paths: tool.schema.array(tool.schema.string().min(1).max(512)).max(12).optional(),
+                        code_paths: tool.schema
+                            .array(tool.schema.string().min(1).max(512))
+                            .max(12)
+                            .optional()
+                            .describe("Replacement anchors: verified existing regular files relative to the project root. Omit to preserve current anchors; pass [] to clear them. Any invalid path rejects the update."),
                         pinned: tool.schema
                             .boolean()
                             .optional()
@@ -509,7 +513,10 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                             .max(240)
                             .optional()
                             .describe("Reason for locking the memory. Only valid with lock_action='lock'."),
-                        taxonomy: tool.schema.enum(MEMORY_TAXONOMIES).optional(),
+                        taxonomy: tool.schema
+                            .enum(MEMORY_TAXONOMIES)
+                            .optional()
+                            .describe("Explicit reclassification; omit to preserve the current taxonomy."),
                         confidence: tool.schema.number().min(0).max(1).optional(),
                         conflict_with: tool.schema
                             .array(tool.schema.string().regex(/^mem_[0-9a-f]{32}$/))

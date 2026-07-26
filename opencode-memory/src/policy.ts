@@ -6,9 +6,9 @@ export const CANDIDATES_CLOSE = "</durable-memory-candidates>";
 
 export const COMPACTION_CONTEXT = `Preserve durable project knowledge across compaction, but never copy the full summary into memory. Exclude secrets, guesses, transient progress, and conversational detail. End the summary with exactly this block containing a JSON array of at most three verified, atomic candidates (or []):
 ${CANDIDATES_OPEN}
-[{"title":"...","content":"...","kind":"decision|preference|fact|pattern|gotcha","importance":0.0,"tags":["..."],"code_paths":["relative/path"]}]
+[{"title":"...","content":"...","kind":"decision|preference|fact|pattern|gotcha","importance":0.0,"tags":["..."],"code_paths":[]}]
 ${CANDIDATES_CLOSE}
-Importance must be between 0 and 0.6 inclusive. Facts require at least one code_paths entry. Do not include Markdown fences.`;
+Importance must be between 0 and 0.6 inclusive. code_paths entries must be verified existing regular files relative to the project root; never infer or guess a path. Facts require at least one such verified path, so omit a fact candidate when no verified file applies. Do not include Markdown fences.`;
 
 interface RecallQueryPart {
   type: string;

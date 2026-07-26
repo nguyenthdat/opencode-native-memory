@@ -29,6 +29,7 @@ const MAX_SOURCE_CHARS: usize = 240;
 const MAX_TAGS: usize = 12;
 const MAX_TAG_CHARS: usize = 64;
 const MAX_CODE_PATHS: usize = 12;
+const MAX_CODE_PATH_CHARS: usize = 512;
 const MAX_CODE_FILE_BYTES: u64 = 2 * 1_024 * 1_024;
 const TOKEN_PREFIXES: [&str; 9] = [
     "ghp_",
@@ -169,6 +170,14 @@ pub(crate) fn validate_store_request(request: StoreRequest) -> Result<Normalized
         request.code_paths.len() <= MAX_CODE_PATHS,
         "at most {MAX_CODE_PATHS} code paths are allowed"
     );
+    for path in &request.code_paths {
+        ensure!(!path.trim().is_empty(), "code path cannot be empty");
+        ensure!(
+            path.chars().count() <= MAX_CODE_PATH_CHARS,
+            "code path exceeds {MAX_CODE_PATH_CHARS} characters"
+        );
+        ensure!(!path.contains('\0'), "code path cannot contain NUL bytes");
+    }
     let scope_key = normalize_scope_key(request.scope, request.scope_key.as_deref())?;
     let confidence = resolve_confidence(request.confidence, request.importance, request.origin)?;
     let taxonomy = request.taxonomy.unwrap_or_else(|| {
@@ -323,7 +332,12 @@ pub(crate) fn capture_code_anchors(
         let canonical = root
             .join(relative)
             .canonicalize()
-            .with_context(|| format!("cannot resolve code path {path}"))?;
+            .with_context(|| {
+                format!(
+                    "cannot resolve code path `{path}` relative to project root `{}`; verify the file exists or omit code_paths when no verified anchor applies",
+                    root.display()
+                )
+            })?;
         ensure!(
             canonical.starts_with(&root),
             "code path escapes the project root: {path}"
@@ -540,8 +554,17 @@ pub(crate) fn contains_instruction_injection(content: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_capture_safety, sensitive_content_reason, validate_store_request};
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{
+        capture_code_anchors, classify_capture_safety, sensitive_content_reason,
+        validate_store_request,
+    };
+    use crate::MemoryConfig;
     use crate::capture::{CaptureSafety, SourceTrust};
+    use crate::config::hash_hex;
     use crate::contract::{MemoryKind, MemoryOrigin, MemoryScope, StoreRequest};
 
     fn request(content: &str) -> StoreRequest {
@@ -569,6 +592,77 @@ mod tests {
             .expect("valid request");
         assert_eq!(normalized.tags, vec!["Rust"]);
         assert_eq!(normalized.title, "Use Rust for the memory sidecar.");
+    }
+
+    #[test]
+    fn rejects_malformed_code_paths_at_the_request_boundary() {
+        let mut blank = request("Safe content");
+        blank.code_paths = vec![" \t".to_string()];
+        assert!(
+            validate_store_request(blank)
+                .err()
+                .expect("blank path must fail")
+                .to_string()
+                .contains("code path cannot be empty")
+        );
+
+        let mut too_long = request("Safe content");
+        too_long.code_paths = vec!["a".repeat(513)];
+        assert!(
+            validate_store_request(too_long)
+                .err()
+                .expect("oversized path must fail")
+                .to_string()
+                .contains("code path exceeds 512 characters")
+        );
+
+        let mut nul = request("Safe content");
+        nul.code_paths = vec!["src/\0lib.rs".to_string()];
+        assert!(
+            validate_store_request(nul)
+                .err()
+                .expect("NUL path must fail")
+                .to_string()
+                .contains("code path cannot contain NUL bytes")
+        );
+    }
+
+    #[test]
+    fn captures_an_existing_project_relative_file() {
+        let project = tempdir().expect("temporary project");
+        fs::create_dir(project.path().join("src")).expect("create source directory");
+        let contents = b"pub fn example() {}\n";
+        fs::write(project.path().join("src/lib.rs"), contents).expect("write source file");
+        let config = MemoryConfig::new(
+            project.path().to_path_buf(),
+            project.path().join("data"),
+            project.path().join("models"),
+        );
+
+        let anchors = capture_code_anchors(&config, &["src/lib.rs".to_string()])
+            .expect("capture valid anchor");
+
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].path, "src/lib.rs");
+        assert_eq!(anchors[0].sha256, hash_hex(contents));
+    }
+
+    #[test]
+    fn missing_code_path_error_explains_the_root_and_recovery() {
+        let project = tempdir().expect("temporary project");
+        let config = MemoryConfig::new(
+            project.path().to_path_buf(),
+            project.path().join("data"),
+            project.path().join("models"),
+        );
+
+        let error = capture_code_anchors(&config, &["missing.rs".to_string()])
+            .expect_err("missing path must fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("cannot resolve code path `missing.rs` relative to project root"));
+        assert!(message.contains(&project.path().to_string_lossy().to_string()));
+        assert!(message.contains("omit code_paths when no verified anchor applies"));
     }
 
     #[test]
