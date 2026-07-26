@@ -2,6 +2,7 @@ pub mod capture;
 mod config;
 mod contract;
 mod document;
+mod document_index;
 mod embedding;
 mod engine;
 mod lifecycle;
@@ -23,7 +24,8 @@ pub use capture::{
 pub use config::{EmbeddingConfig, MemoryConfig};
 pub use contract::{
     CaptureRequest, CaptureResponse, CodeAnchor, DeleteReason, DeleteRequest, DeleteResponse,
-    DoctorRequest, DoctorResponse, ExportRequest, FeedbackEvent, FeedbackRequest, FeedbackResponse,
+    DoctorRequest, DoctorResponse, DocumentIndexRejection, DocumentIndexRequest,
+    DocumentIndexResponse, ExportRequest, FeedbackEvent, FeedbackRequest, FeedbackResponse,
     FeedbackStats, ForgetRequest, ForgetResponse, GetRequest, ImportRequest, ImportResponse,
     IndexStatus, IngestRequest, IngestResponse, LifecycleResponse, ListRequest, ListResponse,
     LockAction, LockRequest, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, MemorySnapshot,

@@ -1,7 +1,7 @@
 //! Bounded local document extraction and deterministic Markdown chunking.
 
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use xberg::{ExtractInput, ExtractionConfig, OutputFormat, SecurityLimits};
@@ -11,7 +11,7 @@ use crate::config::hash_hex;
 use crate::validation::MAX_CONTENT_CHARS;
 
 const MAX_DOCUMENT_PATH_CHARS: usize = 200;
-const MAX_DOCUMENT_FILE_BYTES: u64 = 32 * 1_024 * 1_024;
+pub(crate) const MAX_DOCUMENT_FILE_BYTES: u64 = 32 * 1_024 * 1_024;
 const MAX_EXTRACTED_CHARS: usize = 600_000;
 const MAX_DOCUMENT_CHUNKS: usize = 100;
 
@@ -23,21 +23,50 @@ pub(crate) struct ExtractedDocument {
     pub(crate) warnings: Vec<String>,
 }
 
+pub(crate) struct InspectedDocument {
+    path: PathBuf,
+    pub(crate) normalized_path: String,
+    pub(crate) mime_type: String,
+    pub(crate) content_hash: String,
+    bytes: Vec<u8>,
+}
+
 pub(crate) fn extract_document(
     config: &MemoryConfig,
     requested_path: &str,
 ) -> Result<ExtractedDocument> {
+    extract_inspected_document(inspect_document(config, requested_path)?)
+}
+
+pub(crate) fn inspect_document(
+    config: &MemoryConfig,
+    requested_path: &str,
+) -> Result<InspectedDocument> {
     let (path, normalized_path) = validated_document_path(config, requested_path)?;
     let bytes =
         fs::read(&path).with_context(|| format!("cannot read document `{normalized_path}`"))?;
     let content_hash = hash_hex(&bytes);
-    let filename = path
+    let mime_type = mime_type_for_path(&path)?;
+    Ok(InspectedDocument {
+        path,
+        normalized_path,
+        mime_type,
+        content_hash,
+        bytes,
+    })
+}
+
+pub(crate) fn extract_inspected_document(
+    inspected: InspectedDocument,
+) -> Result<ExtractedDocument> {
+    let filename = inspected
+        .path
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("document filename must be valid UTF-8"))?
         .to_string();
-    let mime_type = mime_type_for_path(&path)?;
-    let input = ExtractInput::from_bytes(bytes, mime_type.clone(), Some(filename));
+    let input =
+        ExtractInput::from_bytes(inspected.bytes, inspected.mime_type.clone(), Some(filename));
     let limits = SecurityLimits {
         max_content_size: MAX_EXTRACTED_CHARS * 4,
         ..SecurityLimits::default()
@@ -57,7 +86,7 @@ pub(crate) fn extract_document(
         .context("cannot initialize xberg extraction runtime")?;
     let mut output = runtime
         .block_on(xberg::extract(input, &extraction))
-        .with_context(|| format!("cannot extract document `{normalized_path}`"))?;
+        .with_context(|| format!("cannot extract document `{}`", inspected.normalized_path))?;
     if !output.errors.is_empty() {
         let message = output
             .errors
@@ -66,21 +95,28 @@ pub(crate) fn extract_document(
             .map(|error| error.message.as_str())
             .collect::<Vec<_>>()
             .join("; ");
-        bail!("xberg could not extract `{normalized_path}`: {message}");
+        bail!(
+            "xberg could not extract `{}`: {message}",
+            inspected.normalized_path
+        );
     }
     ensure!(
         output.results.len() == 1,
-        "xberg returned {} documents for one input `{normalized_path}`",
-        output.results.len()
+        "xberg returned {} documents for one input `{}`",
+        output.results.len(),
+        inspected.normalized_path
     );
-    let document = output
-        .results
-        .pop()
-        .ok_or_else(|| anyhow::anyhow!("xberg returned no content for `{normalized_path}`"))?;
+    let document = output.results.pop().ok_or_else(|| {
+        anyhow::anyhow!(
+            "xberg returned no content for `{}`",
+            inspected.normalized_path
+        )
+    })?;
     let content = document.content.trim().to_string();
     ensure!(
         !content.is_empty(),
-        "document `{normalized_path}` contains no extractable text"
+        "document `{}` contains no extractable text",
+        inspected.normalized_path
     );
     ensure!(
         content.chars().count() <= MAX_EXTRACTED_CHARS,
@@ -93,12 +129,23 @@ pub(crate) fn extract_document(
         .map(|warning| format!("{}: {}", warning.source, warning.message))
         .collect();
     Ok(ExtractedDocument {
-        path: normalized_path,
+        path: inspected.normalized_path,
         mime_type: document.mime_type.into_owned(),
-        content_hash,
+        content_hash: inspected.content_hash,
         content,
         warnings,
     })
+}
+
+pub(crate) fn is_supported_document_path(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "pdf" | "md" | "markdown" | "html" | "htm"
+    )
 }
 
 pub(crate) fn split_markdown(content: &str) -> Result<Vec<String>> {

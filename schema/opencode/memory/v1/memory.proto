@@ -24,6 +24,7 @@ enum Method {
   METHOD_EXPORT = 18;
   METHOD_IMPORT = 19;
   METHOD_INGEST = 20;
+  METHOD_INDEX_DOCUMENTS = 21;
 }
 
 message ValueList {

@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { resolveMemoryPluginOptions } from "./plugin.js";
+import { isSupportedDocumentPath, resolveMemoryPluginOptions } from "./plugin.js";
 
 const ENVIRONMENT_KEYS = [
   "OPENCODE_MEMORY_WARMUP",
   "OPENCODE_MEMORY_AUTO_RECALL",
   "OPENCODE_MEMORY_AUTO_CAPTURE",
+  "OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS",
+  "OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS",
   "OPENCODE_MEMORY_SHARED_SYNC",
   "OPENCODE_MEMORY_FEEDBACK_TRACKING",
   "OPENCODE_MEMORY_MIN_SCORE",
@@ -26,6 +28,8 @@ describe("memory plugin options", () => {
       warmup: true,
       automaticRecall: true,
       automaticCapture: true,
+      automaticDocumentIndex: true,
+      documentIndexDebounceMs: 750,
       sharedSync: true,
       feedbackTracking: true,
       minScore: 0.42,
@@ -35,6 +39,8 @@ describe("memory plugin options", () => {
   test("reads environment controls and lets explicit options win", () => {
     process.env.OPENCODE_MEMORY_AUTO_RECALL = "off";
     process.env.OPENCODE_MEMORY_AUTO_CAPTURE = "0";
+    process.env.OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS = "off";
+    process.env.OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS = "1500";
     process.env.OPENCODE_MEMORY_MIN_SCORE = "0.55";
     const resolved = resolveMemoryPluginOptions({
       root: "/tmp/plugin",
@@ -42,6 +48,8 @@ describe("memory plugin options", () => {
     });
     expect(resolved.automaticRecall).toBe(true);
     expect(resolved.automaticCapture).toBe(false);
+    expect(resolved.automaticDocumentIndex).toBe(false);
+    expect(resolved.documentIndexDebounceMs).toBe(1500);
     expect(resolved.minScore).toBe(0.55);
   });
 
@@ -49,6 +57,19 @@ describe("memory plugin options", () => {
     process.env.OPENCODE_MEMORY_SHARED_SYNC = "sometimes";
     expect(() => resolveMemoryPluginOptions({ root: "/tmp/plugin" })).toThrow(
       "OPENCODE_MEMORY_SHARED_SYNC must be a boolean",
+    );
+  });
+
+  test("recognizes document watcher paths case-insensitively", () => {
+    expect(isSupportedDocumentPath("docs/guide.MD")).toBe(true);
+    expect(isSupportedDocumentPath("papers/result.pdf")).toBe(true);
+    expect(isSupportedDocumentPath("src/main.rs")).toBe(false);
+  });
+
+  test("rejects unsafe document index debounce values", () => {
+    process.env.OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS = "10";
+    expect(() => resolveMemoryPluginOptions({ root: "/tmp/plugin" })).toThrow(
+      "memory documentIndexDebounceMs must be between 50 and 60000",
     );
   });
 });

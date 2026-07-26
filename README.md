@@ -6,7 +6,7 @@ Local-first persistent memory for OpenCode. The plugin runs a native Rust sideca
 
 - Hybrid dense, lexical, metadata, and feedback-aware retrieval
 - Selectable lexical-only, dense-only, and hybrid retrieval modes
-- Rust-native xberg document ingestion for local PDF, Markdown, and HTML evidence
+- Automatic gitignore-aware indexing plus Rust-native xberg ingestion for local PDF, Markdown, and HTML evidence
 - Local GGUF embeddings through `utilityai/llama-cpp-rs`
 - Default pinned `Qwen3-Embedding-4B` model from Hugging Face
 - Session-family, agent, project, and repository scopes
@@ -23,7 +23,7 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@nguyenthdat/opencode-memory@0.4.0"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.4.1"]
 }
 ```
 
@@ -45,25 +45,26 @@ The plugin automatically registers its packaged `rules/flow.md` as an OpenCode i
 
 ## Memory Tools
 
-| Tool              | Purpose                                              |
-| ----------------- | ---------------------------------------------------- |
-| `memory_search`   | Retrieve relevant memories within a context budget   |
-| `memory_store`    | Store a verified durable memory                      |
-| `memory_ingest`   | Extract a local PDF, Markdown, or HTML document      |
-| `memory_get`      | Fetch complete records by ID                         |
-| `memory_list`     | Review/filter lifecycle-indexed memories             |
-| `memory_update`   | Correct semantic content or lifecycle metadata       |
-| `memory_pin`      | Pin or unpin without re-embedding                    |
-| `memory_lock`     | Lock or unlock without re-embedding                  |
-| `memory_delete`   | Delete records, with tombstones by default           |
-| `memory_promote`  | Promote reviewed local memory to repository Markdown |
-| `memory_export`   | Export records, lifecycle relations, and tombstones  |
-| `memory_import`   | Validate and restore a portable JSON snapshot        |
-| `memory_feedback` | Record whether recalled memories were useful         |
-| `memory_optimize` | Prune expired records and optimize indexes           |
-| `memory_status`   | Inspect backend, model, and schema status            |
-| `memory_doctor`   | Run shallow or deep integrity checks                 |
-| `memory_purge`    | Confirm and delete the complete project store        |
+| Tool                     | Purpose                                               |
+| ------------------------ | ----------------------------------------------------- |
+| `memory_search`          | Retrieve relevant memories within a context budget    |
+| `memory_store`           | Store a verified durable memory                       |
+| `memory_ingest`          | Extract one local PDF, Markdown, or HTML document     |
+| `memory_index_documents` | Incrementally index all non-ignored project documents |
+| `memory_get`             | Fetch complete records by ID                          |
+| `memory_list`            | Review/filter lifecycle-indexed memories              |
+| `memory_update`          | Correct semantic content or lifecycle metadata        |
+| `memory_pin`             | Pin or unpin without re-embedding                     |
+| `memory_lock`            | Lock or unlock without re-embedding                   |
+| `memory_delete`          | Delete records, with tombstones by default            |
+| `memory_promote`         | Promote reviewed local memory to repository Markdown  |
+| `memory_export`          | Export records, lifecycle relations, and tombstones   |
+| `memory_import`          | Validate and restore a portable JSON snapshot         |
+| `memory_feedback`        | Record whether recalled memories were useful          |
+| `memory_optimize`        | Prune expired records and optimize indexes            |
+| `memory_status`          | Inspect backend, model, and schema status             |
+| `memory_doctor`          | Run shallow or deep integrity checks                  |
+| `memory_purge`           | Confirm and delete the complete project store         |
 
 The 15 stable taxonomy values are `task_attempt`, `tool_call`, `session_summary`, `architecture_fact`, `codebase_fact`, `user_fact`, `fix_pattern`, `code_template`, `tool_heuristic`, `code_style`, `library_pref`, `workflow_pref`, `decision`, `team_convention`, and `project_standard`.
 
@@ -110,6 +111,8 @@ Changing model identity or embedding dimension requires rebuilding the project's
 | `OPENCODE_MEMORY_WARMUP`                     | Enable model/shared-memory warmup; default `true`                            |
 | `OPENCODE_MEMORY_AUTO_RECALL`                | Enable automatic contextual recall; default `true`                           |
 | `OPENCODE_MEMORY_AUTO_CAPTURE`               | Evaluate compaction candidates through the capture gate; default `true`      |
+| `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS`       | Incrementally index non-ignored project documents; default `true`            |
+| `OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS` | File-watcher re-index debounce; default `750`                                |
 | `OPENCODE_MEMORY_SHARED_SYNC`                | Synchronize `.opencode/memory/**/*.md`; default `true`                       |
 | `OPENCODE_MEMORY_FEEDBACK_TRACKING`          | Track retrieval feedback; default `true`                                     |
 | `OPENCODE_MEMORY_MIN_SCORE`                  | Default calibrated search threshold; default `0.42`                          |
@@ -140,6 +143,8 @@ Repository memory is canonical Markdown in:
 Shared Markdown is treated as untrusted data: paths are contained under `.opencode/memory`, YAML is parsed with a strict schema, instruction-shaped content and likely secrets are rejected, and imported records cannot be pinned or locked through RPC.
 
 `memory_ingest` accepts only project-relative `.pdf`, `.md`, `.markdown`, `.html`, and `.htm` files. Rust-side `xberg` extracts Markdown, chunks it below the 6,000-character memory limit, and stores the chunks with source hashes and document provenance. Extracted document content is untrusted evidence and is never treated as an instruction.
+
+Automatic document indexing scans the project at startup and after debounced document watcher events. It respects `.gitignore`, `.ignore`, `.git/info/exclude`, global Git ignores, hidden directories, and the 32 MiB per-file limit; `.opencode/memory/` remains managed exclusively by repository-memory sync. A private derived manifest at `document-index.json` tracks source hashes and chunk ownership, so unchanged files skip extraction/embedding, changed files replace their previous chunks, deleted files are removed without tombstones, and a malformed file retains its last valid index. Set `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS=false` to disable automatic synchronization, or call `memory_index_documents` for an explicit/forced run.
 
 ## Architecture
 

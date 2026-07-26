@@ -10,9 +10,10 @@ use serde_json::{Map, Number, Value as JsonValue, json};
 
 use crate::memory_proto::{Method, Request, Response, Value, ValueList, ValueObject, value};
 use crate::{
-    CaptureRequest, DeleteRequest, DoctorRequest, ExportRequest, FeedbackRequest, ForgetRequest,
-    GetRequest, ImportRequest, IngestRequest, ListRequest, LockRequest, MemoryConfig, MemoryEngine,
-    PinRequest, PurgeRequest, SearchRequest, StoreRequest, SyncSharedRequest, UpdateRequest,
+    CaptureRequest, DeleteRequest, DoctorRequest, DocumentIndexRequest, ExportRequest,
+    FeedbackRequest, ForgetRequest, GetRequest, ImportRequest, IngestRequest, ListRequest,
+    LockRequest, MemoryConfig, MemoryEngine, PinRequest, PurgeRequest, SearchRequest, StoreRequest,
+    SyncSharedRequest, UpdateRequest,
 };
 
 /// Incremented because version 2 replaces JSON-lines with Protobuf framing.
@@ -78,6 +79,10 @@ impl Service {
             Method::Ingest => serde_json::to_value(
                 self.engine()?
                     .ingest(serde_json::from_value::<IngestRequest>(params)?)?,
+            )?,
+            Method::IndexDocuments => serde_json::to_value(
+                self.engine()?
+                    .index_documents(&serde_json::from_value::<DocumentIndexRequest>(params)?)?,
             )?,
             Method::Get => {
                 let request = serde_json::from_value::<GetRequest>(params)?;

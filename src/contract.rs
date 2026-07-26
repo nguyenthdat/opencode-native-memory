@@ -237,6 +237,13 @@ pub struct IngestRequest {
     pub confidence: Option<f32>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentIndexRequest {
+    #[serde(default)]
+    pub force: bool,
+}
+
 const fn default_ingest_kind() -> MemoryKind {
     MemoryKind::Fact
 }
@@ -574,6 +581,27 @@ pub struct IngestResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DocumentIndexRejection {
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentIndexResponse {
+    pub discovered: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub removed: usize,
+    pub rejected: usize,
+    pub inserted_chunks: usize,
+    pub updated_chunks: usize,
+    pub removed_chunks: u64,
+    pub rejections: Vec<DocumentIndexRejection>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CaptureResponse {
     pub decision: CaptureDecision,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -709,6 +737,7 @@ pub struct StatusResponse {
     pub project_id: String,
     pub collection_path: String,
     pub document_count: u64,
+    pub indexed_document_count: usize,
     pub state_schema_version: u32,
     pub metadata_count: usize,
     pub tombstone_count: usize,

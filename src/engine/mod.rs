@@ -13,15 +13,19 @@ use crate::capture::{CaptureDecision, CaptureGate, CaptureSignals, NoveltyDispos
 use crate::config::hash_hex;
 use crate::contract::{
     CaptureRequest, CaptureResponse, DeleteReason, DeleteRequest, DeleteResponse, DoctorRequest,
-    DoctorResponse, ExportRequest, FeedbackEvent, FeedbackRequest, FeedbackResponse, ForgetRequest,
-    ForgetResponse, GetRequest, ImportRequest, ImportResponse, IndexStatus, IngestRequest,
-    IngestResponse, LifecycleResponse, ListRequest, ListResponse, LockRequest, MemoryKind,
-    MemoryOrigin, MemoryRecord, MemoryScope, MemorySnapshot, OptimizeResponse, PinRequest,
-    PurgeRequest, PurgeResponse, SharedMemoryRejection, StatusResponse, StoreRequest,
-    StoreResponse, SyncSharedRequest, SyncSharedResponse, TombstoneSnapshot, UpdateRequest,
-    UpdateResponse,
+    DoctorResponse, DocumentIndexRejection, DocumentIndexRequest, DocumentIndexResponse,
+    ExportRequest, FeedbackEvent, FeedbackRequest, FeedbackResponse, ForgetRequest, ForgetResponse,
+    GetRequest, ImportRequest, ImportResponse, IndexStatus, IngestRequest, IngestResponse,
+    LifecycleResponse, ListRequest, ListResponse, LockRequest, MemoryKind, MemoryOrigin,
+    MemoryRecord, MemoryScope, MemorySnapshot, OptimizeResponse, PinRequest, PurgeRequest,
+    PurgeResponse, SharedMemoryRejection, StatusResponse, StoreRequest, StoreResponse,
+    SyncSharedRequest, SyncSharedResponse, TombstoneSnapshot, UpdateRequest, UpdateResponse,
 };
-use crate::document::{extract_document, split_markdown};
+use crate::document::{
+    ExtractedDocument, extract_document, extract_inspected_document, inspect_document,
+    split_markdown,
+};
+use crate::document_index::{DocumentIndexManifest, IndexedDocument, discover_documents};
 use crate::embedding::{Embedder, LlamaCppEmbedder};
 use crate::lifecycle::{
     default_expiry, default_half_life_days, ensure_delete_allowed, ensure_store_overwrite_allowed,
@@ -47,6 +51,7 @@ pub struct MemoryEngine {
     collection: Collection,
     embedder: LlamaCppEmbedder,
     state: MemoryState,
+    document_index: DocumentIndexManifest,
     shared_sync_rejections: Vec<SharedMemoryRejection>,
     _writer_lock: File,
 }
@@ -70,6 +75,7 @@ impl MemoryEngine {
 
         let writer_lock = zvec::acquire_writer_lock(&config.project_data_dir())?;
         let state = MemoryState::load(&config.state_path())?;
+        let document_index = DocumentIndexManifest::load(&config.document_index_path())?;
         let embedder = LlamaCppEmbedder::load(config.embedding(), config.model_cache())?;
         let collection = zvec::open_collection(
             &config,
@@ -83,6 +89,7 @@ impl MemoryEngine {
             collection,
             embedder,
             state,
+            document_index,
             shared_sync_rejections: Vec::new(),
             _writer_lock: writer_lock,
         };
@@ -133,12 +140,7 @@ impl MemoryEngine {
             );
         }
 
-        let id = deterministic_memory_id(
-            normalized.kind,
-            normalized.scope,
-            normalized.scope_key.as_deref(),
-            &normalized.content,
-        );
+        let id = deterministic_memory_id(&normalized);
         let now = now_ms()?;
         let existing =
             self.collection
@@ -241,6 +243,31 @@ impl MemoryEngine {
             "document ingestion cannot write canonical repository memory; promote reviewed conclusions instead"
         );
         let extracted = extract_document(&self.config, &request.path)?;
+        let path = extracted.path.clone();
+        let scope_key = normalize_scope_key(request.scope, request.scope_key.as_deref())?;
+        let previous_ids = self
+            .ingested_memory_ids_by_path(request.scope, scope_key.as_deref())?
+            .remove(&path)
+            .unwrap_or_default();
+        let response = self.ingest_extracted(&request, extracted, Vec::new())?;
+        let current_ids = response.memory_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut stale_ids = previous_ids
+            .into_iter()
+            .filter(|id| !current_ids.contains(id))
+            .collect::<Vec<_>>();
+        stale_ids.sort();
+        for ids in stale_ids.chunks(MAX_ID_COUNT) {
+            self.delete_internal(ids, false, DeleteReason::Obsolete)?;
+        }
+        Ok(response)
+    }
+
+    fn ingest_extracted(
+        &mut self,
+        request: &IngestRequest,
+        extracted: ExtractedDocument,
+        code_paths: Vec<String>,
+    ) -> Result<IngestResponse> {
         let mut chunks = split_markdown(&extracted.content)?;
         let mut seen = HashSet::new();
         chunks.retain(|chunk| seen.insert(hash_hex(chunk.as_bytes())));
@@ -292,7 +319,7 @@ impl MemoryEngine {
                     scope_key: request.scope_key.clone(),
                     origin: MemoryOrigin::IngestedDocument,
                     expires_in_days: request.expires_in_days,
-                    code_paths: Vec::new(),
+                    code_paths: code_paths.clone(),
                     revive: request.revive,
                     taxonomy: request.taxonomy,
                     confidence: request.confidence,
@@ -324,6 +351,175 @@ impl MemoryEngine {
         })
     }
 
+    /// Discover supported project documents and incrementally synchronize their
+    /// searchable chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery is unsafe, the derived manifest cannot
+    /// be persisted, or stale indexed chunks cannot be removed.
+    pub fn index_documents(
+        &mut self,
+        request: &DocumentIndexRequest,
+    ) -> Result<DocumentIndexResponse> {
+        let discovery = discover_documents(&self.config)?;
+        let discovered = discovery.paths.len();
+        let incoming_paths = discovery.paths.iter().cloned().collect::<HashSet<_>>();
+        let legacy_by_path = self.ingested_memory_ids_by_path(MemoryScope::Project, None)?;
+        let mut next_manifest = self.document_index.clone();
+        let mut stale_ids = HashSet::new();
+        let mut rejections = Vec::new();
+        let mut warnings = discovery.warnings;
+        let mut added = 0;
+        let mut updated = 0;
+        let mut unchanged = 0;
+        let mut removed = 0;
+        let mut inserted_chunks = 0;
+        let mut updated_chunks = 0;
+
+        for path in discovery.paths {
+            let previous = self.document_index.files.get(&path).cloned();
+            let inspected = match inspect_document(&self.config, &path) {
+                Ok(inspected) => inspected,
+                Err(error) => {
+                    rejections.push(DocumentIndexRejection {
+                        path,
+                        message: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
+            let previous_is_current =
+                self.document_index
+                    .is_current(&path, &inspected.content_hash, |id| {
+                        self.state.records.contains_key(id)
+                    });
+            if !request.force && previous_is_current {
+                unchanged += 1;
+                continue;
+            }
+
+            let extracted = match extract_inspected_document(inspected) {
+                Ok(extracted) => extracted,
+                Err(error) => {
+                    rejections.push(DocumentIndexRejection {
+                        path,
+                        message: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
+            let ingest_request = IngestRequest {
+                path: path.clone(),
+                title: None,
+                kind: MemoryKind::Fact,
+                importance: 0.6,
+                tags: vec!["auto-indexed".to_string()],
+                scope: MemoryScope::Project,
+                scope_key: None,
+                expires_in_days: None,
+                revive: false,
+                taxonomy: None,
+                confidence: Some(0.6),
+            };
+            let response =
+                match self.ingest_extracted(&ingest_request, extracted, vec![path.clone()]) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        rejections.push(DocumentIndexRejection {
+                            path,
+                            message: format!("{error:#}"),
+                        });
+                        continue;
+                    }
+                };
+
+            let mut previous_ids = previous
+                .as_ref()
+                .map(|entry| entry.memory_ids.clone())
+                .unwrap_or_default();
+            if let Some(legacy_ids) = legacy_by_path.get(&path) {
+                previous_ids.extend(legacy_ids.iter().cloned());
+            }
+            let current_ids = response.memory_ids.iter().cloned().collect::<HashSet<_>>();
+            stale_ids.extend(
+                previous_ids
+                    .into_iter()
+                    .filter(|id| !current_ids.contains(id)),
+            );
+            if previous.is_some() || legacy_by_path.contains_key(&path) {
+                updated += 1;
+            } else {
+                added += 1;
+            }
+            inserted_chunks += response.inserted;
+            updated_chunks += response.updated;
+            warnings.extend(
+                response
+                    .warnings
+                    .into_iter()
+                    .map(|warning| format!("{path}: {warning}")),
+            );
+            next_manifest.files.insert(
+                path,
+                IndexedDocument {
+                    content_hash: response.content_hash,
+                    memory_ids: response.memory_ids,
+                },
+            );
+        }
+
+        if discovery.complete {
+            let missing = self.document_index.missing_paths(&incoming_paths);
+            for path in missing {
+                if let Some(entry) = next_manifest.files.remove(&path) {
+                    stale_ids.extend(entry.memory_ids);
+                    removed += 1;
+                }
+            }
+        } else {
+            warnings.push(
+                "document discovery was incomplete; missing-file cleanup was skipped".to_string(),
+            );
+        }
+
+        let retained_ids = next_manifest
+            .files
+            .values()
+            .flat_map(|entry| entry.memory_ids.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut stale_ids = stale_ids
+            .into_iter()
+            .filter(|id| !retained_ids.contains(id))
+            .collect::<Vec<_>>();
+        stale_ids.sort();
+        let mut removed_chunks = 0;
+        for ids in stale_ids.chunks(MAX_ID_COUNT) {
+            removed_chunks += self
+                .delete_internal(ids, false, DeleteReason::Obsolete)?
+                .deleted;
+        }
+
+        if added > 0 || updated > 0 || removed > 0 {
+            next_manifest.save(&self.config.document_index_path())?;
+            self.document_index = next_manifest;
+        }
+        let rejected = rejections.len();
+        Ok(DocumentIndexResponse {
+            discovered,
+            added,
+            updated,
+            unchanged,
+            removed,
+            rejected,
+            inserted_chunks,
+            updated_chunks,
+            removed_chunks,
+            rejections,
+            warnings,
+        })
+    }
+
     /// Evaluate and, when accepted, durably store one automatic capture candidate.
     ///
     /// # Errors
@@ -342,14 +538,7 @@ impl MemoryEngine {
         } else {
             None
         };
-        let candidate_id = normalized.as_ref().map(|candidate| {
-            deterministic_memory_id(
-                candidate.kind,
-                candidate.scope,
-                candidate.scope_key.as_deref(),
-                &candidate.content,
-            )
-        });
+        let candidate_id = normalized.as_ref().map(deterministic_memory_id);
         let duplicate = if let Some(id) = &candidate_id {
             !self
                 .collection
@@ -573,14 +762,11 @@ impl MemoryEngine {
                 taxonomy: Some(record.taxonomy),
                 confidence: Some(record.confidence),
             })?;
-            let expected_id = deterministic_memory_id(
-                normalized.kind,
-                normalized.scope,
-                normalized.scope_key.as_deref(),
-                &normalized.content,
-            );
+            let expected_id = deterministic_memory_id(&normalized);
+            let legacy_document_id = (normalized.origin == MemoryOrigin::IngestedDocument)
+                .then(|| legacy_deterministic_memory_id(&normalized));
             ensure!(
-                expected_id == record.id,
+                expected_id == record.id || legacy_document_id.as_deref() == Some(&record.id),
                 "snapshot memory id is invalid: {}",
                 record.id
             );
@@ -1037,6 +1223,9 @@ impl MemoryEngine {
             self.state.tombstones.clear();
         }
         self.save_state()?;
+        self.document_index.clear();
+        self.document_index
+            .save(&self.config.document_index_path())?;
         Ok(PurgeResponse {
             deleted,
             tombstones_retained: self.state.tombstones.len(),
@@ -1256,6 +1445,7 @@ impl MemoryEngine {
             project_id: self.config.project_id().to_string(),
             collection_path: self.config.collection_dir().display().to_string(),
             document_count: stats.doc_count,
+            indexed_document_count: self.document_index.files.len(),
             state_schema_version: STATE_SCHEMA_VERSION,
             metadata_count: self.state.records.len(),
             tombstone_count: self.state.tombstones.len(),
@@ -1275,6 +1465,7 @@ impl MemoryEngine {
                 "llama_cpp_gguf_embeddings_v1",
                 "search_retrieval_modes_v1",
                 "document_ingestion_v1",
+                "document_auto_index_v1",
                 "protobuf_framed_rpc_v1",
                 "durable_upsert_journal_v1",
                 "capture_gate_v1",
@@ -1605,12 +1796,7 @@ impl MemoryEngine {
         conflict_with: Option<Vec<String>>,
         now: i64,
     ) -> Result<UpdateResponse> {
-        let target_id = deterministic_memory_id(
-            merged.kind,
-            merged.scope,
-            merged.scope_key.as_deref(),
-            &merged.content,
-        );
+        let target_id = deterministic_memory_id(merged);
         let identity_changed = target_id != previous_id;
         if identity_changed {
             ensure!(
@@ -1843,6 +2029,36 @@ impl MemoryEngine {
             )?);
         }
         Ok(documents)
+    }
+
+    fn ingested_memory_ids_by_path(
+        &self,
+        scope: MemoryScope,
+        scope_key: Option<&str>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let ids = self
+            .state
+            .records
+            .iter()
+            .filter(|(_, metadata)| {
+                metadata.origin == MemoryOrigin::IngestedDocument
+                    && metadata.scope == scope
+                    && metadata.scope_key.as_deref() == scope_key
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut by_path: HashMap<String, Vec<String>> = HashMap::new();
+        for document in self.fetch_documents(&ids)? {
+            let stored = stored_memory_from_doc(&document)?;
+            if let Some(path) = document_path_from_source(&stored.source) {
+                by_path.entry(path.to_string()).or_default().push(stored.id);
+            }
+        }
+        for memory_ids in by_path.values_mut() {
+            memory_ids.sort();
+            memory_ids.dedup();
+        }
+        Ok(by_path)
     }
 
     fn remove_state_record(&mut self, id: &str) {
@@ -2090,21 +2306,39 @@ fn initial_expiry(
     )
 }
 
-fn deterministic_memory_id(
-    kind: MemoryKind,
-    scope: MemoryScope,
-    scope_key: Option<&str>,
-    content: &str,
-) -> String {
+fn deterministic_memory_id(normalized: &NormalizedStoreRequest) -> String {
+    if normalized.origin != MemoryOrigin::IngestedDocument {
+        return legacy_deterministic_memory_id(normalized);
+    }
     let material = format!(
-        "{}\0{}\0{}\0{}",
-        kind.as_str(),
-        scope.as_str(),
-        scope_key.unwrap_or_default(),
-        content
+        "{}\0{}\0{}\0{}\0{}",
+        normalized.kind.as_str(),
+        normalized.scope.as_str(),
+        normalized.scope_key.as_deref().unwrap_or_default(),
+        normalized.source,
+        normalized.content
     );
     let hash = hash_hex(material.as_bytes());
     format!("mem_{}", &hash[..32])
+}
+
+fn legacy_deterministic_memory_id(normalized: &NormalizedStoreRequest) -> String {
+    let material = format!(
+        "{}\0{}\0{}\0{}",
+        normalized.kind.as_str(),
+        normalized.scope.as_str(),
+        normalized.scope_key.as_deref().unwrap_or_default(),
+        normalized.content
+    );
+    let hash = hash_hex(material.as_bytes());
+    format!("mem_{}", &hash[..32])
+}
+
+fn document_path_from_source(source: &str) -> Option<&str> {
+    source
+        .strip_prefix("document:")?
+        .rsplit_once("#chunk=")
+        .map(|(path, _)| path)
 }
 
 fn management_visible(
@@ -2128,12 +2362,16 @@ fn now_ms() -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_pending_upsert_to_state;
-    use crate::contract::{FeedbackStats, MemoryKind, MemoryOrigin, MemoryScope};
+    use super::{
+        apply_pending_upsert_to_state, deterministic_memory_id, document_path_from_source,
+        legacy_deterministic_memory_id,
+    };
+    use crate::contract::{FeedbackStats, MemoryKind, MemoryOrigin, MemoryScope, StoreRequest};
     use crate::storage::state::{
         MemoryMetadata, MemoryState, PendingDocument, PendingUpsert, Tombstone,
     };
     use crate::taxonomy::MemoryTaxonomy;
+    use crate::validation::validate_store_request;
 
     const PREDECESSOR: &str = "mem_00000000000000000000000000000000";
     const TARGET: &str = "mem_11111111111111111111111111111111";
@@ -2198,6 +2436,48 @@ mod tests {
         assert_eq!(state.record_revisions[TARGET], 20);
         assert_eq!(state.record_revisions[PREDECESSOR], 20);
         assert_eq!(state.record_revisions[CONFLICT], 20);
+    }
+
+    #[test]
+    fn ingested_document_identity_includes_its_source_path() {
+        let first =
+            validate_store_request(document_store_request("document:docs/first.md#chunk=1/1"))
+                .expect("first document request should validate");
+        let second =
+            validate_store_request(document_store_request("document:docs/second.md#chunk=1/1"))
+                .expect("second document request should validate");
+
+        assert_ne!(
+            deterministic_memory_id(&first),
+            deterministic_memory_id(&second)
+        );
+        assert_eq!(
+            legacy_deterministic_memory_id(&first),
+            legacy_deterministic_memory_id(&second)
+        );
+        assert_eq!(
+            document_path_from_source("document:docs/first.md#chunk=1/3"),
+            Some("docs/first.md")
+        );
+    }
+
+    fn document_store_request(source: &str) -> StoreRequest {
+        StoreRequest {
+            content: "Shared document text".to_string(),
+            title: Some("Document".to_string()),
+            kind: MemoryKind::Fact,
+            importance: 0.6,
+            tags: vec!["document".to_string()],
+            source: Some(source.to_string()),
+            scope: MemoryScope::Project,
+            scope_key: None,
+            origin: MemoryOrigin::IngestedDocument,
+            expires_in_days: None,
+            code_paths: Vec::new(),
+            revive: false,
+            taxonomy: None,
+            confidence: Some(0.6),
+        }
     }
 
     fn metadata() -> MemoryMetadata {

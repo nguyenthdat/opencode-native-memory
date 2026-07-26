@@ -19,6 +19,7 @@ const METHODS = {
   export: Method.EXPORT,
   import: Method.IMPORT,
   ingest: Method.INGEST,
+  index_documents: Method.INDEX_DOCUMENTS,
   get: Method.GET,
   list: Method.LIST,
   update: Method.UPDATE,

@@ -234,7 +234,11 @@ export declare enum Method {
     /**
      * @generated from enum value: METHOD_INGEST = 20;
      */
-    INGEST = 20
+    INGEST = 20,
+    /**
+     * @generated from enum value: METHOD_INDEX_DOCUMENTS = 21;
+     */
+    INDEX_DOCUMENTS = 21
 }
 /**
  * Describes the enum opencode.memory.v1.Method.

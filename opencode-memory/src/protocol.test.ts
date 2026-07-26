@@ -64,6 +64,13 @@ describe("Protobuf memory protocol", () => {
     const request = fromBinary(RequestSchema, payload!);
     expect(request.method).toBe(Method.INGEST);
   });
+
+  test("encodes automatic document indexing as its own method", () => {
+    const frame = encodeRequest(4, "index_documents", { force: false });
+    const [payload] = new DelimitedFrameDecoder(1024).push(frame);
+    const request = fromBinary(RequestSchema, payload!);
+    expect(request.method).toBe(Method.INDEX_DOCUMENTS);
+  });
 });
 
 function withLength(payload: Uint8Array): Uint8Array {

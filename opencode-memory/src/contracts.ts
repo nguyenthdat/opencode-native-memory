@@ -151,6 +151,20 @@ export interface IngestResponse {
   warnings: string[];
 }
 
+export interface DocumentIndexResponse {
+  discovered: number;
+  added: number;
+  updated: number;
+  unchanged: number;
+  removed: number;
+  rejected: number;
+  inserted_chunks: number;
+  updated_chunks: number;
+  removed_chunks: number;
+  rejections: Array<{ path: string; message: string }>;
+  warnings: string[];
+}
+
 export interface SharedMemoryRecord extends CuratedCandidate {
   source: string;
 }

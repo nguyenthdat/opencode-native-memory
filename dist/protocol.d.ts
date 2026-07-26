@@ -7,6 +7,7 @@ declare const METHODS: {
     readonly export: Method.EXPORT;
     readonly import: Method.IMPORT;
     readonly ingest: Method.INGEST;
+    readonly index_documents: Method.INDEX_DOCUMENTS;
     readonly get: Method.GET;
     readonly list: Method.LIST;
     readonly update: Method.UPDATE;

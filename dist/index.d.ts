@@ -1,7 +1,7 @@
 declare const _default: import("@opencode-ai/plugin").Plugin;
 export default _default;
 export { MEMORY_KINDS, MEMORY_SCOPES, MEMORY_TAXONOMIES, RETRIEVAL_MODES, WRITABLE_MEMORY_SCOPES, FEEDBACK_EVENTS, LOCK_ACTIONS, LOCK_REASON_MAX, UNLOCK_FORBIDDEN_FIELDS, } from "./contracts.js";
-export type { MemoryRecord, SearchResponse, RetrievalMode, ListResponse, IngestResponse, PendingRecall, CuratedCandidate, SharedMemoryRecord, SharedSyncResponse, } from "./contracts.js";
+export type { MemoryRecord, SearchResponse, RetrievalMode, ListResponse, IngestResponse, DocumentIndexResponse, PendingRecall, CuratedCandidate, SharedMemoryRecord, SharedSyncResponse, } from "./contracts.js";
 export { NativeMemoryClient, resolveNativeMemoryBinary, REQUEST_TIMEOUT_MS, INITIALIZATION_TIMEOUT_MS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, } from "./sidecar-client.js";
 export type { SpawnFn } from "./sidecar-client.js";
 export { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";

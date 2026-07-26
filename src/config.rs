@@ -190,6 +190,11 @@ impl MemoryConfig {
     pub fn state_path(&self) -> PathBuf {
         self.project_data_dir().join("state.json")
     }
+
+    #[must_use]
+    pub(crate) fn document_index_path(&self) -> PathBuf {
+        self.project_data_dir().join("document-index.json")
+    }
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {

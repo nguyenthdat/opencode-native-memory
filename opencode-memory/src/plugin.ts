@@ -7,6 +7,7 @@ import type {
   SharedSyncResponse,
   CaptureResponse,
   IngestResponse,
+  DocumentIndexResponse,
 } from "./contracts.js";
 import {
   MEMORY_KINDS,
@@ -44,6 +45,8 @@ export interface MemoryPluginOptions {
   warmup?: boolean;
   automaticRecall?: boolean;
   automaticCapture?: boolean;
+  automaticDocumentIndex?: boolean;
+  documentIndexDebounceMs?: number;
   sharedSync?: boolean;
   feedbackTracking?: boolean;
   minScore?: number;
@@ -64,6 +67,8 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     );
     let sharedSignature: string | undefined;
     let sharedSync: Promise<void> | undefined;
+    let documentSync: Promise<DocumentIndexResponse> | undefined;
+    let documentSyncTimer: ReturnType<typeof setTimeout> | undefined;
 
     const syncSharedMemories = async (force = false): Promise<void> => {
       if (!settings.sharedSync) return;
@@ -92,12 +97,55 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
       await sharedSync;
     };
 
-    if (settings.warmup) {
-      void Promise.all([native.request("status"), syncSharedMemories()]).catch(session.warnOnce);
+    const indexDocuments = async (force = false): Promise<DocumentIndexResponse> => {
+      if (documentSync) return await documentSync;
+      documentSync = native
+        .request<DocumentIndexResponse>("index_documents", { force })
+        .then((response) => {
+          for (const rejection of response.rejections) {
+            session.warnOnce(new Error(`${rejection.path}: ${rejection.message}`));
+          }
+          for (const warning of response.warnings) session.warnOnce(new Error(warning));
+          if (response.added > 0 || response.updated > 0 || response.removed > 0) {
+            session.invalidateRecall();
+          }
+          return response;
+        })
+        .finally(() => {
+          documentSync = undefined;
+        });
+      return await documentSync;
+    };
+
+    const syncDocuments = async (): Promise<void> => {
+      if (!settings.automaticDocumentIndex) return;
+      await indexDocuments();
+    };
+
+    const syncProjectIndexes = async (): Promise<void> => {
+      await Promise.all([syncSharedMemories(), syncDocuments()]);
+    };
+
+    const scheduleDocumentSync = (): void => {
+      if (!settings.automaticDocumentIndex) return;
+      if (documentSyncTimer) clearTimeout(documentSyncTimer);
+      documentSyncTimer = setTimeout(() => {
+        documentSyncTimer = undefined;
+        void syncDocuments().catch(session.warnOnce);
+      }, settings.documentIndexDebounceMs);
+    };
+
+    if (settings.warmup || settings.automaticDocumentIndex) {
+      const startup = settings.warmup
+        ? [native.request("status"), syncProjectIndexes()]
+        : [syncDocuments()];
+      void Promise.all(startup).catch(session.warnOnce);
     }
 
     return {
       dispose: async () => {
+        if (documentSyncTimer) clearTimeout(documentSyncTimer);
+        if (documentSync) await documentSync.catch(() => undefined);
         for (const sessID of session.pendingRecall.keys()) session.discardPendingRecall(sessID);
         session.latestQuery.clear();
         session.invalidateRecall();
@@ -149,6 +197,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           if (file.includes(`/${SHARED_MEMORY_RELATIVE_DIR}/`)) {
             sharedSignature = undefined;
           }
+          if (isSupportedDocumentPath(file)) scheduleDocumentSync();
           return;
         }
         if (event.type !== "session.compacted") return;
@@ -220,7 +269,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         const latest = session.latestQuery.get(sessionID);
         if (!latest) return;
         try {
-          await syncSharedMemories();
+          await syncProjectIndexes();
         } catch (error) {
           session.warnOnce(error);
         }
@@ -360,7 +409,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           },
           async execute(args, context) {
             session.discardPendingRecall(context.sessionID);
-            await syncSharedMemories();
+            await syncProjectIndexes();
             const rootSessionID = await session.resolveSessionRoot(context.sessionID);
             const response = await native.request<SearchResponse>(
               "search",
@@ -554,6 +603,35 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             });
           },
         }),
+        memory_index_documents: tool({
+          description:
+            "Incrementally discover and index supported project documents while respecting .gitignore and .ignore files. Unchanged files are skipped and deleted files are removed from the derived index.",
+          args: {
+            force: tool.schema
+              .boolean()
+              .default(false)
+              .describe(
+                "Re-extract every discovered document even when its content hash is unchanged.",
+              ),
+          },
+          async execute(args, context) {
+            await context.ask({
+              permission: "memory_ingest",
+              patterns: ["**/*.{pdf,md,markdown,html,htm}"],
+              always: [],
+              metadata: { operation: "index_documents", force: args.force },
+            });
+            const response = await indexDocuments(args.force);
+            session.invalidateRecall();
+            return result("Indexed project documents", response, {
+              discovered: response.discovered,
+              added: response.added,
+              updated: response.updated,
+              removed: response.removed,
+              rejected: response.rejected,
+            });
+          },
+        }),
         memory_get: tool({
           description: "Fetch complete durable memories by IDs returned from memory_search.",
           args: {
@@ -598,7 +676,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             limit: tool.schema.number().int().min(1).max(100).default(50),
           },
           async execute(args, context) {
-            await syncSharedMemories();
+            await syncProjectIndexes();
             const keys = await session.managementScopeKeys(context.sessionID, context.agent);
             const response = await native.request<ListResponse>(
               "list",
@@ -949,7 +1027,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .describe("Hash all code anchors to detect staleness."),
           },
           async execute(args, context) {
-            await syncSharedMemories();
+            await syncProjectIndexes();
             const response = await native.request<Record<string, unknown>>(
               "doctor",
               args,
@@ -963,7 +1041,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             "Inspect the current project's native memory backend, collection, embedding model, indexes, and document count.",
           args: {},
           async execute(_args, context) {
-            await syncSharedMemories();
+            await syncProjectIndexes();
             const response = await native.request<Record<string, unknown>>(
               "status",
               {},
@@ -981,6 +1059,8 @@ interface ResolvedMemoryPluginOptions {
   warmup: boolean;
   automaticRecall: boolean;
   automaticCapture: boolean;
+  automaticDocumentIndex: boolean;
+  documentIndexDebounceMs: number;
   sharedSync: boolean;
   feedbackTracking: boolean;
   minScore: number;
@@ -993,15 +1073,31 @@ export function resolveMemoryPluginOptions(
   if (!Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
     throw new Error("memory minScore must be between 0 and 1");
   }
+  const documentIndexDebounceMs =
+    options.documentIndexDebounceMs ?? envNumber("OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS", 750);
+  if (
+    !Number.isFinite(documentIndexDebounceMs) ||
+    documentIndexDebounceMs < 50 ||
+    documentIndexDebounceMs > 60_000
+  ) {
+    throw new Error("memory documentIndexDebounceMs must be between 50 and 60000");
+  }
   return {
     warmup: options.warmup ?? envBoolean("OPENCODE_MEMORY_WARMUP", true),
     automaticRecall: options.automaticRecall ?? envBoolean("OPENCODE_MEMORY_AUTO_RECALL", true),
     automaticCapture: options.automaticCapture ?? envBoolean("OPENCODE_MEMORY_AUTO_CAPTURE", true),
+    automaticDocumentIndex:
+      options.automaticDocumentIndex ?? envBoolean("OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS", true),
+    documentIndexDebounceMs,
     sharedSync: options.sharedSync ?? envBoolean("OPENCODE_MEMORY_SHARED_SYNC", true),
     feedbackTracking:
       options.feedbackTracking ?? envBoolean("OPENCODE_MEMORY_FEEDBACK_TRACKING", true),
     minScore,
   };
+}
+
+export function isSupportedDocumentPath(path: string): boolean {
+  return /\.(?:pdf|md|markdown|html|htm)$/i.test(path);
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {

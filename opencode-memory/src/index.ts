@@ -29,6 +29,7 @@ export type {
   RetrievalMode,
   ListResponse,
   IngestResponse,
+  DocumentIndexResponse,
   PendingRecall,
   CuratedCandidate,
   SharedMemoryRecord,
