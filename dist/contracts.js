@@ -24,6 +24,7 @@ export const MEMORY_TAXONOMIES = [
     "team_convention",
     "project_standard",
 ];
+export const RETRIEVAL_MODES = ["lexical", "dense", "hybrid"];
 export const WRITABLE_MEMORY_SCOPES = ["session", "agent", "project"];
 export const FEEDBACK_EVENTS = ["used", "ignored", "error"];
 export const LOCK_ACTIONS = ["lock", "unlock"];

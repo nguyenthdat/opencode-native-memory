@@ -1,6 +1,8 @@
 export declare const MEMORY_KINDS: readonly ["decision", "preference", "fact", "pattern", "gotcha", "summary"];
 export declare const MEMORY_SCOPES: readonly ["session", "agent", "project", "repository"];
 export declare const MEMORY_TAXONOMIES: readonly ["task_attempt", "tool_call", "session_summary", "architecture_fact", "codebase_fact", "user_fact", "fix_pattern", "code_template", "tool_heuristic", "code_style", "library_pref", "workflow_pref", "decision", "team_convention", "project_standard"];
+export declare const RETRIEVAL_MODES: readonly ["lexical", "dense", "hybrid"];
+export type RetrievalMode = (typeof RETRIEVAL_MODES)[number];
 export declare const WRITABLE_MEMORY_SCOPES: readonly ["session", "agent", "project"];
 export declare const FEEDBACK_EVENTS: readonly ["used", "ignored", "error"];
 export declare const LOCK_ACTIONS: readonly ["lock", "unlock"];
@@ -18,7 +20,7 @@ export interface MemoryRecord {
     updated_at_ms: number;
     scope: (typeof MEMORY_SCOPES)[number];
     scope_key?: string | null;
-    origin: "manual" | "auto_compaction" | "shared_markdown" | "legacy";
+    origin: "manual" | "auto_compaction" | "shared_markdown" | "ingested_document" | "legacy";
     expires_at_ms?: number | null;
     stale: boolean;
     code_anchors: Array<{
@@ -44,6 +46,7 @@ export interface MemoryRecord {
 }
 export interface SearchResponse {
     query: string;
+    retrieval_mode: RetrievalMode;
     retrieval_id?: string | null;
     count: number;
     candidates_considered: number;
@@ -87,6 +90,17 @@ export interface CaptureResponse {
         updated_at_ms: number;
         scope: (typeof MEMORY_SCOPES)[number];
     };
+}
+export interface IngestResponse {
+    path: string;
+    mime_type: string;
+    content_hash: string;
+    extracted_chars: number;
+    chunk_count: number;
+    inserted: number;
+    updated: number;
+    memory_ids: string[];
+    warnings: string[];
 }
 export interface SharedMemoryRecord extends CuratedCandidate {
     source: string;

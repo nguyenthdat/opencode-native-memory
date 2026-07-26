@@ -14,12 +14,14 @@ use crate::config::hash_hex;
 use crate::contract::{
     CaptureRequest, CaptureResponse, DeleteReason, DeleteRequest, DeleteResponse, DoctorRequest,
     DoctorResponse, ExportRequest, FeedbackEvent, FeedbackRequest, FeedbackResponse, ForgetRequest,
-    ForgetResponse, GetRequest, ImportRequest, ImportResponse, IndexStatus, LifecycleResponse,
-    ListRequest, ListResponse, LockRequest, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope,
-    MemorySnapshot, OptimizeResponse, PinRequest, PurgeRequest, PurgeResponse,
-    SharedMemoryRejection, StatusResponse, StoreRequest, StoreResponse, SyncSharedRequest,
-    SyncSharedResponse, TombstoneSnapshot, UpdateRequest, UpdateResponse,
+    ForgetResponse, GetRequest, ImportRequest, ImportResponse, IndexStatus, IngestRequest,
+    IngestResponse, LifecycleResponse, ListRequest, ListResponse, LockRequest, MemoryKind,
+    MemoryOrigin, MemoryRecord, MemoryScope, MemorySnapshot, OptimizeResponse, PinRequest,
+    PurgeRequest, PurgeResponse, SharedMemoryRejection, StatusResponse, StoreRequest,
+    StoreResponse, SyncSharedRequest, SyncSharedResponse, TombstoneSnapshot, UpdateRequest,
+    UpdateResponse,
 };
+use crate::document::{extract_document, split_markdown};
 use crate::embedding::{Embedder, LlamaCppEmbedder};
 use crate::lifecycle::{
     default_expiry, default_half_life_days, ensure_delete_allowed, ensure_store_overwrite_allowed,
@@ -32,8 +34,8 @@ use crate::storage::state::{
 use crate::storage::zvec::{self, RESULT_FIELDS, ensure_write_succeeded};
 use crate::validation::{
     MAX_ID_COUNT, MAX_LIST_RESULTS, MAX_SHARED_RECORDS, NormalizedStoreRequest, anchors_stale,
-    capture_code_anchors, classify_capture_safety, git_head, normalize_scope_key, validate_ids,
-    validate_retrieval_id, validate_shared_source, validate_store_request,
+    capture_code_anchors, classify_capture_safety, git_head, normalize_scope_key, truncate_chars,
+    validate_ids, validate_retrieval_id, validate_shared_source, validate_store_request,
 };
 
 const SESSION_DEFAULT_TTL_DAYS: u32 = 7;
@@ -47,6 +49,11 @@ pub struct MemoryEngine {
     state: MemoryState,
     shared_sync_rejections: Vec<SharedMemoryRejection>,
     _writer_lock: File,
+}
+
+struct PreparedStore {
+    pending: PendingUpsert,
+    response: StoreResponse,
 }
 
 impl MemoryEngine {
@@ -101,6 +108,18 @@ impl MemoryEngine {
         predecessor_ids: Vec<String>,
         conflict_ids: Vec<String>,
     ) -> Result<StoreResponse> {
+        let prepared = self.prepare_store_upsert(request, predecessor_ids, conflict_ids)?;
+        self.commit_pending_upsert(prepared.pending)?;
+        Ok(prepared.response)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prepare_store_upsert(
+        &mut self,
+        request: StoreRequest,
+        predecessor_ids: Vec<String>,
+        conflict_ids: Vec<String>,
+    ) -> Result<PreparedStore> {
         let normalized = validate_store_request(request)?;
         let fingerprint = memory_fingerprint(
             normalized.kind,
@@ -190,19 +209,118 @@ impl MemoryEngine {
         };
         let document = self.prepare_document(&id, &normalized, created_at, now)?;
         let content_hash = document.content_hash.clone();
-        self.commit_pending_upsert(PendingUpsert {
+        let pending = PendingUpsert {
             document,
             metadata,
             predecessor_ids,
             revive_fingerprint: normalized.revive.then_some(fingerprint),
-        })?;
+        };
 
-        Ok(StoreResponse {
-            id,
+        Ok(PreparedStore {
+            pending,
+            response: StoreResponse {
+                id,
+                inserted,
+                content_hash,
+                updated_at_ms: now,
+                scope: normalized.scope,
+            },
+        })
+    }
+
+    /// Extract a local document into bounded Markdown chunks and durably store
+    /// the complete prepared batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths, unsupported or malformed documents,
+    /// unsafe extracted content, or a storage/inference failure.
+    pub fn ingest(&mut self, request: IngestRequest) -> Result<IngestResponse> {
+        ensure!(
+            request.scope != MemoryScope::Repository,
+            "document ingestion cannot write canonical repository memory; promote reviewed conclusions instead"
+        );
+        let extracted = extract_document(&self.config, &request.path)?;
+        let mut chunks = split_markdown(&extracted.content)?;
+        let mut seen = HashSet::new();
+        chunks.retain(|chunk| seen.insert(hash_hex(chunk.as_bytes())));
+        ensure!(
+            !chunks.is_empty(),
+            "document contains no unique text chunks"
+        );
+
+        let base_title = request
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                std::path::Path::new(&extracted.path)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("Document")
+                    .to_string()
+            });
+        let base_title = truncate_chars(&base_title, 120);
+        let chunk_count = chunks.len();
+        let mut tags = request.tags.clone();
+        if tags.len() < 12 && !tags.iter().any(|tag| tag.eq_ignore_ascii_case("document")) {
+            tags.push("document".to_string());
+        }
+
+        let mut prepared = Vec::with_capacity(chunk_count);
+        for (index, content) in chunks.into_iter().enumerate() {
+            let ordinal = index + 1;
+            let title = if chunk_count == 1 {
+                base_title.clone()
+            } else {
+                format!("{base_title} (chunk {ordinal} of {chunk_count})")
+            };
+            prepared.push(self.prepare_store_upsert(
+                StoreRequest {
+                    content,
+                    title: Some(title),
+                    kind: request.kind,
+                    importance: request.importance,
+                    tags: tags.clone(),
+                    source: Some(format!(
+                        "document:{}#chunk={ordinal}/{chunk_count}",
+                        extracted.path
+                    )),
+                    scope: request.scope,
+                    scope_key: request.scope_key.clone(),
+                    origin: MemoryOrigin::IngestedDocument,
+                    expires_in_days: request.expires_in_days,
+                    code_paths: Vec::new(),
+                    revive: request.revive,
+                    taxonomy: request.taxonomy,
+                    confidence: request.confidence,
+                },
+                Vec::new(),
+                Vec::new(),
+            )?);
+        }
+
+        let responses = prepared
+            .iter()
+            .map(|item| item.response.clone())
+            .collect::<Vec<_>>();
+        self.commit_pending_upserts(prepared.into_iter().map(|item| item.pending).collect())?;
+        let inserted = responses
+            .iter()
+            .filter(|response| response.inserted)
+            .count();
+        Ok(IngestResponse {
+            path: extracted.path,
+            mime_type: extracted.mime_type,
+            content_hash: extracted.content_hash,
+            extracted_chars: extracted.content.chars().count(),
+            chunk_count,
             inserted,
-            content_hash,
-            updated_at_ms: now,
-            scope: normalized.scope,
+            updated: chunk_count - inserted,
+            memory_ids: responses.into_iter().map(|response| response.id).collect(),
+            warnings: extracted.warnings,
         })
     }
 
@@ -1155,6 +1273,8 @@ impl MemoryEngine {
             capabilities: vec![
                 "phase1_taxonomy_lifecycle_v1",
                 "llama_cpp_gguf_embeddings_v1",
+                "search_retrieval_modes_v1",
+                "document_ingestion_v1",
                 "protobuf_framed_rpc_v1",
                 "durable_upsert_journal_v1",
                 "capture_gate_v1",

@@ -11,8 +11,8 @@ use serde_json::{Map, Number, Value as JsonValue, json};
 use crate::memory_proto::{Method, Request, Response, Value, ValueList, ValueObject, value};
 use crate::{
     CaptureRequest, DeleteRequest, DoctorRequest, ExportRequest, FeedbackRequest, ForgetRequest,
-    GetRequest, ImportRequest, ListRequest, LockRequest, MemoryConfig, MemoryEngine, PinRequest,
-    PurgeRequest, SearchRequest, StoreRequest, SyncSharedRequest, UpdateRequest,
+    GetRequest, ImportRequest, IngestRequest, ListRequest, LockRequest, MemoryConfig, MemoryEngine,
+    PinRequest, PurgeRequest, SearchRequest, StoreRequest, SyncSharedRequest, UpdateRequest,
 };
 
 /// Incremented because version 2 replaces JSON-lines with Protobuf framing.
@@ -74,6 +74,10 @@ impl Service {
             Method::Import => serde_json::to_value(
                 self.engine()?
                     .import_snapshot(serde_json::from_value::<ImportRequest>(params)?)?,
+            )?,
+            Method::Ingest => serde_json::to_value(
+                self.engine()?
+                    .ingest(serde_json::from_value::<IngestRequest>(params)?)?,
             )?,
             Method::Get => {
                 let request = serde_json::from_value::<GetRequest>(params)?;
@@ -338,7 +342,7 @@ mod tests {
         Method, RPC_PROTOCOL_VERSION, Request, Service, decode_value, encode_value, read_frame,
         run_protocol_io,
     };
-    use crate::MemoryConfig;
+    use crate::{MemoryConfig, RetrievalMode, SearchRequest};
 
     fn config() -> (tempfile::TempDir, MemoryConfig) {
         let temp = tempfile::tempdir().expect("create temp dir");
@@ -361,6 +365,13 @@ mod tests {
         });
         let encoded = encode_value(&input, 0).expect("encode value");
         assert_eq!(decode_value(&encoded, 0).expect("decode value"), input);
+    }
+
+    #[test]
+    fn search_request_defaults_to_hybrid_for_older_clients() {
+        let request: SearchRequest = serde_json::from_value(json!({ "query": "memory" }))
+            .expect("search request should deserialize");
+        assert_eq!(request.retrieval_mode, RetrievalMode::Hybrid);
     }
 
     #[test]

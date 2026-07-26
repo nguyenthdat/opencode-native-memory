@@ -97,6 +97,44 @@ describe("SessionContext recall state", () => {
     expect(session.recallGeneration("two")).not.toBe(initialTwo);
     expect(session.recallCache.size).toBe(0);
   });
+
+  test("shares session scope across the complete parent and subagent family", async () => {
+    const parents: Record<string, string | undefined> = {
+      root: undefined,
+      child: "root",
+      grandchild: "child",
+      unrelated: undefined,
+    };
+    const session = new SessionContext(
+      new FeedbackClient(),
+      async ({ id }) => ({ data: { parentID: parents[id] ?? null } }),
+      ".",
+    );
+
+    expect(await session.resolveSessionRoot("root")).toBe("root");
+    expect(await session.resolveSessionRoot("child")).toBe("root");
+    expect(await session.resolveSessionRoot("grandchild")).toBe("root");
+    expect(await session.scopeKey("session", "grandchild", "researcher")).toBe("root");
+    expect(await session.managementScopeKeys("child", "researcher")).toEqual({
+      session_scope_key: "root",
+      agent_scope_key: "researcher",
+    });
+    expect(await session.resolveSessionRoot("unrelated")).toBe("unrelated");
+    expect(await session.scopeKey("agent", "grandchild", "researcher")).toBe("researcher");
+  });
+
+  test("falls back to the current session when the session API is unavailable", async () => {
+    const session = new SessionContext(
+      new FeedbackClient(),
+      async () => {
+        throw new Error("session API unavailable");
+      },
+      ".",
+    );
+
+    expect(await session.resolveSessionRoot("child")).toBe("child");
+    expect(await session.resolveSessionRoot("child")).toBe("child");
+  });
 });
 
 function createSession(native: NativeMemoryClient): SessionContext {
@@ -115,6 +153,7 @@ function feedbackEvent(request: { method: MemoryMethod; params: unknown }): unkn
 function searchResponse(): SearchResponse {
   return {
     query: "query",
+    retrieval_mode: "hybrid",
     count: 0,
     candidates_considered: 0,
     budget_chars: 2_400,

@@ -15,6 +15,7 @@ export {
   MEMORY_KINDS,
   MEMORY_SCOPES,
   MEMORY_TAXONOMIES,
+  RETRIEVAL_MODES,
   WRITABLE_MEMORY_SCOPES,
   FEEDBACK_EVENTS,
   LOCK_ACTIONS,
@@ -25,7 +26,9 @@ export {
 export type {
   MemoryRecord,
   SearchResponse,
+  RetrievalMode,
   ListResponse,
+  IngestResponse,
   PendingRecall,
   CuratedCandidate,
   SharedMemoryRecord,

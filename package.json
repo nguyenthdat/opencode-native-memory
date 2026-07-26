@@ -1,6 +1,6 @@
 {
   "name": "@nguyenthdat/opencode-memory",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "Local-first persistent memory for OpenCode with a Rust, zvec, and llama.cpp sidecar",
   "type": "module",
   "packageManager": "bun@1.3.14",
@@ -39,7 +39,8 @@
     "build": "bun run clean && bun run typecheck && bun run build:ts",
     "build:native": "cargo build --locked && bun scripts/stage-native.ts --profile debug --runtime --destination target/debug",
     "build:native:release": "cargo build --release --locked && bun scripts/stage-native.ts --profile release --runtime --destination target/release",
-    "test:ts": "bun test opencode-memory/src tests/ts",
+    "test:ts": "bun test opencode-memory/src tests/ts tests/benchmark",
+    "benchmark:retrieval": "bun scripts/benchmark-retrieval.ts",
     "test:rust": "cargo test --locked --lib",
     "test:protocol": "bun scripts/test-protocol-e2e.ts",
     "test": "bun run test:ts && bun run test:rust",
@@ -58,9 +59,9 @@
     "@opencode-ai/plugin": ">=1.18.4 <2"
   },
   "optionalDependencies": {
-    "@nguyenthdat/opencode-memory-darwin-arm64": "0.3.3",
-    "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.3.3",
-    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.3.3"
+    "@nguyenthdat/opencode-memory-darwin-arm64": "0.4.0",
+    "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.4.0",
+    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.4.0"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.4",

@@ -22,7 +22,7 @@ pub(crate) const MIN_BUDGET_CHARS: usize = 512;
 pub(crate) const MAX_BUDGET_CHARS: usize = 24_000;
 pub(crate) const MAX_SHARED_RECORDS: usize = 200;
 const AUTO_COMPACTION_CONFIDENCE_CAP: f32 = 0.6;
-const MAX_CONTENT_CHARS: usize = 6_000;
+pub(crate) const MAX_CONTENT_CHARS: usize = 6_000;
 const MAX_QUERY_CHARS: usize = 2_000;
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SOURCE_CHARS: usize = 240;
@@ -152,7 +152,9 @@ pub(crate) fn validate_store_request(request: StoreRequest) -> Result<Normalized
     }
     if matches!(
         request.origin,
-        MemoryOrigin::AutoCompaction | MemoryOrigin::SharedMarkdown
+        MemoryOrigin::AutoCompaction
+            | MemoryOrigin::SharedMarkdown
+            | MemoryOrigin::IngestedDocument
     ) {
         let untrusted = format!("{title}\n{}\n{content}", tags.join("\n"));
         ensure!(

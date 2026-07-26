@@ -27,6 +27,9 @@ export const MEMORY_TAXONOMIES = [
   "project_standard",
 ] as const;
 
+export const RETRIEVAL_MODES = ["lexical", "dense", "hybrid"] as const;
+export type RetrievalMode = (typeof RETRIEVAL_MODES)[number];
+
 export const WRITABLE_MEMORY_SCOPES = ["session", "agent", "project"] as const;
 
 export const FEEDBACK_EVENTS = ["used", "ignored", "error"] as const;
@@ -63,7 +66,7 @@ export interface MemoryRecord {
   updated_at_ms: number;
   scope: (typeof MEMORY_SCOPES)[number];
   scope_key?: string | null;
-  origin: "manual" | "auto_compaction" | "shared_markdown" | "legacy";
+  origin: "manual" | "auto_compaction" | "shared_markdown" | "ingested_document" | "legacy";
   expires_at_ms?: number | null;
   stale: boolean;
   code_anchors: Array<{ path: string; sha256: string; git_sha?: string }>;
@@ -86,6 +89,7 @@ export interface MemoryRecord {
 
 export interface SearchResponse {
   query: string;
+  retrieval_mode: RetrievalMode;
   retrieval_id?: string | null;
   count: number;
   candidates_considered: number;
@@ -133,6 +137,18 @@ export interface CaptureResponse {
     updated_at_ms: number;
     scope: (typeof MEMORY_SCOPES)[number];
   };
+}
+
+export interface IngestResponse {
+  path: string;
+  mime_type: string;
+  content_hash: string;
+  extracted_chars: number;
+  chunk_count: number;
+  inserted: number;
+  updated: number;
+  memory_ids: string[];
+  warnings: string[];
 }
 
 export interface SharedMemoryRecord extends CuratedCandidate {

@@ -6,6 +6,7 @@ declare const METHODS: {
     readonly capture: Method.CAPTURE;
     readonly export: Method.EXPORT;
     readonly import: Method.IMPORT;
+    readonly ingest: Method.INGEST;
     readonly get: Method.GET;
     readonly list: Method.LIST;
     readonly update: Method.UPDATE;

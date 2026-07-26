@@ -5,6 +5,8 @@ Local-first persistent memory for OpenCode. The plugin runs a native Rust sideca
 ## Highlights
 
 - Hybrid dense, lexical, metadata, and feedback-aware retrieval
+- Selectable lexical-only, dense-only, and hybrid retrieval modes
+- Rust-native xberg document ingestion for local PDF, Markdown, and HTML evidence
 - Local GGUF embeddings through `utilityai/llama-cpp-rs`
 - Default pinned `Qwen3-Embedding-4B` model from Hugging Face
 - Session-family, agent, project, and repository scopes
@@ -21,7 +23,7 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@nguyenthdat/opencode-memory@0.3.3"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.4.0"]
 }
 ```
 
@@ -47,6 +49,7 @@ The plugin automatically registers its packaged `rules/flow.md` as an OpenCode i
 | ----------------- | ---------------------------------------------------- |
 | `memory_search`   | Retrieve relevant memories within a context budget   |
 | `memory_store`    | Store a verified durable memory                      |
+| `memory_ingest`   | Extract a local PDF, Markdown, or HTML document      |
 | `memory_get`      | Fetch complete records by ID                         |
 | `memory_list`     | Review/filter lifecycle-indexed memories             |
 | `memory_update`   | Correct semantic content or lifecycle metadata       |
@@ -63,6 +66,8 @@ The plugin automatically registers its packaged `rules/flow.md` as an OpenCode i
 | `memory_purge`    | Confirm and delete the complete project store        |
 
 The 15 stable taxonomy values are `task_attempt`, `tool_call`, `session_summary`, `architecture_fact`, `codebase_fact`, `user_fact`, `fix_pattern`, `code_template`, `tool_heuristic`, `code_style`, `library_pref`, `workflow_pref`, `decision`, `team_convention`, and `project_standard`.
+
+Session scope is shared by the primary session and every nested or sibling subagent that resolves to the same root session. Agent scope is limited to the agent role, while project scope is durable and private across project sessions. Repository scope is reviewed canonical Markdown intended for Git sharing. Documents ingested by `memory_ingest` remain private project/agent/session memory; promote only reviewed conclusions to repository Markdown.
 
 ## Embedding Models
 
@@ -134,6 +139,8 @@ Repository memory is canonical Markdown in:
 
 Shared Markdown is treated as untrusted data: paths are contained under `.opencode/memory`, YAML is parsed with a strict schema, instruction-shaped content and likely secrets are rejected, and imported records cannot be pinned or locked through RPC.
 
+`memory_ingest` accepts only project-relative `.pdf`, `.md`, `.markdown`, `.html`, and `.htm` files. Rust-side `xberg` extracts Markdown, chunks it below the 6,000-character memory limit, and stores the chunks with source hashes and document provenance. Extracted document content is untrusted evidence and is never treated as an instruction.
+
 ## Architecture
 
 ```text
@@ -183,6 +190,10 @@ bun run build:native:release
 ```
 
 GPU features are opt-in Cargo features: `metal`, `cuda`, `cuda-no-vmm`, `vulkan`, `openmp`, and `static-openmp`.
+
+### Retrieval Benchmark
+
+The versioned smoke corpus under `tests/benchmark/retrieval-v1/` compares no-memory, lexical-only, dense-only, and hybrid served retrieval. It validates frozen corpus hashes and records Precision/Recall/Hit at 1/3/5/10, MRR@10, nDCG@10, abstention quality, per-query results, and latency. See its README for the reproducible command and current baseline.
 
 ## Releases
 

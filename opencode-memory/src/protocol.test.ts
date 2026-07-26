@@ -13,6 +13,7 @@ describe("Protobuf memory protocol", () => {
   test("encodes a typed request with length-delimited framing", () => {
     const frame = encodeRequest(7, "search", {
       query: "memory",
+      retrieval_mode: "lexical",
       max_results: 5,
       enabled: true,
     });
@@ -55,6 +56,13 @@ describe("Protobuf memory protocol", () => {
 
   test("rejects unknown methods before writing to the sidecar", () => {
     expect(() => encodeRequest(1, "unknown", {})).toThrow("Unknown memory method");
+  });
+
+  test("encodes document ingestion as its own method", () => {
+    const frame = encodeRequest(3, "ingest", { path: "paper.pdf" });
+    const [payload] = new DelimitedFrameDecoder(1024).push(frame);
+    const request = fromBinary(RequestSchema, payload!);
+    expect(request.method).toBe(Method.INGEST);
   });
 });
 

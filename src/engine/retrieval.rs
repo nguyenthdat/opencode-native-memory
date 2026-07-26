@@ -1,4 +1,4 @@
-//! Hybrid dense/lexical retrieval and score calibration.
+//! Dense, lexical, and hybrid retrieval with score calibration.
 
 use std::collections::{HashMap, HashSet};
 
@@ -8,7 +8,8 @@ use zvec_rust::{Doc, Fts, SearchQuery};
 use super::{MemoryEngine, StoredMemory, decorate_memory, now_ms, stored_memory_from_doc};
 use crate::config::hash_hex;
 use crate::contract::{
-    MemoryKind, MemoryRecord, MemoryScope, ScoreBreakdown, SearchRequest, SearchResponse,
+    MemoryKind, MemoryRecord, MemoryScope, RetrievalMode, ScoreBreakdown, SearchRequest,
+    SearchResponse,
 };
 use crate::embedding::Embedder;
 use crate::lifecycle::{is_expired, retention_factor};
@@ -18,7 +19,6 @@ use crate::validation::{
     MAX_BUDGET_CHARS, MAX_SEARCH_RESULTS, MIN_BUDGET_CHARS, truncate_chars, validate_search_request,
 };
 
-const SCORE_VERSION: &str = "hybrid_v3_taxonomy";
 const MAX_EXCERPT_CHARS: usize = 1_600;
 const MAX_CANDIDATES: usize = 1_000;
 const ABSTENTION_THRESHOLD: f32 = 0.42;
@@ -46,26 +46,45 @@ impl MemoryEngine {
                 query_text,
                 budget_chars,
                 "empty_store",
+                request.retrieval_mode,
             ));
         }
 
-        let query_embedding = self.embedder.embed_query(&query_text)?;
         let candidate_count = usize::try_from(stats.doc_count)
             .unwrap_or(MAX_CANDIDATES)
             .min(MAX_CANDIDATES);
         let filter = kind_filter(&request.kinds);
-        let dense_documents =
-            self.dense_query(&query_embedding, candidate_count, filter.as_deref())?;
-        let (lexical_documents, warnings) =
-            match self.lexical_query(&query_text, candidate_count, filter.as_deref()) {
-                Ok(documents) => (documents, Vec::new()),
-                Err(error) => (
+        let (dense_documents, lexical_documents, warnings) = match request.retrieval_mode {
+            RetrievalMode::Lexical => (
+                Vec::new(),
+                self.lexical_query(&query_text, candidate_count, filter.as_deref())?,
+                Vec::new(),
+            ),
+            RetrievalMode::Dense => {
+                let query_embedding = self.embedder.embed_query(&query_text)?;
+                (
+                    self.dense_query(&query_embedding, candidate_count, filter.as_deref())?,
                     Vec::new(),
-                    vec![format!(
-                        "lexical retrieval degraded to dense-only: {error:#}"
-                    )],
-                ),
-            };
+                    Vec::new(),
+                )
+            }
+            RetrievalMode::Hybrid => {
+                let query_embedding = self.embedder.embed_query(&query_text)?;
+                let dense =
+                    self.dense_query(&query_embedding, candidate_count, filter.as_deref())?;
+                let (lexical, warnings) =
+                    match self.lexical_query(&query_text, candidate_count, filter.as_deref()) {
+                        Ok(documents) => (documents, Vec::new()),
+                        Err(error) => (
+                            Vec::new(),
+                            vec![format!(
+                                "lexical retrieval degraded to dense-only: {error:#}"
+                            )],
+                        ),
+                    };
+                (dense, lexical, warnings)
+            }
+        };
         let candidates = merge_candidates(&dense_documents, &lexical_documents)?;
         let considered = candidates.len();
         let now = now_ms()?;
@@ -105,6 +124,7 @@ impl MemoryEngine {
 
         Ok(SearchResponse {
             query: query_text,
+            retrieval_mode: request.retrieval_mode,
             retrieval_id,
             count: memories.len(),
             candidates_considered: considered,
@@ -112,7 +132,7 @@ impl MemoryEngine {
             used_chars,
             abstained,
             abstention_reason,
-            score_version: SCORE_VERSION,
+            score_version: request.retrieval_mode.score_version(),
             warnings,
             memories,
         })
@@ -126,7 +146,9 @@ impl MemoryEngine {
         now: i64,
     ) -> Result<Vec<RankedMemory>> {
         let mut ranked = Vec::with_capacity(candidates.len());
-        for candidate in candidates.into_values() {
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.memory.id.cmp(&right.memory.id));
+        for candidate in candidates {
             if self.state.pending_deletes.contains(&candidate.memory.id) {
                 continue;
             }
@@ -163,16 +185,23 @@ impl MemoryEngine {
                 &candidate.memory.tags,
             );
             let dense = candidate.dense_similarity.unwrap_or_default();
-            let reciprocal_rank =
-                normalized_reciprocal_rank(candidate.dense_rank, candidate.lexical_rank);
+            let reciprocal_rank = normalized_reciprocal_rank(
+                candidate.dense_rank,
+                candidate.lexical_rank,
+                request.retrieval_mode,
+            );
             let channel_agreement =
                 f32::from(candidate.dense_rank.is_some() && candidate.lexical_rank.is_some());
             // Phase 1: per-candidate retrieval profile weights from taxonomy.
             let (w_dense, w_rr, w_lex, w_agree) = metadata.taxonomy.retrieval_profile().weights();
-            let raw = w_dense * dense
-                + w_rr * reciprocal_rank
-                + w_lex * lexical
-                + w_agree * channel_agreement;
+            let raw = mode_score(
+                request.retrieval_mode,
+                dense,
+                reciprocal_rank,
+                lexical,
+                channel_agreement,
+                (w_dense, w_rr, w_lex, w_agree),
+            );
             let calibrated = logistic(10.0 * (raw - 0.55));
             let retention = retention_factor(now, candidate.memory.updated_at_ms, &metadata);
             let feedback = feedback_factor(&metadata.feedback);
@@ -276,14 +305,42 @@ fn merge_candidates(dense: &[Doc], lexical: &[Doc]) -> Result<HashMap<String, Re
     Ok(candidates)
 }
 
-fn normalized_reciprocal_rank(dense_rank: Option<usize>, lexical_rank: Option<usize>) -> f32 {
-    fn channel(rank: Option<usize>, weight: f32) -> f32 {
+fn normalized_reciprocal_rank(
+    dense_rank: Option<usize>,
+    lexical_rank: Option<usize>,
+    mode: RetrievalMode,
+) -> f32 {
+    fn channel(rank: Option<usize>) -> f32 {
         rank.map_or(0.0, |rank| {
             let rank = f32::from(u16::try_from(rank).unwrap_or(u16::MAX));
-            weight * 61.0 / (61.0 + rank)
+            61.0 / (61.0 + rank)
         })
     }
-    (channel(dense_rank, 0.65) + channel(lexical_rank, 0.35)).clamp(0.0, 1.0)
+    match mode {
+        RetrievalMode::Lexical => channel(lexical_rank),
+        RetrievalMode::Dense => channel(dense_rank),
+        RetrievalMode::Hybrid => {
+            (0.65 * channel(dense_rank) + 0.35 * channel(lexical_rank)).clamp(0.0, 1.0)
+        }
+    }
+}
+
+fn mode_score(
+    mode: RetrievalMode,
+    dense: f32,
+    reciprocal_rank: f32,
+    lexical: f32,
+    channel_agreement: f32,
+    weights: (f32, f32, f32, f32),
+) -> f32 {
+    let (w_dense, w_rr, w_lex, w_agree) = weights;
+    match mode {
+        RetrievalMode::Lexical => (w_rr * reciprocal_rank + w_lex * lexical) / (w_rr + w_lex),
+        RetrievalMode::Dense => (w_dense * dense + w_rr * reciprocal_rank) / (w_dense + w_rr),
+        RetrievalMode::Hybrid => {
+            w_dense * dense + w_rr * reciprocal_rank + w_lex * lexical + w_agree * channel_agreement
+        }
+    }
 }
 
 fn logistic(value: f32) -> f32 {
@@ -351,7 +408,9 @@ fn deduplicate_layers(ranked: Vec<RankedMemory>) -> Vec<RankedMemory> {
             })
             .or_insert(candidate);
     }
-    deduplicated.into_values().collect()
+    let mut values = deduplicated.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| left.memory.id.cmp(&right.memory.id));
+    values
 }
 
 fn select_mmr(
@@ -371,14 +430,15 @@ fn select_mmr(
                     .map(|memory| memory_similarity(&candidate.memory, memory))
                     .fold(0.0_f32, f32::max);
                 let mmr = 0.75 * candidate.score - 0.25 * similarity;
-                (index, mmr, candidate.score)
+                (index, mmr, candidate.score, candidate.memory.id.as_str())
             })
             .max_by(|left, right| {
                 left.1
                     .total_cmp(&right.1)
                     .then_with(|| left.2.total_cmp(&right.2))
+                    .then_with(|| right.3.cmp(left.3))
             });
-        let Some((index, _, _)) = best else {
+        let Some((index, _, _, _)) = best else {
             break;
         };
         let candidate = candidates.swap_remove(index);
@@ -434,9 +494,15 @@ fn retrieval_id(query: &str, now: i64, generation: u64, memories: &[MemoryRecord
     format!("ret_{}", &hash[..24])
 }
 
-fn empty_search_response(query: String, budget_chars: usize, reason: &str) -> SearchResponse {
+fn empty_search_response(
+    query: String,
+    budget_chars: usize,
+    reason: &str,
+    retrieval_mode: RetrievalMode,
+) -> SearchResponse {
     SearchResponse {
         query,
+        retrieval_mode,
         retrieval_id: None,
         count: 0,
         candidates_considered: 0,
@@ -444,7 +510,7 @@ fn empty_search_response(query: String, budget_chars: usize, reason: &str) -> Se
         used_chars: 0,
         abstained: true,
         abstention_reason: Some(reason.to_string()),
-        score_version: SCORE_VERSION,
+        score_version: retrieval_mode.score_version(),
         warnings: Vec::new(),
         memories: Vec::new(),
     }
@@ -497,10 +563,12 @@ fn kind_filter(kinds: &[MemoryKind]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RankedMemory, deduplicate_layers, kind_filter, lexical_score, logistic,
+        RankedMemory, deduplicate_layers, kind_filter, lexical_score, logistic, mode_score,
         normalized_reciprocal_rank,
     };
-    use crate::contract::{FeedbackStats, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope};
+    use crate::contract::{
+        FeedbackStats, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, RetrievalMode,
+    };
 
     #[test]
     fn lexical_overlap_handles_code_identifiers_and_vietnamese() {
@@ -515,12 +583,21 @@ mod tests {
 
     #[test]
     fn calibrated_score_components_are_bounded_and_monotonic() {
-        let dense_only = normalized_reciprocal_rank(Some(0), None);
-        let both = normalized_reciprocal_rank(Some(0), Some(0));
+        let dense_only = normalized_reciprocal_rank(Some(0), None, RetrievalMode::Hybrid);
+        let both = normalized_reciprocal_rank(Some(0), Some(0), RetrievalMode::Hybrid);
         assert!(dense_only > 0.0 && dense_only < both);
         assert!(both <= 1.0);
         assert!(logistic(-5.0) < logistic(0.0));
         assert!(logistic(0.0) < logistic(5.0));
+    }
+
+    #[test]
+    fn pure_mode_scores_normalize_inactive_channels() {
+        let weights = (0.45, 0.25, 0.20, 0.10);
+        let lexical = mode_score(RetrievalMode::Lexical, 0.0, 1.0, 1.0, 0.0, weights);
+        let dense = mode_score(RetrievalMode::Dense, 1.0, 1.0, 0.0, 0.0, weights);
+        assert_eq!(lexical, 1.0);
+        assert_eq!(dense, 1.0);
     }
 
     #[test]

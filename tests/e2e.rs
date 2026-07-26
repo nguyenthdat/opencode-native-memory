@@ -3,7 +3,7 @@ use std::fs;
 use opencode_memory::{
     FeedbackEvent, FeedbackRequest, ForgetRequest, GetRequest, ListRequest, LockAction,
     LockRequest, MemoryConfig, MemoryEngine, MemoryKind, MemoryOrigin, MemoryScope, MemoryTaxonomy,
-    PinRequest, SearchRequest, StoreRequest, UpdateRequest,
+    PinRequest, RetrievalMode, SearchRequest, StoreRequest, UpdateRequest,
 };
 
 #[test]
@@ -76,6 +76,7 @@ fn stores_recalls_and_forgets_project_memory() {
     let results = engine
         .search(&SearchRequest {
             query: "Memory server được viết bằng ngôn ngữ và database nào?".to_string(),
+            retrieval_mode: RetrievalMode::Hybrid,
             limit: Some(2),
             max_results: 20,
             budget_chars: 6_000,
@@ -108,6 +109,7 @@ fn stores_recalls_and_forgets_project_memory() {
     let feedback_search = engine
         .search(&SearchRequest {
             query: "OpenCode memory Rust zvec search".to_string(),
+            retrieval_mode: RetrievalMode::Hybrid,
             limit: Some(5),
             max_results: 20,
             budget_chars: 6_000,

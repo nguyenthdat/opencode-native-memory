@@ -4,6 +4,7 @@ mode: subagent
 temperature: 0.2
 permission:
   edit: allow
+  memory_ingest: allow
   bash:
     "*": deny
     "mkdir *": allow
@@ -100,6 +101,7 @@ When a paper is legally accessible:
 
 3. Use CloakBrowser download handling for browser-hosted files or `curl -L -o <path> <url>` for direct legal PDF URLs.
 4. For downloaded documents, use `xberg_detect` when the format is uncertain, then `xberg_extract` for text, tables, and metadata. Prefer `content_format: "markdown"` for papers.
+5. Persist every legally accessible full-text paper that materially informs the report with the `memory_ingest` tool using its project-relative downloaded path. Use durable private `project` scope, record the returned memory IDs and chunk count, and never place raw paper text in `.opencode/memory/`. Paywalled abstract-only sources are not full-text ingestions.
 
 ## Paper Metadata
 
@@ -129,6 +131,10 @@ Metadata fields:
     - "Claim 1 used in report"
     - "Claim 2 used in report"
   pdf_path: "_workspace/research/papers/<topic-slug>/<year>-<author>-<short-title>.pdf"
+  ingestion_status: "ingested" | "not-ingested" | "failed"
+  ingested_chunk_count: 0
+  memory_ids: []
+  content_hash: "..."
   methodology_notes: "Sample size, method type, key assumptions, limitations"
 ```
 
@@ -167,9 +173,9 @@ Return a structured document:
 _workspace/research/papers/<topic-slug>/metadata.yaml
 
 ## Downloaded Papers
-| # | File | Authors | Year | DOI | Access Method |
-|---|------|---------|------|-----|---------------|
-| 1 | ... | ... | ... | ... | ... |
+| # | File | Authors | Year | DOI | Access Method | Ingestion |
+|---|------|---------|------|-----|---------------|-----------|
+| 1 | ... | ... | ... | ... | ... | ... |
 
 ## Paywalled / Inaccessible
 | # | Title | Authors | DOI | Reason |

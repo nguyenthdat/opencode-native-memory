@@ -7,7 +7,7 @@ const packageRoot = basename(moduleDirectory) === "dist"
     : resolve(moduleDirectory, "../..");
 export default createMemoryPlugin({ root: packageRoot });
 // Contracts and constants
-export { MEMORY_KINDS, MEMORY_SCOPES, MEMORY_TAXONOMIES, WRITABLE_MEMORY_SCOPES, FEEDBACK_EVENTS, LOCK_ACTIONS, LOCK_REASON_MAX, UNLOCK_FORBIDDEN_FIELDS, } from "./contracts.js";
+export { MEMORY_KINDS, MEMORY_SCOPES, MEMORY_TAXONOMIES, RETRIEVAL_MODES, WRITABLE_MEMORY_SCOPES, FEEDBACK_EVENTS, LOCK_ACTIONS, LOCK_REASON_MAX, UNLOCK_FORBIDDEN_FIELDS, } from "./contracts.js";
 // Sidecar client
 export { NativeMemoryClient, resolveNativeMemoryBinary, REQUEST_TIMEOUT_MS, INITIALIZATION_TIMEOUT_MS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, } from "./sidecar-client.js";
 export { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";

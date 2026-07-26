@@ -2,7 +2,14 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const rootPackage = await readPackage("package.json");
-const cargo = Bun.spawnSync(["cargo", "metadata", "--no-deps", "--format-version", "1"]);
+const cargo = Bun.spawnSync([
+  "cargo",
+  "metadata",
+  "--locked",
+  "--no-deps",
+  "--format-version",
+  "1",
+]);
 if (!cargo.success) throw new Error(cargo.stderr.toString());
 const metadata = JSON.parse(cargo.stdout.toString()) as {
   packages: Array<{ name: string; version: string }>;
@@ -29,6 +36,11 @@ for (const [directory, expectedName] of nativePackages) {
   if (pkg.repository?.url !== expectedRepositoryUrl) {
     throw new Error(
       `${directory} repository URL must be ${expectedRepositoryUrl}, received ${pkg.repository?.url ?? "none"}`,
+    );
+  }
+  if (rootPackage.optionalDependencies?.[expectedName] !== rootPackage.version) {
+    throw new Error(
+      `${expectedName} optional dependency must match root version ${rootPackage.version}, received ${rootPackage.optionalDependencies?.[expectedName] ?? "none"}`,
     );
   }
   versions.set(pkg.name, pkg.version);

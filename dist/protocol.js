@@ -7,6 +7,7 @@ const METHODS = {
     capture: Method.CAPTURE,
     export: Method.EXPORT,
     import: Method.IMPORT,
+    ingest: Method.INGEST,
     get: Method.GET,
     list: Method.LIST,
     update: Method.UPDATE,

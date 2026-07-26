@@ -1,0 +1,6 @@
+{"query_id":"q-storage","text":"Which database backs native memory records?","category":"exact_identifier","language":"en","answerable":true,"relevance":[{"fixture_id":"architecture-zvec","grade":3}]}
+{"query_id":"q-retrieval","text":"How are semantic and keyword search combined?","category":"paraphrase","language":"en","answerable":true,"relevance":[{"fixture_id":"retrieval-hybrid","grade":3},{"fixture_id":"benchmark-baselines","grade":1}]}
+{"query_id":"q-subagents","text":"Bộ nhớ nào được chia sẻ giữa parent và sibling subagent?","category":"vietnamese","language":"vi","answerable":true,"relevance":[{"fixture_id":"session-family","grade":3}]}
+{"query_id":"q-papers","text":"How are downloaded PDF papers persisted for later search?","category":"workflow","language":"en","answerable":true,"relevance":[{"fixture_id":"document-ingestion","grade":3},{"fixture_id":"repository-markdown","grade":1}]}
+{"query_id":"q-delete","text":"Can previously deleted content be stored again automatically?","category":"gotcha","language":"en","answerable":true,"relevance":[{"fixture_id":"tombstone-revival","grade":3}]}
+{"query_id":"q-negative","text":"Which Kubernetes namespace hosts the production service?","category":"negative","language":"en","answerable":false,"relevance":[]}

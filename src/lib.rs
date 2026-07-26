@@ -1,6 +1,7 @@
 pub mod capture;
 mod config;
 mod contract;
+mod document;
 mod embedding;
 mod engine;
 mod lifecycle;
@@ -24,11 +25,12 @@ pub use contract::{
     CaptureRequest, CaptureResponse, CodeAnchor, DeleteReason, DeleteRequest, DeleteResponse,
     DoctorRequest, DoctorResponse, ExportRequest, FeedbackEvent, FeedbackRequest, FeedbackResponse,
     FeedbackStats, ForgetRequest, ForgetResponse, GetRequest, ImportRequest, ImportResponse,
-    IndexStatus, LifecycleResponse, ListRequest, ListResponse, LockAction, LockRequest, MemoryKind,
-    MemoryOrigin, MemoryRecord, MemoryScope, MemorySnapshot, OptimizeResponse, PinRequest,
-    PurgeRequest, PurgeResponse, ScoreBreakdown, SearchRequest, SearchResponse, SharedMemoryInput,
-    SharedMemoryRejection, StatusResponse, StoreRequest, StoreResponse, SyncSharedRequest,
-    SyncSharedResponse, TombstoneSnapshot, UpdateRequest, UpdateResponse,
+    IndexStatus, IngestRequest, IngestResponse, LifecycleResponse, ListRequest, ListResponse,
+    LockAction, LockRequest, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, MemorySnapshot,
+    OptimizeResponse, PinRequest, PurgeRequest, PurgeResponse, RetrievalMode, ScoreBreakdown,
+    SearchRequest, SearchResponse, SharedMemoryInput, SharedMemoryRejection, StatusResponse,
+    StoreRequest, StoreResponse, SyncSharedRequest, SyncSharedResponse, TombstoneSnapshot,
+    UpdateRequest, UpdateResponse,
 };
 pub use engine::MemoryEngine;
 pub use taxonomy::{MemoryFamily, MemoryTaxonomy, RetrievalProfile};

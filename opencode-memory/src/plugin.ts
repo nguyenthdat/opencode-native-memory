@@ -6,6 +6,7 @@ import type {
   SearchResponse,
   SharedSyncResponse,
   CaptureResponse,
+  IngestResponse,
 } from "./contracts.js";
 import {
   MEMORY_KINDS,
@@ -14,6 +15,7 @@ import {
   FEEDBACK_EVENTS,
   LOCK_ACTIONS,
   MEMORY_TAXONOMIES,
+  RETRIEVAL_MODES,
 } from "./contracts.js";
 import { acquireNativeMemoryClient } from "./sidecar-client.js";
 import {
@@ -308,6 +310,10 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .min(1)
               .max(2_000)
               .describe("Concise task-specific retrieval query."),
+            retrieval_mode: tool.schema
+              .enum(RETRIEVAL_MODES)
+              .default("hybrid")
+              .describe("Retrieval channel used for search and benchmark comparisons."),
             limit: tool.schema
               .number()
               .int()
@@ -360,6 +366,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               "search",
               {
                 query: args.query,
+                retrieval_mode: args.retrieval_mode,
                 max_results: args.limit,
                 budget_chars: args.budget_chars,
                 kinds: args.kinds,
@@ -481,6 +488,68 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             session.invalidateRecall();
             return result("Stored memory", response, {
               id: response.id,
+              inserted: response.inserted,
+            });
+          },
+        }),
+        memory_ingest: tool({
+          description:
+            "Extract a project-local PDF, Markdown, or HTML document with xberg and persist its text as bounded, searchable memory chunks.",
+          args: {
+            path: tool.schema
+              .string()
+              .min(1)
+              .max(200)
+              .describe("Existing document path relative to the project root."),
+            title: tool.schema
+              .string()
+              .min(1)
+              .max(120)
+              .optional()
+              .describe("Optional document title; defaults to the filename."),
+            kind: tool.schema.enum(MEMORY_KINDS).default("fact"),
+            importance: tool.schema.number().min(0).max(1).default(0.6),
+            tags: tool.schema.array(tool.schema.string().min(1).max(64)).max(11).default([]),
+            scope: tool.schema
+              .enum(WRITABLE_MEMORY_SCOPES)
+              .default("project")
+              .describe(
+                "session shares within the parent/subagent family; agent is role-specific; project is durable and private.",
+              ),
+            expires_in_days: tool.schema.number().int().min(1).max(3_650).optional(),
+            revive: tool.schema
+              .boolean()
+              .default(false)
+              .describe("Revive matching tombstoned chunks after user approval."),
+            taxonomy: tool.schema.enum(MEMORY_TAXONOMIES).optional(),
+            confidence: tool.schema.number().min(0).max(1).optional(),
+          },
+          async execute(args, context) {
+            await context.ask({
+              permission: "memory_ingest",
+              patterns: [args.path],
+              always: [],
+              metadata: { operation: "ingest", scope: args.scope },
+            });
+            if (args.revive) {
+              await context.ask({
+                permission: "memory_revive",
+                patterns: [args.path],
+                always: [],
+                metadata: { operation: "revive", scope: args.scope },
+              });
+            }
+            const scopeKey = await session.scopeKey(args.scope, context.sessionID, context.agent);
+            const response = await native.request<IngestResponse>(
+              "ingest",
+              { ...args, scope_key: scopeKey },
+              context.abort,
+            );
+            for (const warning of response.warnings) session.warnOnce(new Error(warning));
+            session.invalidateRecall();
+            return result("Ingested document", response, {
+              path: response.path,
+              chunk_count: response.chunk_count,
               inserted: response.inserted,
             });
           },

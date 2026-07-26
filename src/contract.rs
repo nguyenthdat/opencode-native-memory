@@ -77,6 +77,7 @@ pub enum MemoryOrigin {
     Manual,
     AutoCompaction,
     SharedMarkdown,
+    IngestedDocument,
     Legacy,
 }
 
@@ -103,6 +104,25 @@ pub enum DeleteReason {
 pub enum LockAction {
     Lock,
     Unlock,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalMode {
+    Lexical,
+    Dense,
+    #[default]
+    Hybrid,
+}
+
+impl RetrievalMode {
+    pub(crate) const fn score_version(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical_v1_taxonomy",
+            Self::Dense => "dense_v1_taxonomy",
+            Self::Hybrid => "hybrid_v3_taxonomy",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -191,6 +211,36 @@ pub struct CaptureRequest {
     pub agent_scope_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestRequest {
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default = "default_ingest_kind")]
+    pub kind: MemoryKind,
+    #[serde(default = "default_importance")]
+    pub importance: f32,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub scope: MemoryScope,
+    #[serde(default)]
+    pub scope_key: Option<String>,
+    #[serde(default)]
+    pub expires_in_days: Option<u32>,
+    #[serde(default)]
+    pub revive: bool,
+    #[serde(default)]
+    pub taxonomy: Option<MemoryTaxonomy>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+}
+
+const fn default_ingest_kind() -> MemoryKind {
+    MemoryKind::Fact
+}
+
 const fn default_importance() -> f32 {
     0.7
 }
@@ -199,6 +249,8 @@ const fn default_importance() -> f32 {
 #[serde(deny_unknown_fields)]
 pub struct SearchRequest {
     pub query: String,
+    #[serde(default)]
+    pub retrieval_mode: RetrievalMode,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default = "default_max_results")]
@@ -509,6 +561,19 @@ pub struct StoreResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct IngestResponse {
+    pub path: String,
+    pub mime_type: String,
+    pub content_hash: String,
+    pub extracted_chars: usize,
+    pub chunk_count: usize,
+    pub inserted: usize,
+    pub updated: usize,
+    pub memory_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CaptureResponse {
     pub decision: CaptureDecision,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -518,6 +583,7 @@ pub struct CaptureResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResponse {
     pub query: String,
+    pub retrieval_mode: RetrievalMode,
     pub retrieval_id: Option<String>,
     pub count: usize,
     pub candidates_considered: usize,
@@ -650,8 +716,7 @@ pub struct StatusResponse {
     pub pending_upsert_count: usize,
     pub pending_delete_count: usize,
     pub indexes: Vec<IndexStatus>,
-    /// Phase 1 capability strings advertised to the TypeScript client. The
-    /// current set is `["phase1_taxonomy_lifecycle_v1"]`.
+    /// Capability strings advertised to the TypeScript client.
     pub capabilities: Vec<&'static str>,
 }
 
