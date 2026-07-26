@@ -739,7 +739,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                     },
                 }),
                 memory_feedback: tool({
-                    description: "Record whether recalled memory was used, ignored, or caused an error. Used feedback must be explicit.",
+                    description: "Record whether recalled memory was used, ignored, or caused an error. Provide at least one exact recalled memory ID; skip this tool when no memory qualifies.",
                     args: {
                         retrieval_id: tool.schema
                             .string()

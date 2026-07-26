@@ -23,7 +23,7 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@nguyenthdat/opencode-memory@0.4.1"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.4.2"]
 }
 ```
 
