@@ -8,7 +8,25 @@
     },
     "crates.io": { "type": "local", "command": ["cratesio-mcp"], "enabled": true },
     "cargo": { "type": "local", "command": ["cargo-mcp", "serve"], "enabled": true },
-    "ferroscope": { "type": "local", "command": ["ferroscope"], "enabled": true },
+    "ferroscope": {
+      "type": "local",
+      "command": [
+        "ferroscope"
+      ],
+      "enabled": true
+    },
+    "bitwarden": {
+      "type": "local",
+      "command": [
+        "bunx",
+        "-y",
+        "@bitwarden/mcp-server"
+      ],
+      "enabled": true,
+      "environment": {
+        "BW_SESSION": "{env:BW_SESSION}"
+      }
+    },
   },
   "instructions": [".opencode/instructions/parallel-agents.md"],
 }

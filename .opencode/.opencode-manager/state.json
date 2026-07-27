@@ -12,6 +12,9 @@
     },
     "ferroscope": {
       "appliedHash": "bd5e2ba1b6f2d8f208bba4fed119630461ecfbf6baefb962efc1b4e897541a87"
+    },
+    "bitwarden": {
+      "appliedHash": "7957f587d4ecae93d4f02e5bf35cd5846e98442f9b7f99fc0470bdd767862c8d"
     }
   },
   "plugins": {},
@@ -44,6 +47,7 @@
   },
   "agents": {
     "researcher": {
+      "type": "team",
       "title": "Research Team",
       "description": "Orchestrated web, academic, community, validation, and synthesis research team.",
       "tags": [
@@ -51,7 +55,6 @@
         "deep-research"
       ],
       "path": "agents/researcher",
-      "type": "team",
       "digest": "9d9f7f757cf284e2919dcc5d64da8188102dbd6eff28c6a7062fbdec6ebc3bfc",
       "members": 6
     }
