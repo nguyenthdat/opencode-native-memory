@@ -165,6 +165,32 @@ If the spike fails because of platform or runtime constraints, retain the existi
 
 The rest of this plan uses gRPC names for the preferred branch. The fallback must implement the same transport-neutral semantics: session negotiation, heartbeat/TTL, project leases, per-call IDs and deadlines, bounded queues, in-band errors, reconnect behavior, and no automatic replay of ambiguous mutations. Shared acceptance criteria refer to the selected direct IPC transport.
 
+### Phase 0 executable matrix
+
+The spike is complete only when the installed native package and generated TypeScript client pass this matrix:
+
+| Native package    | Build/test image   | Host/runtime gate                                     |
+| ----------------- | ------------------ | ----------------------------------------------------- |
+| `darwin-arm64`    | `macos-14`         | OpenCode CLI 1.18.4, Bun 1.3.14                       |
+| `darwin-arm64`    | `macos-14`         | OpenCode Desktop 1.18.4 with pinned embedded runtime  |
+| `linux-arm64-gnu` | `ubuntu-24.04-arm` | OpenCode CLI 1.18.4, Bun 1.3.14, recorded glibc floor |
+| `linux-x64-gnu`   | `ubuntu-24.04`     | OpenCode CLI 1.18.4, Bun 1.3.14, recorded glibc floor |
+
+The preferred branch uses the literal grpc-js target `unix:/absolute/path`, authority `localhost`, and `grpc.credentials.createInsecure()` over the owner-only UDS; OS peer credentials provide local identity. Alternate URI forms are not tried silently at runtime.
+
+Phase 0 writes a committed `docs/daemon-transport-matrix.lock.json` that pins tonic, grpc-js, generator, OpenCode/Desktop, embedded Node/Bun, runner image, architecture, and observed glibc versions plus the exact test command and result artifact hash. Placeholder or conditional support rows are not allowed at phase exit. If another Desktop/native combination becomes a claimed target, add an unconditional pinned row before release.
+
+Every matrix row tests:
+
+- hostile `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` values plus a sentinel TCP listener, proving no TCP/proxy fallback;
+- absent, same-user stale, live, incompatible, and atomically replaced endpoints;
+- short, maximum supported, and overlong socket paths;
+- foreign owner, wrong mode, wrong file type, and symlink endpoints;
+- concurrent clients, session half-close, channel close, heartbeat expiry, and daemon restart;
+- unary cancellation, per-call deadline, status mapping, backpressure, and encoded/decoded message limits.
+
+If a supported host row fails, the spike selects the framed-Protobuf fallback or the release does not claim that host as supported.
+
 ### MCP boundary
 
 MCP is deliberately not used for plugin-to-daemon IPC. MCP messages are JSON-RPC messages and standard MCP transports are stdio and Streamable HTTP. Protobuf/gRPC is not an official MCP wire transport.
@@ -188,7 +214,7 @@ The daemon has four major responsibilities.
 ### 1. Process bootstrap
 
 - Resolve a stable per-user endpoint.
-- Ensure only one daemon instance is started per user and daemon protocol generation.
+- Ensure at most one daemon instance is active per user across all protocol generations.
 - Recover from a stale socket without deleting a live endpoint.
 - Report an actionable error for an incompatible daemon already running.
 - Keep logs on stderr or a daemon log sink, never on the binary protocol channel.
@@ -210,7 +236,7 @@ The daemon has four major responsibilities.
 - Derive a `StoreKey` solely from the canonical physical project data directory.
 - Deduplicate concurrent opens by `StoreKey` before validating configuration.
 - Compare a separate project/model/schema fingerprint after lookup and reject a mismatch without creating a second actor.
-- Return the same project handle to multiple clients.
+- Share the same underlying actor across clients while returning a distinct session-scoped handle and lease to each session.
 - Reject an incompatible embedding configuration for an existing collection.
 - Keep one `MemoryEngine` per project actor.
 
@@ -237,6 +263,8 @@ src/
     registry.rs       # project identity and actor registry
     actor.rs          # one MemoryEngine owner and serialized queue
     connection.rs     # connection and lease cleanup
+    governor.rs       # bounded actors, queues, CPU/GPU/model permits
+    preparation.rs    # discovery, extraction, hash, and parse pools
     service.rs        # selected IPC service implementation
   rpc.rs              # compatibility adapter or shared request dispatch
   engine/mod.rs       # existing project engine
@@ -299,6 +327,8 @@ Rules:
 - Multiple clients for one `StoreKey` may enqueue concurrently, but engine transactions remain serialized.
 - Daemon health, session heartbeats, and lease expiry remain responsive even while a project actor is busy.
 - Use bounded channels and semaphores; never create an unbounded task or OS-thread count from client traffic.
+- Propagate one cancellation token from the unary IPC handler through preparation and actor admission.
+- Use RAII permit guards so cancellation, timeout, panic, and normal completion release capacity exactly once.
 - Keep actor workers thread-affine until zvec, llama.cpp context, and `MemoryEngine` `Send`/`Sync` behavior is proven and tested.
 
 For document ingestion and indexing, split work into prepare and commit stages:
@@ -329,6 +359,35 @@ The current embedder defaults each model context to all available CPU threads. T
 
 Do not parallelize reads inside one store merely because a method takes `&self`. `search` mutates feedback state, the collection is C-backed, and read/write consistency has not been proven. Add parallel same-store reads only after dependency guarantees, stress tests, and benchmarks demonstrate safety and benefit.
 
+### Phase 1 resource baseline
+
+These are conservative, measurable defaults for the first daemon cutover. They are configuration values, not permanent limits, and Phase 3 may tune them only with load-test evidence:
+
+| Resource                                    | Baseline                                                               |
+| ------------------------------------------- | ---------------------------------------------------------------------- |
+| Encoded request and response                | 32 MiB, preserving the current sidecar limit                           |
+| Decoded message and temporary decode budget | 32 MiB payload plus a bounded 2x decode allowance                      |
+| Aggregate encoded in-flight bytes           | 128 MiB across all sessions and responses                              |
+| Aggregate decoded/temporary bytes           | 256 MiB across all sessions and preparation handoffs                   |
+| Client sessions per daemon                  | 64                                                                     |
+| Outstanding unary calls per session         | 32                                                                     |
+| Project command queue                       | 64 commands and 64 MiB estimated queued payload, whichever comes first |
+| Aggregate queued command payload            | 256 MiB across all project actors                                      |
+| Preparation workers                         | `max(1, min(8, available_parallelism / 2))`                            |
+| Prepared work per project                   | 128 MiB                                                                |
+| Aggregate prepared work                     | 256 MiB across all projects                                            |
+| Active project actors                       | 2 by default, reduced by model-resident-memory admission               |
+| Model resident-memory budget                | `min(8 GiB, 40% of physical memory)`; opening actors reserve estimates |
+| Concurrent model loads                      | 1                                                                      |
+| Aggregate embedding CPU threads             | `available_parallelism`, shared by all active inference calls          |
+| Per-inference embedding threads             | `min(OPENCODE_MEMORY_EMBEDDING_THREADS, aggregate budget)`             |
+| GPU/Metal inference permits                 | 1 weighted permit until backend benchmarks justify more                |
+| Project idle eviction                       | 5 minutes after the last lease, command, and job                       |
+| Daemon idle shutdown                        | 10 minutes after all non-control activity predicates are zero          |
+| Session heartbeat and lease TTL             | 10-second heartbeat, 30-second TTL                                     |
+
+Overload returns a typed `RESOURCE_EXHAUSTED` result with a bounded retry-after duration. Limits apply before allocation where possible; counting only tasks or connections is not sufficient. The model budget is a hard admission limit: if one model estimate exceeds it, the daemon refuses the project with an actionable memory-cap error rather than attempting the load. All opening actors reserve estimated model bytes before `LlamaCppEmbedder::load()` begins. CPU permits are shared by embedding, extraction, and other daemon-owned blocking work.
+
 ### Project identity
 
 Do not use the worktree string or the embedding configuration as the actor registry key. Split identity into two values:
@@ -354,9 +413,34 @@ The configuration fingerprint contains:
 - embedding dimension and relevant preprocessing configuration;
 - memory schema compatibility.
 
-Relative paths, symlinks, and alternate `OPENCODE_MEMORY_DATA_DIR` spellings must resolve to one `StoreKey` when they point to the same store. Protocol generation is negotiated per daemon session and must not split store ownership.
+Relative paths and symlinked ancestors, plus alternate `OPENCODE_MEMORY_DATA_DIR` spellings, must resolve to one `StoreKey` when they point to the same store. A final symlink at `project_data_dir` is rejected rather than followed, so the physical store invariant is unambiguous. Protocol generation is negotiated per daemon session and must not split store ownership.
 
 The daemon should return an opaque `project_handle` after `AcquireProject`. The handle is scoped to one daemon instance and session; clients must not persist it or construct it from paths.
+
+### Configuration fingerprint contract
+
+The client sends raw project/configuration inputs; the daemon is the authority that canonicalizes and fingerprints them. The request must carry enough data to reproduce the current `MemoryConfig`, including:
+
+- project root and optional explicit data directory;
+- local model path, or repository/revision/filename identity;
+- pooling, attention, query/passage templates, BOS/EOS, normalization, dimension, and context size;
+- domain/schema generation negotiated by the session.
+
+The daemon derives project ID and final `project_data_dir` using the same configuration rules as the engine. It canonicalizes the nearest existing ancestor plus a normalized suffix when the store does not yet exist, rejects a final symlink, recanonicalizes immediately before publishing/opening the actor, derives `StoreKey` from the canonical final store directory, and reserves that key before opening the engine.
+
+The semantic fingerprint is a SHA-256 hash over an explicitly ordered, length-prefixed UTF-8/binary tuple. The tuple includes canonical project root, derived project ID, model artifact identity/hash, all vector-affecting preprocessing settings, embedding dimension/context, and memory schema. Runtime-only settings such as worker thread count are daemon policy and do not create a second actor. The exact tuple and normalization rules must be specified in the daemon proto documentation and covered by alias/mismatch tests.
+
+The registry performs this order atomically:
+
+```text
+StoreKey lookup/reservation
+  -> wait for existing Opening actor, or install Opening entry
+  -> compare normalized ConfigurationFingerprint
+  -> open MemoryEngine only for the reserved entry
+  -> publish Ready actor and session-scoped lease
+```
+
+This prevents one physical store from ever producing two model or state owners, even when two clients provide different roots or embedding settings.
 
 ### Project actor lifecycle
 
@@ -375,6 +459,14 @@ Opening -> Ready -> Draining -> Closing
 - `Failed` stores a short diagnostic/backoff result, then is removed so a later acquisition can retry.
 
 When lease count, admitted command count, and daemon-owned job count all reach zero, start a project idle timer. On expiry, transition the actor through `Draining` and `Closing`. This prevents the daemon from retaining every model, thread, collection, and lock it has ever opened.
+
+Idle eviction is generation-tagged and atomic with admission:
+
+1. Every new lease, admitted command, or job increments an activity generation and cancels the prior timer.
+2. The timer captures that generation.
+3. On expiry, the registry lock is acquired and all counters plus the generation are rechecked.
+4. Only a matching zero-activity entry can transition atomically from `Ready` to `Draining`.
+5. Acquisitions that observe `Draining` or `Closing` wait for entry removal and retry; they never receive a handle to an engine being dropped.
 
 An actor panic must be contained, joined, and removed from the registry. The daemon must not hand out a handle to a failed actor.
 
@@ -447,6 +539,7 @@ service MemoryDaemon {
   rpc AcquireProject(AcquireProjectRequest) returns (AcquireProjectResponse);
   rpc ProjectCall(ProjectCallRequest) returns (ProjectCallResponse);
   rpc ReleaseProject(ReleaseProjectRequest) returns (ReleaseProjectResponse);
+  rpc RequestDrain(RequestDrainRequest) returns (RequestDrainResponse);
 }
 ```
 
@@ -456,19 +549,45 @@ The first `SessionControl` message must be `SessionHello`. `SessionReady` return
 
 gRPC non-OK statuses on `OpenSession` are reserved for session-fatal failures. Each unary project call has its own deadline, cancellation signal, and gRPC status, so one invalid or cancelled operation does not close the session or release unrelated leases.
 
+`RequestDrain(expected_daemon_instance_id)` belongs to the frozen generation-stable local control surface and returns `ACCEPTED`, `BUSY`, or `UNSUPPORTED`. It is callable after `GetDaemonInfo` without opening a project session. An older daemon that does not implement it requires manual restart; a new plugin must not kill that daemon or bind another endpoint.
+
 Remove `METHOD_SHUTDOWN` from the normal plugin client lifecycle. A plugin must never send a global shutdown command to a shared daemon.
 
-Daemon shutdown should be internal and occur only after:
+While `Running`, the daemon starts a generation-tagged idle timer when these activity predicates are zero:
 
-- no active connections;
+- no non-control sessions;
 - no project leases;
 - no queued or active commands;
 - no daemon-owned jobs;
-- idle timeout has elapsed.
+
+New activity invalidates the timer. On expiry, the daemon atomically rechecks the predicates and transitions to `AdmissionClosed`; otherwise it remains `Running`. A control-only connection is excluded from idle activity. `RequestDrain` returns `BUSY` without changing state when any predicate is nonzero, or sends `ACCEPTED` before closing the control connection and entering `AdmissionClosed`.
+
+After admission closes, the daemon drains admitted transactions, transitions all actors through `Draining` and `Closing`, joins their workers, removes the endpoint, and finally releases `daemon-lifetime.lock`. If new activity won admission before `AdmissionClosed`, shutdown is cancelled or waits for that activity; it cannot race a newly issued handle.
 
 A separate developer/admin command can request shutdown after authenticating the local control path.
 
 ## Protocol Plan
+
+### Transport-neutral state machine
+
+Both the preferred gRPC branch and framed-Protobuf fallback implement the same logical state machine:
+
+```text
+Connect
+  -> GetDaemonInfo
+  -> optional RequestDrain control operation
+  -> SessionHello
+  -> SessionReady
+  -> AcquireProject
+  -> zero or more correlated ProjectCall operations
+  -> optional CancelCall before transaction start
+  -> ReleaseProject
+  -> session close / heartbeat expiry releases remaining leases
+```
+
+The framed fallback uses a length-delimited `DaemonEnvelope` with protocol generation, daemon/session/lease IDs, opaque `call_id`, relative timeout, a `oneof` request/response body, and typed status. Its `oneof` includes generation-stable `get_daemon_info` and `request_drain` control variants as well as session/project calls. One reader task and one serialized writer task multiplex correlated calls; EOF is session close. It defines maximum buffered frames/bytes, backpressure, duplicate-call handling, cancellation acknowledgement, and daemon-instance replacement behavior. Session-fatal errors close the connection; project-call errors do not.
+
+The same lifecycle, retry, cancellation, overload, and crash tests run against whichever transport Phase 0 selects. Selecting framed Protobuf does not permit a reduced lease or safety model.
 
 ### Proto files
 
@@ -481,6 +600,8 @@ schema/opencode/memory/daemon/v1/daemon.proto   # daemon service and session/lea
 
 Use package `opencode.memory.daemon.v1` for the new service and import the existing `opencode.memory.v1` domain messages. A future breaking daemon service must use `opencode.memory.daemon.v2`; do not break the `v1` service in place.
 
+`GetDaemonInfo` and `RequestDrain` form a minimal frozen control surface that future daemon generations continue serving on the stable endpoint. If an older daemon predates that surface or a future transport cannot speak it, the only fallback is an explicit manual restart, never a second concurrent daemon.
+
 Proposed shape:
 
 ```proto
@@ -490,6 +611,7 @@ service MemoryDaemon {
   rpc AcquireProject(AcquireProjectRequest) returns (AcquireProjectResponse);
   rpc ProjectCall(ProjectCallRequest) returns (ProjectCallResponse);
   rpc ReleaseProject(ReleaseProjectRequest) returns (ReleaseProjectResponse);
+  rpc RequestDrain(RequestDrainRequest) returns (RequestDrainResponse);
 }
 
 message SessionControl {
@@ -534,6 +656,22 @@ message AcquireProjectRequest {
   EmbeddingIdentity embedding = 6;
 }
 
+message EmbeddingIdentity {
+  optional string local_model_path = 1;
+  string repository = 2;
+  string revision = 3;
+  string filename = 4;
+  string pooling = 5;
+  string attention = 6;
+  string query_template = 7;
+  string passage_template = 8;
+  bool add_bos = 9;
+  bool append_eos = 10;
+  bool normalize = 11;
+  optional uint32 dimension = 12;
+  uint32 context_size = 13;
+}
+
 message AcquireProjectResponse {
   string project_handle = 1;
   string lease_id = 2;
@@ -547,13 +685,29 @@ message ProjectCallRequest {
   string project_handle = 3;
   string lease_id = 4;
   string call_id = 5;
-  int64 deadline_unix_ms = 6;
+  uint32 timeout_ms = 6;
   opencode.memory.v1.Request request = 7;
 }
 
 message ProjectCallResponse {
   string call_id = 1;
   opencode.memory.v1.Response response = 2;
+}
+
+enum DrainOutcome {
+  DRAIN_OUTCOME_UNSPECIFIED = 0;
+  DRAIN_OUTCOME_ACCEPTED = 1;
+  DRAIN_OUTCOME_BUSY = 2;
+  DRAIN_OUTCOME_UNSUPPORTED = 3;
+}
+
+message RequestDrainRequest {
+  string expected_daemon_instance_id = 1;
+}
+
+message RequestDrainResponse {
+  DrainOutcome outcome = 1; // ACCEPTED, BUSY, or UNSUPPORTED
+  uint32 retry_after_ms = 2;
 }
 ```
 
@@ -562,12 +716,13 @@ The exact messages should be finalized during the gRPC spike. A generic unary `P
 ### Request semantics
 
 - Every logical request has an opaque `call_id`; transport request IDs must not be reused as durable operation identity.
-- Every engine call has an application deadline carried in the request envelope; the gRPC session stream itself must not be the only deadline boundary.
+- Every engine call has a relative timeout budget. On receipt, the server combines it with the unary gRPC deadline and converts the smaller budget to a server-monotonic deadline.
 - `AcquireProject` is idempotent per session, `StoreKey`, and configuration fingerprint.
 - `ReleaseProject` is idempotent.
 - Closing the session stream releases all its leases; heartbeat expiry provides crash cleanup.
 - A deadline is enforced before queue admission, while queued, and before the engine transaction begins.
-- A deadline or disconnect does not cancel a running non-cancellable engine operation unless cancellation is explicitly supported for that operation.
+- One cancellation token follows the request through admission, preparation, and the actor queue. Before transaction start it removes/tombstones queued work, stops preparation cooperatively, discards prepared output, and releases permits exactly once.
+- A deadline or disconnect does not cancel a running non-cancellable engine operation after its transaction begins. The actor finishes the transaction boundary and discards only the response.
 - A response for a disconnected client may be discarded after the engine reaches a transaction boundary.
 - Unknown methods and incompatible protocol versions fail explicitly.
 
@@ -618,8 +773,10 @@ The current schema contains `uint64`/`sint64`, while the current TypeScript clie
 - new daemon/session/lease/call identifiers use opaque strings or bytes, not JavaScript numbers;
 - generated TypeScript uses `bigint` for wire-level 64-bit fields where the domain contract requires full range;
 - conversion to the existing JSON-facing memory contract is allowed only for values within `Number.MAX_SAFE_INTEGER`;
-- values above the safe range are returned as decimal strings or rejected with a typed conversion error;
-- golden tests cover zero, `2^53 - 1`, values above `2^53`, explicit null versus absent `oneof`, unknown fields, and unknown enum values.
+- existing `Value.signed_value` and `Value.unsigned_value` outside the JavaScript safe-integer range are rejected with typed `OUT_OF_RANGE`; do not silently change the public value type to a decimal string;
+- generated messages use discriminated unions for `oneof`, and application-required bodies are rejected when absent;
+- unknown fields remain forward-compatible, while unknown method enum values are rejected explicitly;
+- golden tests cover zero, `2^53 - 1`, `2^53`, `2^53 + 1`, `INT64_MIN`, `INT64_MAX`, `UINT64_MAX`, explicit null versus absent `oneof`, unknown fields, and unknown enum values.
 
 Do not rely on the generator's default `Long`, `number`, or string behavior without testing the exact runtime used by the packaged OpenCode plugin.
 
@@ -669,13 +826,14 @@ Use this sequence:
 ```text
 1. Resolve the canonical daemon endpoint.
 2. Try connecting to the endpoint.
-3. If connected, negotiate protocol and use it.
-4. If connection fails because endpoint is absent, acquire daemon-start lock.
+3. If connected and healthy, negotiate protocol and use it.
+4. If the endpoint is absent, or present but the liveness probe fails, acquire daemon-start lock.
 5. Re-check the endpoint after acquiring the lock.
-6. If still absent, spawn the packaged daemon in --daemon mode.
-7. Wait for readiness with bounded backoff.
-8. Release the daemon-start lock.
-9. Connect, negotiate, open a session, and acquire the project lease.
+6. If a live daemon now exists, connect to it; do not spawn another.
+7. If the endpoint is still absent or is a same-user dead socket, spawn the packaged daemon in --daemon mode.
+8. Wait for readiness with bounded backoff.
+9. Release the daemon-start lock.
+10. Connect, negotiate, open a session, and acquire the project lease.
 ```
 
 The bootstrap lock is a user-level daemon-start lock, not the project `writer.lock`. It exists only to prevent several OpenCode processes from spawning several daemons at the same time.
@@ -697,6 +855,8 @@ The client must distinguish:
 - project configuration mismatch.
 
 Every error must state the next action, such as restarting the daemon, closing a legacy OpenCode process, or rebuilding the native package.
+
+The daemon owns stale-socket cleanup. After acquiring `daemon-lifetime.lock`, it uses non-following metadata checks to reject symlinks, foreign ownership, and wrong file types, re-probes the endpoint, and unlinks only a same-user dead socket before binding. A live incompatible endpoint is never unlinked.
 
 ### Pool behavior
 
@@ -758,11 +918,19 @@ Move durable jobs into the daemon:
 - queued/running/succeeded/failed state;
 - bounded queue capacity;
 - status visible to all clients;
-- cancellation only before execution starts;
+- cancellation before the first batch or between batches; already committed batches remain committed and are reported as progress;
 - durable recovery for jobs interrupted during an engine transaction;
 - coalescing of duplicate `index_documents` requests from multiple clients.
 
-The current `index_documents` call is one monolithic synchronous engine operation. Queue priority cannot preempt it after execution begins. Refactor indexing into bounded batches with actor yield points and deadline/cancellation checks between batches while preserving valid journal and manifest boundaries. Daemon-level `GetDaemonInfo` remains responsive independently of a busy project actor; project calls receive fairness only at defined batch boundaries.
+The current `index_documents` call is one monolithic synchronous engine operation. Queue priority cannot preempt it after execution begins. Refactor indexing into bounded batches with actor yield points and deadline/cancellation checks between batches while preserving valid journal and manifest boundaries.
+
+Each batch is capped by all of: document/chunk count, prepared bytes, and elapsed execution budget. Initial defaults are 4 documents, 64 chunks, 8 MiB prepared bytes, and a 100 ms soft execution target; hard configurable maxima are 16 documents, 256 chunks, and 32 MiB. A single non-cancellable model/zvec primitive may exceed the soft target, but no continuation starts without a deadline/cancellation/fairness check.
+
+A continuation is re-enqueued through a weighted/aging scheduler rather than executed immediately. Start with interactive weight 8 and indexing/maintenance weight 1, age a waiting command one priority step per second, and allow at most one consecutive indexing batch while an interactive command is queued. Under saturation, an interactive request waits at most the currently running non-cancellable transaction plus one indexing actor turn. Add a saturation test for that actor-turn bound and record elapsed p95/p99 latency rather than claiming an impossible hard wall-clock bound around llama.cpp/zvec.
+
+Cancellation after partial progress stops before the next batch and returns the committed document/chunk counts plus a resumable job state.
+
+Daemon-level `GetDaemonInfo` remains responsive independently of a busy project actor; project calls receive fairness only at defined batch boundaries.
 
 This should happen before enabling aggressive automatic indexing across many OpenCode processes.
 
@@ -813,7 +981,9 @@ Sharing only immutable model weights while keeping a serialized context per proj
 - Place the endpoint in an owner-only directory.
 - Set socket permissions to owner-only.
 - Verify endpoint ownership and liveness before removing a stale socket; only the daemon holding `daemon-lifetime.lock` may remove a dead socket.
-- Version 1 trusts processes running as the same OS user. Enforce owner-only directory/socket permissions and validate peer UID where the platform exposes it.
+- Version 1 trusts processes running as the same OS user. Enforce a `0700` runtime directory and `0600` socket.
+- On Linux, validate `SO_PEERCRED`; on macOS, validate `getpeereid` before parsing a session message. Fail closed if peer credentials cannot be obtained or do not match the daemon UID.
+- Use non-following metadata checks and reject symlinks, foreign ownership, wrong file type, or broader permissions.
 - Do not use a TCP listener, even on loopback, for the local daemon.
 - Do not bind to `0.0.0.0` or expose the daemon remotely.
 - Keep daemon logs off the protocol stream.
@@ -938,6 +1108,9 @@ Deliverables:
 - `ProjectActor` owning one `MemoryEngine`;
 - `AcquireProject`, `ProjectCall`, and `ReleaseProject` unary RPCs;
 - bounded message/session/actor/queue limits;
+- Tokio multi-thread control plane and bounded blocking/preparation pools;
+- daemon-wide CPU/GPU/model-load resource governor;
+- monotonic deadlines, end-to-end cancellation tokens, queue tombstoning, and RAII permit ownership;
 - actor open/ready/draining/closing/failed state machine;
 - old `writer.lock` retained.
 
@@ -948,7 +1121,10 @@ Exit criteria:
 - two configurations targeting one `StoreKey` produce a configuration mismatch without creating a second actor;
 - one `writer.lock` remains held by the daemon;
 - zero-lease actor eviction deterministically releases that lock and model;
-- `status`, `store`, `search`, `get`, and `list` work from both clients.
+- cancellation before transaction start removes or tombstones work and releases all byte/CPU/GPU/model permits exactly once;
+- cancellation after transaction start leaves permits with the actor until completion;
+- `status`, `store`, `search`, `get`, and `list` work from both clients;
+- independent project actors execute concurrently without blocking daemon health or session heartbeats.
 
 ### Phase 2: TypeScript daemon client
 
@@ -973,13 +1149,18 @@ Exit criteria:
 
 ### Phase 3: Concurrency, jobs, and observability
 
+Phase 1 already ships the baseline limits and governor needed for safe plugin traffic. This phase tunes them with load evidence, adds visibility, and expands them to durable jobs and cooperative indexing; it must not be the first point at which bounds are implemented.
+
 Deliverables:
 
+- multi-threaded Tokio control plane under load;
+- bounded discovery/extraction/hash preparation pool;
+- daemon-wide CPU/GPU/model-load resource governor;
 - project queue limits and fairness;
 - daemon metrics and structured diagnostics;
 - daemon-owned ingestion jobs and status;
 - duplicate index request coalescing;
-- cancellation semantics for queued work;
+- durable-job cancellation and partial-progress reporting between indexing batches;
 - bounded/batched document indexing with actor yields between batches;
 - mutation outcome receipts or an explicit outcome-query API before any automatic replay is considered;
 - crash recovery integration tests.
@@ -987,6 +1168,9 @@ Deliverables:
 Exit criteria:
 
 - simultaneous interactive requests do not corrupt state;
+- different projects make forward progress concurrently;
+- one project's blocking engine work does not block daemon I/O, health, or another project's actor;
+- resource limits prevent thread, queue, model-load, and GPU oversubscription;
 - daemon health remains responsive while a project actor is busy;
 - batched indexing gives interactive project calls defined fairness points;
 - job state is visible across OpenCode processes;
@@ -1029,17 +1213,22 @@ The plugin should not run a `postinstall` script to mutate user files. OpenCode 
 ### Unit tests
 
 - canonical `StoreKey` path aliases and separate configuration fingerprints;
+- deterministic fingerprint vectors for every embedding/preprocessing field;
 - daemon endpoint resolution and socket path length;
-- stale socket detection;
+- stale/live/foreign-owner/symlink/wrong-mode endpoint detection;
 - daemon-start and daemon-lifetime lock behavior;
 - lease idempotency;
+- idle-timer generation invalidation and admission-versus-drain races;
 - session hello/ready state machine, heartbeat expiry, and connection cleanup;
 - protocol version negotiation;
 - Protobuf 64-bit IDs and `oneof` values;
 - queue capacity and ordering;
+- CPU/GPU/model-load permit accounting and release after cancellation/panic;
+- actor/preparation-pool admission limits;
 - deadline-before-admission and deadline-before-execution behavior;
 - retry-safe versus non-retry-safe disconnect behavior;
 - daemon version mismatch.
+- `RequestDrain` accepted/busy/unsupported outcomes.
 
 ### Rust integration tests
 
@@ -1048,6 +1237,9 @@ The plugin should not run a `postinstall` script to mutate user files. OpenCode 
 - same store with a different model fingerprint is rejected before another engine open;
 - second client joins without a second `MemoryEngine` or model load;
 - both clients execute reads and writes safely;
+- independent project actors execute in parallel;
+- preparation tasks overlap while one project's commit operations remain ordered;
+- blocking engine work never runs on Tokio core threads;
 - client A disconnects while client B continues;
 - actor eviction drops the engine and allows a clean later reopen;
 - daemon exits idle only after all work completes;
@@ -1063,6 +1255,7 @@ The plugin should not run a `postinstall` script to mutate user files. OpenCode 
 - two plugin instances in separate OS processes share one endpoint;
 - `dispose()` releases a lease but does not send global shutdown;
 - request timeout does not kill another client's operation;
+- heartbeats and daemon health remain responsive during blocking project work;
 - reconnect creates a new session, reacquires the project lease, and does not resume old calls;
 - plugin request API remains compatible with current tools;
 - no MCP process is spawned on the direct plugin path.
@@ -1072,10 +1265,12 @@ The plugin should not run a `postinstall` script to mutate user files. OpenCode 
 - install each supported optional native package;
 - start the packaged daemon from the installed path;
 - connect through the packaged TypeScript client;
+- verify peer UID before the first session message and fail closed on credential failure;
 - verify zvec shared-library resolution after detaching from the plugin cwd;
 - run two independent OpenCode-like processes against one temporary project;
 - verify only one model/engine open through daemon diagnostics;
 - verify daemon idle shutdown and restart.
+- run the complete lifecycle/retry suite against the selected transport branch.
 
 ### Performance tests
 
@@ -1085,6 +1280,9 @@ Measure before and after:
 - warm status latency;
 - p50/p95 search latency with one client;
 - p50/p95 search latency with two and four clients;
+- throughput and tail latency across two and four independent projects;
+- Tokio scheduler latency while project actors run blocking operations;
+- preparation-pool scaling by worker count;
 - queue wait under document indexing;
 - resident memory for one project and multiple projects;
 - GPU/unified-memory usage where Metal is enabled;
@@ -1107,6 +1305,9 @@ The migration is complete when all of the following are true:
 11. MCP remains an optional future adapter and is not required for installation or normal memory operation.
 12. A transport failure never automatically replays a mutation with an ambiguous outcome.
 13. Actor eviction and daemon drain release models, threads, collections, sockets, and writer locks deterministically.
+14. Independent projects execute concurrently, while one physical store retains one ordered engine transaction lane.
+15. Blocking engine work never stalls IPC, session heartbeat, lease expiry, or daemon health handling.
+16. Resource governance prevents unbounded tasks, threads, queues, model loads, and CPU/GPU oversubscription.
 
 ## Risks and Mitigations
 
@@ -1119,6 +1320,8 @@ The migration is complete when all of the following are true:
 | Daemon crash during zvec/state update     | Inconsistent storage                             | Preserve current journals and add kill-point integration tests       |
 | Different config for same physical store  | Wrong model or incompatible vectors              | Actor key is `StoreKey`; validate a separate fingerprint             |
 | gRPC runtime/package size                 | Larger install or platform incompatibility       | Phase 0 spike; retain framed-Protobuf fallback                       |
+| Async/blocking boundary violation         | IPC stalls or Tokio worker starvation            | Thread-affine engine workers; no blocking work on runtime core       |
+| CPU/GPU oversubscription                  | Latency spikes or out-of-memory failure          | Weighted semaphores and daemon-wide thread/model budgets             |
 | Unsafe local endpoint                     | Another OS user reads/writes memory              | Owner-only runtime directory/socket and peer-UID validation          |
 | Future MCP duplication                    | Duplicate tools in OpenCode                      | Keep MCP optional and separate from direct plugin tools              |
 | Model memory remains high across projects | RAM/VRAM still scales with active projects       | Measure first; implement model registry only as a later optimization |
@@ -1133,8 +1336,9 @@ The migration is complete when all of the following are true:
 - `src/storage/zvec.rs`: retain writer lock; improve daemon-neutral diagnostics if needed.
 - `src/config.rs`: expose canonical project/data identity and daemon-safe config construction.
 - `src/embedding.rs`: no first-phase model sharing refactor; add load diagnostics if needed.
+- `Cargo.toml`: enable the selected Tokio runtime/network features and add pinned IPC dependencies.
 - `build.rs`: add selected IPC service code generation if required by the spike.
-- new `src/daemon/*`: endpoint, bootstrap, registry, actor, connection, and service boundaries.
+- new `src/daemon/*`: endpoint, bootstrap, registry, actor, connection, governor, preparation, and service boundaries.
 
 ### TypeScript
 
@@ -1148,14 +1352,29 @@ The migration is complete when all of the following are true:
 
 ### Schema and tests
 
-- `schema/opencode/memory/v1/memory.proto`: preserve existing field numbers and methods.
-- `schema/opencode/memory/daemon/v1/daemon.proto`: add daemon lifecycle and project lease messages.
-- `buf.yaml`: add lint/breaking configuration for the new service schema.
-- `opencode-memory/src/generated/*`: regenerate and check in TypeScript bindings.
+Protocol tree:
+
+```text
+schema/opencode/memory/
+  v1/
+    memory.proto              # existing domain contract
+  daemon/
+    v1/
+      daemon.proto           # daemon/session/lease service
+```
+
+Protocol generation and verification:
+
+- `buf.yaml`: add lint/breaking configuration for the daemon service.
+- `build.rs`: generate the Rust service bindings when required by the selected transport.
+- `opencode-memory/src/generated/`: regenerate and check in TypeScript bindings.
+
+Tests and CI:
+
 - `opencode-memory/src/sidecar-client.test.ts`: migrate lifecycle tests to daemon connection semantics.
 - `opencode-memory/src/protocol.test.ts`: add daemon envelopes and generated service tests.
-- new Rust daemon integration tests under `tests/`.
-- new multi-process black-box test scripts under `scripts/` or `tests/`.
+- `tests/`: add Rust daemon integration tests.
+- `scripts/` or `tests/`: add multi-process black-box tests.
 - `.github/workflows/ci.yml`: run daemon startup, same-project concurrency, and packaging tests.
 
 ## References
