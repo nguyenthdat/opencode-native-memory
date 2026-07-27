@@ -332,5 +332,3 @@ npm/*/notices/
 # End of https://www.toptal.com/developers/gitignore/api/rust,node,python
 .qdrant/
 .cloakbrowser-artifacts/
-!/dist/
-!/dist/**
