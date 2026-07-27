@@ -18,7 +18,7 @@ import {
   MEMORY_TAXONOMIES,
   RETRIEVAL_MODES,
 } from "./contracts.js";
-import { acquireNativeMemoryClient } from "./sidecar-client.js";
+import { acquireNativeMemoryClient } from "./daemon-client.js";
 import {
   COMPACTION_CONTEXT,
   formatRecalledMemories,
@@ -152,6 +152,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
       dispose: async () => {
         if (documentSyncTimer) clearTimeout(documentSyncTimer);
         await ingestJobs.dispose();
+        if (sharedSync) await sharedSync.catch(() => undefined);
         if (documentSync) await documentSync.catch(() => undefined);
         for (const sessID of session.pendingRecall.keys()) session.discardPendingRecall(sessID);
         session.latestQuery.clear();

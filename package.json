@@ -1,7 +1,7 @@
 {
   "name": "@nguyenthdat/opencode-memory",
-  "version": "0.5.1",
-  "description": "Local-first persistent memory for OpenCode with a Rust, zvec, and llama.cpp sidecar",
+  "version": "0.6.0-beta.0",
+  "description": "Local-first persistent memory for OpenCode with a shared Rust daemon, zvec, and llama.cpp",
   "type": "module",
   "packageManager": "bun@1.3.14",
   "engines": {
@@ -23,7 +23,7 @@
   },
   "files": [
     "dist",
-    "rules/flow.md",
+    "rules/native-memory.md",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
@@ -31,8 +31,8 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "generate:protocol": "protoc --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --es_out=opencode-memory/src/generated --es_opt=target=ts,import_extension=js -I schema schema/opencode/memory/v1/memory.proto",
-    "generate:protocol:check": "bun run generate:protocol && git diff --exit-code -- opencode-memory/src/generated",
+    "generate:protocol": "protoc --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --es_out=opencode-memory/src/generated --es_opt=target=ts,import_extension=js -I schema schema/opencode/memory/v1/memory.proto schema/opencode/memory/daemon/v1/daemon.proto",
+    "generate:protocol:check": "bun scripts/check-generated-protocol.ts",
     "lint:proto": "buf lint",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:ts": "tsc -p tsconfig.build.json",
@@ -59,9 +59,9 @@
     "@opencode-ai/plugin": ">=1.18.4 <2"
   },
   "optionalDependencies": {
-    "@nguyenthdat/opencode-memory-darwin-arm64": "0.5.1",
-    "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.5.1",
-    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.5.1"
+    "@nguyenthdat/opencode-memory-darwin-arm64": "0.6.0-beta.0",
+    "@nguyenthdat/opencode-memory-linux-arm64-gnu": "0.6.0-beta.0",
+    "@nguyenthdat/opencode-memory-linux-x64-gnu": "0.6.0-beta.0"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.4",

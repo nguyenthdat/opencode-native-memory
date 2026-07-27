@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { DaemonOutcomeUnknownError } from "./daemon-client.js";
 
 export const BACKGROUND_JOB_ID_PATTERN = /^job_[0-9a-f]{32}$/;
 
@@ -22,6 +23,12 @@ export type BackgroundJob<TInput extends object, TResult> =
       readonly status: "failed";
       readonly completed_at_ms: number;
       readonly error: string;
+    })
+  | (BackgroundJobBase<TInput> & {
+      readonly status: "outcome_unknown";
+      readonly completed_at_ms: number;
+      readonly error: string;
+      readonly call_id: string;
     });
 
 export interface BackgroundJobQueueOptions {
@@ -136,7 +143,9 @@ export class BackgroundJobQueue<TInput extends object, TResult> {
     const expiresBefore = this.now() - this.terminalRetentionMs;
     for (const [jobID, job] of this.jobs) {
       if (
-        (job.status === "succeeded" || job.status === "failed") &&
+        (job.status === "succeeded" ||
+          job.status === "failed" ||
+          job.status === "outcome_unknown") &&
         job.completed_at_ms <= expiresBefore
       ) {
         this.jobs.delete(jobID);
@@ -150,7 +159,9 @@ export class BackgroundJobQueue<TInput extends object, TResult> {
     let oldestCreated = Number.POSITIVE_INFINITY;
     for (const [jobID, job] of this.jobs) {
       if (
-        (job.status === "succeeded" || job.status === "failed") &&
+        (job.status === "succeeded" ||
+          job.status === "failed" ||
+          job.status === "outcome_unknown") &&
         job.created_at_ms < oldestCreated
       ) {
         oldest = jobID;
@@ -197,14 +208,26 @@ export class BackgroundJobQueue<TInput extends object, TResult> {
         }
       } catch (error) {
         if (!this.disposed) {
-          this.jobs.set(pending.job_id, {
-            job_id: pending.job_id,
-            input: pending.input,
-            created_at_ms: pending.created_at_ms,
-            completed_at_ms: this.now(),
-            status: "failed",
-            error: error instanceof Error ? error.message : String(error),
-          });
+          if (isOutcomeUnknown(error)) {
+            this.jobs.set(pending.job_id, {
+              job_id: pending.job_id,
+              input: pending.input,
+              created_at_ms: pending.created_at_ms,
+              completed_at_ms: this.now(),
+              status: "outcome_unknown",
+              error: error.message,
+              call_id: error.callId,
+            });
+          } else {
+            this.jobs.set(pending.job_id, {
+              job_id: pending.job_id,
+              input: pending.input,
+              created_at_ms: pending.created_at_ms,
+              completed_at_ms: this.now(),
+              status: "failed",
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
       } finally {
         pending.controller = undefined;
@@ -212,4 +235,15 @@ export class BackgroundJobQueue<TInput extends object, TResult> {
       }
     }
   }
+}
+
+function isOutcomeUnknown(error: unknown): error is DaemonOutcomeUnknownError {
+  return (
+    error instanceof DaemonOutcomeUnknownError ||
+    (error instanceof Error &&
+      "code" in error &&
+      error.code === "OUTCOME_UNKNOWN" &&
+      "callId" in error &&
+      typeof error.callId === "string")
+  );
 }

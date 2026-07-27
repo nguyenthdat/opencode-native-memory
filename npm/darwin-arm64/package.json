@@ -1,7 +1,7 @@
 {
   "name": "@nguyenthdat/opencode-memory-darwin-arm64",
-  "version": "0.5.1",
-  "description": "Native OpenCode memory sidecar for macOS ARM64",
+  "version": "0.6.0-beta.0",
+  "description": "Shared native OpenCode memory daemon for macOS ARM64",
   "os": [
     "darwin"
   ],

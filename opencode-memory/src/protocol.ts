@@ -7,7 +7,7 @@ import {
   ValueObjectSchema,
   ValueSchema,
 } from "./generated/opencode/memory/v1/memory_pb.js";
-import type { Response, Value } from "./generated/opencode/memory/v1/memory_pb.js";
+import type { Request, Response, Value } from "./generated/opencode/memory/v1/memory_pb.js";
 import type { RpcResponse } from "./contracts.js";
 
 const MAX_VALUE_DEPTH = 64;
@@ -39,6 +39,10 @@ const METHODS = {
 export type MemoryMethod = keyof typeof METHODS;
 
 export function encodeRequest(id: number, method: string, params: unknown): Uint8Array {
+  return encodeDelimited(toBinary(RequestSchema, createMemoryRequest(id, method, params)));
+}
+
+export function createMemoryRequest(id: number, method: string, params: unknown): Request {
   if (!Number.isSafeInteger(id) || id <= 0) {
     throw new Error(`Invalid memory request ID: ${id}`);
   }
@@ -46,16 +50,18 @@ export function encodeRequest(id: number, method: string, params: unknown): Uint
   if (methodValue === undefined) {
     throw new Error(`Unknown memory method: ${method}`);
   }
-  const request = create(RequestSchema, {
+  return create(RequestSchema, {
     id: BigInt(id),
     method: methodValue,
     params: encodeValue(params, 0),
   });
-  return encodeDelimited(toBinary(RequestSchema, request));
 }
 
 export function decodeResponse(payload: Uint8Array): RpcResponse {
-  const response: Response = fromBinary(ResponseSchema, payload);
+  return decodeMemoryResponse(fromBinary(ResponseSchema, payload));
+}
+
+export function decodeMemoryResponse(response: Response): RpcResponse {
   const id = safeNumber(response.id, "response ID");
   return {
     id,
@@ -115,6 +121,9 @@ function encodeValue(input: unknown, depth: number): Value {
     });
   }
   if (typeof input === "bigint") {
+    if (input < BigInt(Number.MIN_SAFE_INTEGER) || input > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("Memory request contains an integer outside the JavaScript safe range");
+    }
     return create(ValueSchema, {
       kind:
         input >= 0n
@@ -125,6 +134,9 @@ function encodeValue(input: unknown, depth: number): Value {
   if (typeof input === "number") {
     if (!Number.isFinite(input)) {
       throw new Error("Memory request contains a non-finite number");
+    }
+    if (Number.isInteger(input) && !Number.isSafeInteger(input)) {
+      throw new Error("Memory request contains an integer outside the JavaScript safe range");
     }
     if (Number.isSafeInteger(input)) {
       return create(ValueSchema, {
@@ -203,7 +215,7 @@ function safeNumber(value: bigint, label: string): number {
   return number;
 }
 
-function encodeDelimited(payload: Uint8Array): Uint8Array {
+export function encodeDelimited(payload: Uint8Array): Uint8Array {
   const header = encodeVarint(payload.byteLength);
   const frame = new Uint8Array(header.byteLength + payload.byteLength);
   frame.set(header);

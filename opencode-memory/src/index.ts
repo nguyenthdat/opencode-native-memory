@@ -36,18 +36,36 @@ export type {
   SharedSyncResponse,
 } from "./contracts.js";
 
-// Sidecar client
+// Shared daemon client
 export {
   NativeMemoryClient,
+  NativeMemoryClientPool,
+  DaemonOutcomeUnknownError,
+  DaemonRpcError,
+  probeNativeMemoryDaemon,
+  resolveDaemonEndpoint,
   resolveNativeMemoryBinary,
   REQUEST_TIMEOUT_MS,
   INITIALIZATION_TIMEOUT_MS,
   MAX_REQUEST_BYTES,
   MAX_RESPONSE_BYTES,
-} from "./sidecar-client.js";
-export type { SpawnFn } from "./sidecar-client.js";
+} from "./daemon-client.js";
+export type {
+  DaemonClientInfo,
+  DaemonControlInfo,
+  NativeMemoryClientLease,
+  NativeMemoryRequester,
+  SpawnFn,
+} from "./daemon-client.js";
 
-export { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";
+export {
+  createMemoryRequest,
+  decodeMemoryResponse,
+  decodeResponse,
+  DelimitedFrameDecoder,
+  encodeDelimited,
+  encodeRequest,
+} from "./protocol.js";
 export type { MemoryMethod } from "./protocol.js";
 
 // Plugin factory

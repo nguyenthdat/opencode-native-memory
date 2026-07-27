@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -69,7 +69,7 @@ jobs:
       - name: Validate versions
         run: bun run versions:check
 
-      - name: Build native sidecar
+      - name: Build native daemon
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_features }}
 
       - name: Stage native npm package
@@ -143,14 +143,15 @@ jobs:
           test "$RELEASE_TAG" = "v$VERSION"
 
       - name: Build and test umbrella package
-        run: bun run build && bun run test:ts && bun run pack:check
+        run: bun run generate:protocol:check && bun run build && bun run test:ts && bun run pack:check
 
       - name: Publish native packages with provenance
         run: |
+          VERSION=$(node -p "require('./package.json').version")
+          NPM_TAG=$(node -p "require('./package.json').version.includes('-') ? 'beta' : 'latest'")
           for TARBALL in artifacts/*.tgz; do
             PACKAGE=$(tar -xOf "$TARBALL" package/package.json | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).name))')
-            VERSION=$(node -p "require('./package.json').version")
-            npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "./$TARBALL" --access public --provenance
+            npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "./$TARBALL" --access public --provenance --tag "$NPM_TAG"
           done
 
       - name: Pack and publish umbrella package
@@ -160,7 +161,8 @@ jobs:
           TARBALL=$(node -e "process.stdout.write(require('./npm-pack.json')[0].filename)")
           VERSION=$(node -p "require('./package.json').version")
           PACKAGE=$(node -p "require('./package.json').name")
-          npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "./$TARBALL" --access public --provenance
+          NPM_TAG=$(node -p "require('./package.json').version.includes('-') ? 'beta' : 'latest'")
+          npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1 || npm publish "./$TARBALL" --access public --provenance --tag "$NPM_TAG"
           sha256sum "$TARBALL" > "$TARBALL.sha256"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
 

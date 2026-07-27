@@ -21,7 +21,7 @@ describe("memory instructions", () => {
 
     const asset = await loadMemoryInstructions(root);
 
-    expect(asset.path).toBe(await realpath(join(root, "rules", "flow.md")));
+    expect(asset.path).toBe(await realpath(join(root, "rules", "native-memory.md")));
     expect(asset.content).toContain(MEMORY_INSTRUCTIONS_MARKER);
   });
 
@@ -66,7 +66,7 @@ describe("memory instructions", () => {
 async function createRoot(content = `${MEMORY_INSTRUCTIONS_MARKER}\n# Test\n`): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "opencode-memory-instructions-"));
   roots.push(root);
-  const path = join(root, "rules", "flow.md");
+  const path = join(root, "rules", "native-memory.md");
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, content);
   return root;

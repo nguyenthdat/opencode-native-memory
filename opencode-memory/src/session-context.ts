@@ -1,6 +1,6 @@
 import type { PendingRecall, SearchResponse } from "./contracts.js";
 import { FEEDBACK_EVENTS, WRITABLE_MEMORY_SCOPES } from "./contracts.js";
-import type { NativeMemoryClient } from "./sidecar-client.js";
+import type { NativeMemoryRequester } from "./daemon-client.js";
 
 export class SessionContext {
   readonly latestQuery = new Map<string, { query: string; agent: string | undefined }>();
@@ -18,7 +18,7 @@ export class SessionContext {
   >();
 
   constructor(
-    private readonly native: NativeMemoryClient,
+    private readonly native: NativeMemoryRequester,
     private readonly getSessionAPI: (
       path: { id: string },
       query: { directory: string },

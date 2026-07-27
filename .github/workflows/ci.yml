@@ -99,7 +99,7 @@ jobs:
       - name: Test Rust with Metal
         run: cargo test --locked --lib --features metal
 
-      - name: Build macOS native sidecar with Metal
+      - name: Build macOS native daemon with Metal
         run: cargo build --release --locked --target aarch64-apple-darwin --features metal
 
   dependency-review:

@@ -1,0 +1,1132 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  stat,
+  unlink,
+  type FileHandle,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { createConnection, type Socket } from "node:net";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import {
+  AcquireProjectRequestSchema,
+  CancelCallRequestSchema,
+  CancelOutcome,
+  DaemonRequestSchema,
+  DaemonResponseSchema,
+  DaemonStatusCode,
+  EmbeddingIdentitySchema,
+  GetDaemonInfoRequestSchema,
+  OpenSessionRequestSchema,
+  ProjectCallRequestSchema,
+  ReleaseProjectRequestSchema,
+  SessionHeartbeatRequestSchema,
+} from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
+import type {
+  AcquireProjectResponse,
+  DaemonRequest as DaemonRequestMessage,
+  DaemonResponse,
+  GetDaemonInfoResponse,
+  OpenSessionResponse,
+} from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
+import type { Response as MemoryResponse } from "./generated/opencode/memory/v1/memory_pb.js";
+import {
+  NativeMemoryClient as LegacySidecarClient,
+  resolveNativeMemoryBinary,
+} from "./sidecar-client.js";
+import type { SpawnFn } from "./sidecar-client.js";
+import {
+  createMemoryRequest,
+  decodeMemoryResponse,
+  DelimitedFrameDecoder,
+  encodeDelimited,
+} from "./protocol.js";
+import type { MemoryMethod } from "./protocol.js";
+
+const MiB = 1024 * 1024;
+const DEFAULT_REQUEST_TIMEOUT_MS = 300_000;
+const MAX_REQUEST_TIMEOUT_MS = 2 * 60 * 60_000;
+const MIN_REQUEST_TIMEOUT_MS = 1_000;
+const CONNECT_TIMEOUT_MS = 5_000;
+const STARTUP_TIMEOUT_MS = 15_000;
+const START_LOCK_STALE_MS = 30_000;
+const START_LOCK_TIMEOUT_MS = START_LOCK_STALE_MS + STARTUP_TIMEOUT_MS;
+const DAEMON_PROTOCOL_GENERATION = 1;
+const DOMAIN_SCHEMA_GENERATION = 1;
+
+export const MAX_REQUEST_BYTES = 32 * MiB;
+export const MAX_RESPONSE_BYTES = 32 * MiB;
+export const REQUEST_TIMEOUT_MS = configuredRequestTimeoutMs();
+export const INITIALIZATION_TIMEOUT_MS = Math.max(REQUEST_TIMEOUT_MS, 30 * 60_000);
+
+const RETRY_SAFE_METHODS = new Set<MemoryMethod>(["get", "list", "status", "doctor", "export"]);
+
+export interface NativeMemoryRequester {
+  request<T>(method: MemoryMethod, params?: unknown, signal?: AbortSignal): Promise<T>;
+}
+
+interface MemoryClientDelegate extends NativeMemoryRequester {
+  dispose(): Promise<void>;
+}
+
+interface PendingDaemonRequest {
+  resolve(response: DaemonResponse): void;
+  reject(error: Error): void;
+  timer: ReturnType<typeof setTimeout>;
+  generation: number;
+}
+
+interface ReadyProject {
+  daemon: GetDaemonInfoResponse;
+  session: OpenSessionResponse;
+  project: AcquireProjectResponse;
+  generation: number;
+}
+
+export interface DaemonClientInfo {
+  readonly endpoint: string;
+  readonly daemonInstanceId: string;
+  readonly daemonVersion: string;
+  readonly pid: number;
+  readonly sessionId: string;
+  readonly projectHandle: string;
+  readonly canonicalProjectId: string;
+  readonly storeKeyHash: string;
+  readonly capabilities: readonly string[];
+}
+
+export type DaemonControlInfo = Pick<
+  GetDaemonInfoResponse,
+  | "daemonInstanceId"
+  | "daemonVersion"
+  | "minimumProtocolGeneration"
+  | "maximumProtocolGeneration"
+  | "domainSchemaGeneration"
+  | "capabilities"
+  | "pid"
+>;
+
+export class DaemonRpcError extends Error {
+  readonly name = "DaemonRpcError";
+
+  constructor(
+    message: string,
+    readonly code: DaemonStatusCode,
+    readonly retryAfterMs = 0,
+  ) {
+    super(message);
+  }
+}
+
+export class DaemonOutcomeUnknownError extends Error {
+  readonly name = "DaemonOutcomeUnknownError";
+  readonly code = "OUTCOME_UNKNOWN";
+
+  constructor(
+    message: string,
+    readonly callId: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
+
+class DaemonTransportError extends Error {
+  readonly name = "DaemonTransportError";
+}
+
+class NativeMemoryOperationError extends Error {
+  readonly name = "NativeMemoryOperationError";
+}
+
+class DaemonProjectClient implements MemoryClientDelegate {
+  private socket: Socket | undefined;
+  private generation = 0;
+  private ready: ReadyProject | undefined;
+  private connecting: Promise<ReadyProject> | undefined;
+  private disposed = false;
+  private disposePromise: Promise<void> | undefined;
+  private readonly lifecycle = new AbortController();
+  private activeRequests = 0;
+  private activeRequestWaiters: Array<() => void> = [];
+  private nextMemoryId = 1;
+  private pending = new Map<string, PendingDaemonRequest>();
+  private heartbeat: ReturnType<typeof setInterval> | undefined;
+  private heartbeatInFlight = false;
+  readonly endpoint = resolveDaemonEndpoint();
+
+  constructor(
+    private readonly root: string,
+    private readonly worktree: string,
+    private readonly requestTimeoutMs: number,
+  ) {}
+
+  async request<T>(method: MemoryMethod, params: unknown = {}, signal?: AbortSignal): Promise<T> {
+    if (this.disposed) throw new Error("Native memory client is disposed");
+    if (method === "shutdown") {
+      throw new Error("Shared native memory clients cannot shut down the user daemon");
+    }
+    if (signal?.aborted) throw new Error("Native memory request was cancelled");
+    const requestSignal = signal
+      ? AbortSignal.any([signal, this.lifecycle.signal])
+      : this.lifecycle.signal;
+    this.activeRequests += 1;
+
+    try {
+      const callId = randomUUID();
+      const isRetrySafe = RETRY_SAFE_METHODS.has(method);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        let dispatched = false;
+        let ready: ReadyProject | undefined;
+        try {
+          ready = await this.ensureProject(requestSignal);
+          if (this.disposed || requestSignal.aborted) {
+            throw new DaemonRpcError(
+              "Native memory request was cancelled",
+              DaemonStatusCode.CANCELLED,
+            );
+          }
+          const requestId = this.nextMemoryId++;
+          const memoryRequest = createMemoryRequest(requestId, method, params);
+          const body = create(ProjectCallRequestSchema, {
+            daemonInstanceId: ready.daemon.daemonInstanceId,
+            sessionId: ready.session.sessionId,
+            projectHandle: ready.project.projectHandle,
+            leaseId: ready.project.leaseId,
+            callId,
+            timeoutMs: this.requestTimeoutMs,
+            request: memoryRequest,
+          });
+          const pending = this.send(
+            { case: "projectCall", value: body },
+            this.requestTimeoutMs,
+            requestSignal,
+          );
+          dispatched = true;
+          const response = await pending;
+          if (response.body.case !== "projectCall") {
+            throw new Error("Native memory daemon returned the wrong project call response");
+          }
+          if (response.body.value.callId !== callId) {
+            throw new Error("Native memory daemon returned a mismatched call ID");
+          }
+          const memoryResponse = response.body.value.response;
+          if (!memoryResponse) {
+            throw new Error("Native memory daemon omitted the memory response");
+          }
+          if (memoryResponse.id !== BigInt(requestId)) {
+            throw new Error("Native memory daemon returned a mismatched domain response ID");
+          }
+          return this.unwrapMemoryResponse<T>(memoryResponse);
+        } catch (error) {
+          const failure = asError(error);
+          const retryableTransport = failure instanceof DaemonTransportError;
+          let rejectedBeforeAdmission = isDefinitePreAdmissionFailure(failure);
+          if (
+            dispatched &&
+            ready &&
+            failure instanceof DaemonRpcError &&
+            [DaemonStatusCode.CANCELLED, DaemonStatusCode.DEADLINE_EXCEEDED].includes(failure.code)
+          ) {
+            const cancelOutcome = await this.cancelProjectCall(ready, callId).catch(
+              () => undefined,
+            );
+            rejectedBeforeAdmission = cancelOutcome === CancelOutcome.CANCELLED_BEFORE_START;
+          }
+          if (
+            ready &&
+            failure instanceof DaemonRpcError &&
+            [DaemonStatusCode.INTERNAL, DaemonStatusCode.OUTCOME_UNKNOWN].includes(failure.code)
+          ) {
+            this.invalidateConnection(ready.generation);
+          }
+          const reconnectRequired = isReconnectRequiredFailure(failure);
+          const shouldReconnect = retryableTransport || reconnectRequired;
+          if (shouldReconnect) this.invalidateConnection(ready?.generation ?? this.generation);
+          if (
+            attempt === 0 &&
+            !requestSignal.aborted &&
+            (retryableTransport
+              ? isRetrySafe || !dispatched
+              : reconnectRequired || (!dispatched && isRetryableSetupFailure(failure)))
+          ) {
+            continue;
+          }
+          const ambiguousMutation =
+            !rejectedBeforeAdmission &&
+            (isAmbiguousFailure(failure) || !(failure instanceof NativeMemoryOperationError));
+          if (!isRetrySafe && dispatched && ambiguousMutation) {
+            throw new DaemonOutcomeUnknownError(
+              `Native memory ${method} may have committed before its response was lost (call_id=${callId})`,
+              callId,
+              { cause: failure },
+            );
+          }
+          throw failure;
+        }
+      }
+      throw new Error("Native memory daemon reconnect retry limit was exhausted");
+    } finally {
+      this.activeRequests -= 1;
+      if (this.activeRequests === 0) {
+        for (const resolveWaiter of this.activeRequestWaiters.splice(0)) resolveWaiter();
+      }
+    }
+  }
+
+  async info(): Promise<DaemonClientInfo> {
+    const ready = await this.ensureProject();
+    return {
+      endpoint: this.endpoint,
+      daemonInstanceId: ready.daemon.daemonInstanceId,
+      daemonVersion: ready.daemon.daemonVersion,
+      pid: ready.daemon.pid,
+      sessionId: ready.session.sessionId,
+      projectHandle: ready.project.projectHandle,
+      canonicalProjectId: ready.project.canonicalProjectId,
+      storeKeyHash: ready.project.storeKeyHash,
+      capabilities: [...ready.daemon.capabilities],
+    };
+  }
+
+  async probe(): Promise<DaemonControlInfo> {
+    try {
+      await this.connectTransport();
+      const response = await this.send(
+        { case: "getDaemonInfo", value: create(GetDaemonInfoRequestSchema) },
+        CONNECT_TIMEOUT_MS,
+      );
+      if (response.body.case !== "getDaemonInfo") {
+        throw new Error("Native memory daemon omitted GetDaemonInfo");
+      }
+      const hello = create(OpenSessionRequestSchema, {
+        clientInstanceId: randomUUID(),
+        minimumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
+        maximumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
+        domainSchemaGeneration: DOMAIN_SCHEMA_GENERATION,
+        pluginVersion: process.env.npm_package_version ?? "development",
+      });
+      const session = await this.send({ case: "openSession", value: hello }, CONNECT_TIMEOUT_MS);
+      if (session.body.case !== "openSession") {
+        throw new Error("Native memory daemon omitted OpenSession during control probe");
+      }
+      return response.body.value;
+    } finally {
+      await this.dispose();
+    }
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposePromise) return await this.disposePromise;
+    this.disposePromise = this.disposeOnce();
+    return await this.disposePromise;
+  }
+
+  private async disposeOnce(): Promise<void> {
+    this.disposed = true;
+    this.lifecycle.abort();
+    this.stopHeartbeat();
+    if (this.activeRequests > 0) {
+      await new Promise<void>((resolveWaiter) => this.activeRequestWaiters.push(resolveWaiter));
+    }
+    const ready = this.ready;
+    if (ready && this.socket && !this.socket.destroyed) {
+      const release = create(ReleaseProjectRequestSchema, {
+        daemonInstanceId: ready.daemon.daemonInstanceId,
+        sessionId: ready.session.sessionId,
+        projectHandle: ready.project.projectHandle,
+        leaseId: ready.project.leaseId,
+      });
+      try {
+        await this.send({ case: "releaseProject", value: release }, CONNECT_TIMEOUT_MS);
+      } catch {
+        // Closing the session connection also releases every remaining lease.
+      }
+    }
+    this.ready = undefined;
+    this.connecting = undefined;
+    const socket = this.socket;
+    this.socket = undefined;
+    if (socket && !socket.destroyed) {
+      socket.end();
+      socket.destroy();
+    }
+    this.rejectPending(new DaemonTransportError("Native memory daemon connection closed"));
+  }
+
+  private async ensureProject(signal?: AbortSignal): Promise<ReadyProject> {
+    if (this.disposed) throw new Error("Native memory client is disposed");
+    if (this.ready && this.socket && !this.socket.destroyed) return this.ready;
+    if (!this.connecting) {
+      const connecting = this.connectAndAcquire();
+      this.connecting = connecting;
+      void connecting
+        .catch(() => {
+          if (this.connecting === connecting) this.invalidateConnection(this.generation);
+        })
+        .finally(() => {
+          if (this.connecting === connecting) this.connecting = undefined;
+        });
+    }
+    const connecting = this.connecting!;
+    const ready = await waitForPromise(connecting, signal);
+    if (this.disposed) {
+      this.invalidateConnection(ready.generation);
+      throw new Error("Native memory client is disposed");
+    }
+    if (ready.generation !== this.generation || !this.socket || this.socket.destroyed) {
+      throw new DaemonTransportError("Native memory daemon setup was superseded");
+    }
+    this.ready = ready;
+    return ready;
+  }
+
+  private async connectAndAcquire(): Promise<ReadyProject> {
+    await this.connectTransport();
+    const generation = this.generation;
+
+    const infoResponse = await this.send(
+      { case: "getDaemonInfo", value: create(GetDaemonInfoRequestSchema) },
+      CONNECT_TIMEOUT_MS,
+    );
+    if (infoResponse.body.case !== "getDaemonInfo") {
+      throw new Error("Native memory daemon omitted GetDaemonInfo");
+    }
+    const daemon = infoResponse.body.value;
+    if (
+      daemon.minimumProtocolGeneration > DAEMON_PROTOCOL_GENERATION ||
+      daemon.maximumProtocolGeneration < DAEMON_PROTOCOL_GENERATION
+    ) {
+      throw new Error(
+        `Native memory daemon protocol mismatch at ${this.endpoint}: ` +
+          `client supports ${DAEMON_PROTOCOL_GENERATION}, daemon ${daemon.daemonVersion} supports ` +
+          `${daemon.minimumProtocolGeneration}-${daemon.maximumProtocolGeneration}. ` +
+          "Close active OpenCode processes and restart the native memory daemon.",
+      );
+    }
+    const hello = create(OpenSessionRequestSchema, {
+      clientInstanceId: randomUUID(),
+      minimumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
+      maximumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
+      domainSchemaGeneration: DOMAIN_SCHEMA_GENERATION,
+      pluginVersion: process.env.npm_package_version ?? "development",
+    });
+    const sessionResponse = await this.send(
+      { case: "openSession", value: hello },
+      CONNECT_TIMEOUT_MS,
+    );
+    if (sessionResponse.body.case !== "openSession") {
+      throw new Error("Native memory daemon omitted OpenSession");
+    }
+    const session = sessionResponse.body.value;
+    this.startHeartbeat(session);
+    const acquire = create(AcquireProjectRequestSchema, {
+      daemonInstanceId: daemon.daemonInstanceId,
+      sessionId: session.sessionId,
+      projectRoot: this.worktree,
+      worktree: this.worktree,
+      ...optionalEnv("OPENCODE_MEMORY_DATA_DIR", "dataDir"),
+      ...optionalEnv("OPENCODE_MEMORY_MODEL_CACHE", "modelCache"),
+      embedding: embeddingIdentity(),
+    });
+    const projectResponse = await this.send(
+      { case: "acquireProject", value: acquire },
+      INITIALIZATION_TIMEOUT_MS,
+    );
+    if (projectResponse.body.case !== "acquireProject") {
+      throw new Error("Native memory daemon omitted AcquireProject");
+    }
+    return { daemon, session, project: projectResponse.body.value, generation };
+  }
+
+  private async connectTransport(): Promise<void> {
+    if (this.disposed) throw new Error("Native memory client is disposed");
+    if (this.socket && !this.socket.destroyed) return;
+    let socket: Socket;
+    try {
+      socket = await connectSocket(this.endpoint, CONNECT_TIMEOUT_MS);
+    } catch {
+      await bootstrapDaemon(this.root, this.endpoint);
+      socket = await connectSocket(this.endpoint, CONNECT_TIMEOUT_MS);
+    }
+    if (this.disposed) {
+      socket.destroy();
+      throw new Error("Native memory client is disposed");
+    }
+    this.attachSocket(socket);
+  }
+
+  private attachSocket(socket: Socket): void {
+    this.socket?.destroy();
+    this.socket = socket;
+    this.generation += 1;
+    const generation = this.generation;
+    const decoder = new DelimitedFrameDecoder(MAX_RESPONSE_BYTES);
+    socket.on("data", (chunk: Buffer) => {
+      try {
+        for (const frame of decoder.push(chunk)) {
+          this.handleFrame(frame, generation);
+        }
+      } catch (error) {
+        socket.destroy(asError(error));
+      }
+    });
+    socket.once("error", (error) => {
+      this.rejectPending(
+        new DaemonTransportError(`Native memory daemon socket failed: ${error.message}`),
+        generation,
+      );
+    });
+    socket.once("close", () => {
+      if (this.socket === socket && this.generation === generation) {
+        this.socket = undefined;
+        this.ready = undefined;
+        this.stopHeartbeat();
+      }
+      this.rejectPending(
+        new DaemonTransportError("Native memory daemon connection closed"),
+        generation,
+      );
+    });
+  }
+
+  private send(
+    body: DaemonRequestMessage["body"],
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<DaemonResponse> {
+    const socket = this.socket;
+    const generation = this.generation;
+    if (!socket || socket.destroyed) {
+      throw new DaemonTransportError("Native memory daemon is not connected");
+    }
+    if (signal?.aborted) throw new Error("Native memory request was cancelled");
+    const requestId = randomUUID();
+    const request = createDaemonRequest(body, requestId);
+    const payload = encodeDelimited(toBinary(DaemonRequestSchema, request));
+    if (payload.byteLength > MAX_REQUEST_BYTES) {
+      throw new Error(
+        `Native memory daemon request exceeds ${MAX_REQUEST_BYTES} bytes (was ${payload.byteLength})`,
+      );
+    }
+
+    return new Promise<DaemonResponse>((resolveRequest, rejectRequest) => {
+      let abort: (() => void) | undefined;
+      const finish = (): void => {
+        const pending = this.pending.get(requestId);
+        if (!pending) return;
+        this.pending.delete(requestId);
+        clearTimeout(pending.timer);
+        if (signal && abort) signal.removeEventListener("abort", abort);
+      };
+      const timer = setTimeout(() => {
+        if (!this.pending.has(requestId)) return;
+        finish();
+        rejectRequest(
+          new DaemonRpcError(
+            "Native memory daemon request timed out",
+            DaemonStatusCode.DEADLINE_EXCEEDED,
+          ),
+        );
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(requestId, {
+        resolve: (response) => {
+          finish();
+          resolveRequest(response);
+        },
+        reject: (error) => {
+          finish();
+          rejectRequest(error);
+        },
+        timer,
+        generation,
+      });
+      if (signal) {
+        abort = () => {
+          finish();
+          rejectRequest(
+            new DaemonRpcError("Native memory request was cancelled", DaemonStatusCode.CANCELLED),
+          );
+        };
+        signal.addEventListener("abort", abort, { once: true });
+      }
+      socket.write(payload, (error) => {
+        if (!error) return;
+        const pending = this.pending.get(requestId);
+        pending?.reject(new DaemonTransportError(`Cannot write daemon request: ${error.message}`));
+      });
+    });
+  }
+
+  private handleFrame(frame: Uint8Array, generation: number): void {
+    const response = fromBinary(DaemonResponseSchema, frame);
+    const pending = this.pending.get(response.requestId);
+    if (!pending || pending.generation !== generation) return;
+    const status = response.status;
+    if (!status || status.code !== DaemonStatusCode.OK) {
+      pending.reject(
+        new DaemonRpcError(
+          status?.message || "Native memory daemon request failed",
+          status?.code ?? DaemonStatusCode.INTERNAL,
+          status?.retryAfterMs ?? 0,
+        ),
+      );
+      return;
+    }
+    if (response.body.case === undefined) {
+      pending.reject(new Error("Native memory daemon response body is missing"));
+      return;
+    }
+    pending.resolve(response);
+  }
+
+  private unwrapMemoryResponse<T>(response: MemoryResponse): T {
+    const decoded = decodeMemoryResponse(response);
+    if (!decoded.ok) {
+      throw new NativeMemoryOperationError(decoded.error || "Native memory operation failed");
+    }
+    return decoded.result as T;
+  }
+
+  private async cancelProjectCall(ready: ReadyProject, callId: string): Promise<CancelOutcome> {
+    const cancel = create(CancelCallRequestSchema, {
+      daemonInstanceId: ready.daemon.daemonInstanceId,
+      sessionId: ready.session.sessionId,
+      projectHandle: ready.project.projectHandle,
+      leaseId: ready.project.leaseId,
+      callId,
+    });
+    const response = await this.send({ case: "cancelCall", value: cancel }, CONNECT_TIMEOUT_MS);
+    if (response.body.case !== "cancelCall") {
+      throw new Error("Native memory daemon omitted CancelCall");
+    }
+    return response.body.value.outcome;
+  }
+
+  private startHeartbeat(session: OpenSessionResponse): void {
+    this.stopHeartbeat();
+    const intervalMs = Math.max(1_000, session.heartbeatIntervalSeconds * 1_000);
+    const generation = this.generation;
+    this.heartbeat = setInterval(() => {
+      if (this.heartbeatInFlight || !this.socket || this.socket.destroyed) return;
+      this.heartbeatInFlight = true;
+      const heartbeat = create(SessionHeartbeatRequestSchema, {
+        daemonInstanceId: session.daemonInstanceId,
+        sessionId: session.sessionId,
+      });
+      void this.send({ case: "heartbeat", value: heartbeat }, CONNECT_TIMEOUT_MS)
+        .catch(() => this.invalidateConnection(generation))
+        .finally(() => {
+          if (generation === this.generation) this.heartbeatInFlight = false;
+        });
+    }, intervalMs);
+    this.heartbeat.unref?.();
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+    this.heartbeatInFlight = false;
+  }
+
+  private invalidateConnection(expectedGeneration = this.generation): void {
+    if (expectedGeneration !== this.generation) return;
+    this.ready = undefined;
+    this.stopHeartbeat();
+    const socket = this.socket;
+    this.socket = undefined;
+    socket?.destroy();
+  }
+
+  private rejectPending(error: Error, generation?: number): void {
+    for (const pending of [...this.pending.values()]) {
+      if (generation !== undefined && pending.generation !== generation) continue;
+      pending.reject(error);
+    }
+  }
+}
+
+function createDaemonRequest(body: DaemonRequestMessage["body"], requestId = randomUUID()) {
+  return create(DaemonRequestSchema, {
+    requestId,
+    protocolGeneration: DAEMON_PROTOCOL_GENERATION,
+    body,
+  });
+}
+
+export class NativeMemoryClient implements MemoryClientDelegate {
+  private readonly daemon: DaemonProjectClient | undefined;
+  private readonly delegate: MemoryClientDelegate;
+
+  constructor(
+    root: string,
+    worktree: string,
+    spawnOverride?: SpawnFn,
+    requestTimeoutMs = REQUEST_TIMEOUT_MS,
+  ) {
+    validateRequestTimeout(requestTimeoutMs);
+    const transport = process.env.OPENCODE_MEMORY_TRANSPORT ?? "daemon";
+    if (transport !== "daemon" && transport !== "sidecar") {
+      throw new Error(
+        `Invalid OPENCODE_MEMORY_TRANSPORT: expected daemon or sidecar, received ${transport}`,
+      );
+    }
+    if (spawnOverride || transport === "sidecar") {
+      this.delegate = new LegacySidecarClient(root, worktree, spawnOverride, requestTimeoutMs);
+      return;
+    }
+    this.daemon = new DaemonProjectClient(root, worktree, requestTimeoutMs);
+    this.delegate = this.daemon;
+  }
+
+  request<T>(method: MemoryMethod, params: unknown = {}, signal?: AbortSignal): Promise<T> {
+    return this.delegate.request<T>(method, params, signal);
+  }
+
+  dispose(): Promise<void> {
+    return this.delegate.dispose();
+  }
+
+  async daemonInfo(): Promise<DaemonClientInfo> {
+    if (!this.daemon) throw new Error("Native memory client is using the legacy sidecar transport");
+    return await this.daemon.info();
+  }
+}
+
+type NativeMemoryClientFactory = (root: string, worktree: string) => NativeMemoryClient;
+
+interface NativeMemoryClientPoolEntry {
+  readonly client: NativeMemoryClient;
+  leases: number;
+  closing?: Promise<void>;
+}
+
+export interface NativeMemoryClientLease {
+  readonly client: NativeMemoryRequester;
+  release(): Promise<void>;
+}
+
+export class NativeMemoryClientPool {
+  private readonly entries = new Map<string, NativeMemoryClientPoolEntry>();
+
+  constructor(
+    private readonly createClient: NativeMemoryClientFactory = (root, worktree) =>
+      new NativeMemoryClient(root, worktree),
+  ) {}
+
+  async acquire(root: string, worktree: string): Promise<NativeMemoryClientLease> {
+    const key = daemonPoolKey(worktree);
+    for (;;) {
+      const current = this.entries.get(key);
+      if (current?.closing) {
+        await current.closing;
+        continue;
+      }
+      if (current) {
+        current.leases += 1;
+        return this.createLease(key, current);
+      }
+      const entry: NativeMemoryClientPoolEntry = {
+        client: this.createClient(root, worktree),
+        leases: 1,
+      };
+      this.entries.set(key, entry);
+      return this.createLease(key, entry);
+    }
+  }
+
+  private createLease(key: string, entry: NativeMemoryClientPoolEntry): NativeMemoryClientLease {
+    let released = false;
+    return {
+      client: entry.client,
+      release: async () => {
+        if (released) return;
+        released = true;
+        entry.leases -= 1;
+        if (entry.leases > 0) return;
+        const closing = entry.client.dispose().finally(() => {
+          if (this.entries.get(key) === entry) this.entries.delete(key);
+        });
+        entry.closing = closing;
+        await closing;
+      },
+    };
+  }
+}
+
+const SHARED_DAEMON_POOL = Symbol.for("@nguyenthdat/opencode-memory/daemon-pool/v1");
+const daemonPoolGlobal = globalThis as typeof globalThis & {
+  [key: symbol]: NativeMemoryClientPool | undefined;
+};
+const sharedNativeMemoryClientPool =
+  daemonPoolGlobal[SHARED_DAEMON_POOL] ?? new NativeMemoryClientPool();
+daemonPoolGlobal[SHARED_DAEMON_POOL] = sharedNativeMemoryClientPool;
+
+export function acquireNativeMemoryClient(
+  root: string,
+  worktree: string,
+): Promise<NativeMemoryClientLease> {
+  return sharedNativeMemoryClientPool.acquire(root, worktree);
+}
+
+export async function probeNativeMemoryDaemon(root: string): Promise<DaemonControlInfo> {
+  const client = new DaemonProjectClient(root, process.cwd(), CONNECT_TIMEOUT_MS);
+  return await client.probe();
+}
+
+export function resolveDaemonEndpoint(): string {
+  const uid = process.getuid?.() ?? 0;
+  const runtimeDirectory =
+    process.platform === "linux" && process.env.XDG_RUNTIME_DIR
+      ? join(process.env.XDG_RUNTIME_DIR, "opencode-memory")
+      : join(tmpdir(), "opencode-memory");
+  const endpoint = join(runtimeDirectory, "daemon.sock");
+  return Buffer.byteLength(endpoint) <= 100
+    ? endpoint
+    : join("/tmp", `opencode-memory-${uid}`, "daemon.sock");
+}
+
+async function bootstrapDaemon(root: string, endpoint: string): Promise<void> {
+  const runtimeDirectory = dirname(endpoint);
+  await ensurePrivateRuntimeDirectory(runtimeDirectory);
+  const startLock = join(runtimeDirectory, "daemon-start.lock");
+  const deadline = Date.now() + START_LOCK_TIMEOUT_MS;
+  let lock: FileHandle | undefined;
+
+  while (!lock && Date.now() < deadline) {
+    try {
+      lock = await open(startLock, "wx", 0o600);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+      if (await canConnect(endpoint)) return;
+      await removeStaleStartLock(startLock);
+      await delay(50);
+    }
+  }
+  if (!lock)
+    throw new Error(`Timed out waiting for native memory daemon startup lock ${startLock}`);
+
+  const lockIdentity = await lock.stat();
+  try {
+    if (await canConnect(endpoint)) return;
+    await lock.writeFile(`${process.pid}\n${Date.now()}\n`);
+    const binary = resolveNativeMemoryBinary(root);
+    const child = spawn(binary, ["--daemon", "--endpoint", endpoint], {
+      cwd: dirname(binary),
+      detached: true,
+      env: process.env,
+      stdio: "ignore",
+    });
+    let startupFailure: Error | undefined;
+    child.once("error", (error) => {
+      startupFailure = new Error(`Native memory daemon failed to start: ${error.message}`, {
+        cause: error,
+      });
+    });
+    child.once("exit", (code, signal) => {
+      if (code !== 0) {
+        startupFailure = new Error(
+          `Native memory daemon exited during startup with ${code ?? signal ?? "unknown status"}`,
+        );
+      }
+    });
+    child.unref();
+    const readinessDeadline = Date.now() + STARTUP_TIMEOUT_MS;
+    while (Date.now() < readinessDeadline) {
+      if (await canConnect(endpoint)) return;
+      if (startupFailure) throw startupFailure;
+      await delay(50);
+    }
+    throw new Error(
+      `Native memory daemon did not become ready at ${endpoint}. ` +
+        "Run the packaged binary with --daemon manually to inspect its stderr.",
+    );
+  } finally {
+    await lock.close();
+    const current = await stat(startLock).catch(() => undefined);
+    if (current?.dev === lockIdentity.dev && current.ino === lockIdentity.ino) {
+      await unlink(startLock).catch(() => undefined);
+    }
+  }
+}
+
+async function removeStaleStartLock(path: string): Promise<void> {
+  try {
+    const metadata = await stat(path);
+    const uid = process.getuid?.();
+    if (uid !== undefined && metadata.uid !== uid) {
+      throw new Error(`Native memory daemon startup lock has a foreign owner: ${path}`);
+    }
+    if (Date.now() - metadata.mtimeMs < START_LOCK_STALE_MS) return;
+    const ownerPid = Number.parseInt(await readFile(path, "utf8"), 10);
+    if (Number.isSafeInteger(ownerPid) && ownerPid > 0 && processIsAlive(ownerPid)) return;
+    const current = await stat(path);
+    if (current.dev === metadata.dev && current.ino === metadata.ino) await unlink(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+async function connectSocket(path: string, timeoutMs: number): Promise<Socket> {
+  await validateDaemonEndpoint(path);
+  return await new Promise((resolveSocket, rejectSocket) => {
+    const socket = createConnection({ path });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      rejectSocket(
+        new DaemonTransportError(`Timed out connecting to native memory daemon at ${path}`),
+      );
+    }, timeoutMs);
+    timer.unref?.();
+    const onError = (error: Error): void => {
+      clearTimeout(timer);
+      rejectSocket(
+        new DaemonTransportError(`Cannot connect to native memory daemon: ${error.message}`, {
+          cause: error,
+        }),
+      );
+    };
+    socket.once("error", onError);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      socket.removeListener("error", onError);
+      resolveSocket(socket);
+    });
+  });
+}
+
+async function canConnect(path: string): Promise<boolean> {
+  try {
+    const socket = await connectSocket(path, 250);
+    socket.destroy();
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ECONNREFUSED") return false;
+    if (error instanceof DaemonTransportError && error.cause) {
+      const causeCode = (error.cause as NodeJS.ErrnoException).code;
+      if (causeCode === "ENOENT" || causeCode === "ECONNREFUSED") return false;
+    }
+    throw error;
+  }
+}
+
+async function ensurePrivateRuntimeDirectory(path: string): Promise<void> {
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const metadata = await lstat(path);
+  const uid = process.getuid?.();
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`Native memory runtime path is not a real directory: ${path}`);
+  }
+  if (uid !== undefined && metadata.uid !== uid) {
+    throw new Error(`Native memory runtime directory has a foreign owner: ${path}`);
+  }
+  await chmod(path, 0o700);
+  const restricted = await lstat(path);
+  if ((restricted.mode & 0o777) !== 0o700) {
+    throw new Error(`Native memory runtime directory must use mode 0700: ${path}`);
+  }
+}
+
+async function validateDaemonEndpoint(path: string): Promise<void> {
+  const runtimeDirectory = dirname(path);
+  const directory = await lstat(runtimeDirectory);
+  const endpoint = await lstat(path);
+  const uid = process.getuid?.();
+  if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    throw new Error(`Native memory runtime path is not a real directory: ${runtimeDirectory}`);
+  }
+  if (uid !== undefined && (directory.uid !== uid || endpoint.uid !== uid)) {
+    throw new Error(`Native memory daemon endpoint has a foreign owner: ${path}`);
+  }
+  if ((directory.mode & 0o777) !== 0o700) {
+    throw new Error(`Native memory runtime directory must use mode 0700: ${runtimeDirectory}`);
+  }
+  if (!endpoint.isSocket() || endpoint.isSymbolicLink()) {
+    throw new Error(`Native memory daemon endpoint is not a real Unix socket: ${path}`);
+  }
+  if ((endpoint.mode & 0o777) !== 0o600) {
+    throw new Error(`Native memory daemon endpoint must use mode 0600: ${path}`);
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function embeddingIdentity() {
+  return create(EmbeddingIdentitySchema, {
+    ...optionalEnv("OPENCODE_MEMORY_EMBEDDING_MODEL_PATH", "localModelPath"),
+    ...optionalEnv("OPENCODE_MEMORY_EMBEDDING_MODEL_REPO", "repository"),
+    ...optionalEnv("OPENCODE_MEMORY_EMBEDDING_MODEL_REVISION", "revision"),
+    ...optionalEnv("OPENCODE_MEMORY_EMBEDDING_MODEL_FILE", "filename"),
+    ...optionalEnv("OPENCODE_MEMORY_EMBEDDING_POOLING", "pooling"),
+    ...optionalEnv("OPENCODE_MEMORY_EMBEDDING_ATTENTION", "attention"),
+    ...optionalEnv("OPENCODE_MEMORY_EMBEDDING_QUERY_TEMPLATE", "queryTemplate"),
+    ...optionalEnv("OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE", "passageTemplate"),
+    ...optionalBooleanEnv("OPENCODE_MEMORY_EMBEDDING_ADD_BOS", "addBos"),
+    ...optionalBooleanEnv("OPENCODE_MEMORY_EMBEDDING_APPEND_EOS", "appendEos"),
+    ...optionalBooleanEnv("OPENCODE_MEMORY_EMBEDDING_NORMALIZE", "normalize"),
+    ...optionalIntegerEnv("OPENCODE_MEMORY_EMBEDDING_DIMENSION", "dimension"),
+    ...optionalIntegerEnv("OPENCODE_MEMORY_EMBEDDING_CONTEXT_SIZE", "contextSize"),
+    ...optionalPositiveInt32Env("OPENCODE_MEMORY_EMBEDDING_THREADS", "threads"),
+    ...optionalIntegerEnv("OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS", "gpuLayers"),
+  });
+}
+
+function optionalEnv<const K extends string>(name: string, key: K): Partial<Record<K, string>> {
+  const value = process.env[name];
+  return value ? ({ [key]: value } as Partial<Record<K, string>>) : {};
+}
+
+function optionalBooleanEnv<const K extends string>(
+  name: string,
+  key: K,
+): Partial<Record<K, boolean>> {
+  const value = process.env[name];
+  if (!value) return {};
+  if (["1", "true", "yes", "on"].includes(value.toLowerCase())) {
+    return { [key]: true } as Partial<Record<K, boolean>>;
+  }
+  if (["0", "false", "no", "off"].includes(value.toLowerCase())) {
+    return { [key]: false } as Partial<Record<K, boolean>>;
+  }
+  throw new Error(`Invalid ${name}: expected true or false, received ${value}`);
+}
+
+function optionalIntegerEnv<const K extends string>(
+  name: string,
+  key: K,
+): Partial<Record<K, number>> {
+  const value = process.env[name];
+  if (!value) return {};
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > 0xffff_ffff) {
+    throw new Error(`Invalid ${name}: expected a uint32-compatible integer, received ${value}`);
+  }
+  return { [key]: parsed } as Partial<Record<K, number>>;
+}
+
+function optionalPositiveInt32Env<const K extends string>(
+  name: string,
+  key: K,
+): Partial<Record<K, number>> {
+  const value = process.env[name];
+  if (!value) return {};
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 0x7fff_ffff) {
+    throw new Error(`Invalid ${name}: expected a positive int32, received ${value}`);
+  }
+  return { [key]: parsed } as Partial<Record<K, number>>;
+}
+
+function daemonPoolKey(worktree: string): string {
+  return `${resolve(worktree)}\0${process.env.OPENCODE_MEMORY_DATA_DIR ?? ""}`;
+}
+
+function configuredRequestTimeoutMs(): number {
+  const configured = Number(process.env.OPENCODE_MEMORY_REQUEST_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_REQUEST_TIMEOUT_MS;
+  return Math.min(Math.max(Math.trunc(configured), MIN_REQUEST_TIMEOUT_MS), MAX_REQUEST_TIMEOUT_MS);
+}
+
+function validateRequestTimeout(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_REQUEST_TIMEOUT_MS) {
+    throw new Error(
+      `Invalid native memory request timeout: expected 1-${MAX_REQUEST_TIMEOUT_MS} ms, received ${value}`,
+    );
+  }
+}
+
+function isAmbiguousFailure(error: Error): boolean {
+  return (
+    error instanceof DaemonTransportError ||
+    (error instanceof DaemonRpcError &&
+      [
+        DaemonStatusCode.CANCELLED,
+        DaemonStatusCode.DEADLINE_EXCEEDED,
+        DaemonStatusCode.INTERNAL,
+        DaemonStatusCode.OUTCOME_UNKNOWN,
+      ].includes(error.code))
+  );
+}
+
+function isDefinitePreAdmissionFailure(error: Error): boolean {
+  return (
+    error instanceof DaemonRpcError &&
+    [
+      DaemonStatusCode.INVALID_ARGUMENT,
+      DaemonStatusCode.FAILED_PRECONDITION,
+      DaemonStatusCode.NOT_FOUND,
+      DaemonStatusCode.RESOURCE_EXHAUSTED,
+      DaemonStatusCode.UNAVAILABLE,
+    ].includes(error.code)
+  );
+}
+
+function isReconnectRequiredFailure(error: Error): boolean {
+  return (
+    error instanceof DaemonRpcError &&
+    (error.code === DaemonStatusCode.NOT_FOUND ||
+      (error.code === DaemonStatusCode.FAILED_PRECONDITION &&
+        error.message.includes("daemon instance changed")))
+  );
+}
+
+function isRetryableSetupFailure(error: Error): boolean {
+  return (
+    error instanceof DaemonTransportError ||
+    (error instanceof DaemonRpcError &&
+      [
+        DaemonStatusCode.DEADLINE_EXCEEDED,
+        DaemonStatusCode.NOT_FOUND,
+        DaemonStatusCode.UNAVAILABLE,
+      ].includes(error.code))
+  );
+}
+
+function waitForPromise<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    throw new DaemonRpcError("Native memory request was cancelled", DaemonStatusCode.CANCELLED);
+  }
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const abort = (): void => {
+      rejectPromise(
+        new DaemonRpcError("Native memory request was cancelled", DaemonStatusCode.CANCELLED),
+      );
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    void promise.then(resolvePromise, rejectPromise).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+export { resolveNativeMemoryBinary };
+export type { SpawnFn };

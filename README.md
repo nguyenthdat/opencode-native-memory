@@ -1,6 +1,6 @@
 # OpenCode Native Memory
 
-Local-first persistent memory for OpenCode. The plugin runs a native Rust sidecar, stores project-scoped memories in zvec, and embeds text locally with llama.cpp. No memory content or embedding request is sent to a hosted inference service.
+Local-first persistent memory for OpenCode. The plugin connects to one user-scoped native Rust daemon, stores project-scoped memories in zvec, and embeds text locally with llama.cpp. Multiple OpenCode processes can share one daemon and one project engine without sharing memory content with a hosted inference service.
 
 ## Highlights
 
@@ -14,8 +14,9 @@ Local-first persistent memory for OpenCode. The plugin runs a native Rust sideca
 - Deterministic capture gate with quarantine, skip, duplicate, supersession, and conflict outcomes
 - Crash-recoverable batch upsert journal and portable export/import snapshots
 - Markdown-backed shared repository memory under `.opencode/memory/`
-- Length-delimited Protobuf protocol between TypeScript and Rust
-- Native sidecar packages for Apple Silicon macOS and glibc Linux
+- Versioned length-delimited Protobuf IPC over an owner-only Unix domain socket
+- One serialized project actor and `MemoryEngine` per canonical physical store
+- Native daemon packages for Apple Silicon macOS and glibc Linux
 
 ## Install
 
@@ -23,11 +24,19 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@nguyenthdat/opencode-memory@0.5.1"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.6.0-beta.0"]
 }
 ```
 
 On a supported platform, npm installs one matching optional native package. Reinstall without `--omit=optional`; the plugin intentionally has no postinstall script or runtime binary download.
+
+### How the daemon is installed
+
+The plugin does not install a global daemon, `systemd` unit, `launchd` service, or postinstall downloader. The umbrella package declares platform-specific binaries as npm `optionalDependencies`, so Bun/npm selects the one matching the current OS and architecture during normal plugin installation. That native package contains the `opencode-memory` executable alongside its package metadata.
+
+When OpenCode loads the TypeScript plugin, no native process is started yet. On the first memory request, the plugin resolves the executable from the installed native package, validates the private per-user runtime directory and socket, and connects to an existing compatible daemon when one is already running. If no daemon is available, one contender acquires the startup lock and launches the packaged executable in detached `--daemon` mode; concurrent OpenCode processes wait for the same endpoint instead of starting additional daemons.
+
+The daemon is therefore installed and upgraded as part of the npm plugin dependency graph, but started lazily at runtime. It exits automatically after the configured idle interval and is started again on the next memory request. Set `OPENCODE_NATIVE_MEMORY_BIN` only for a development binary override, or `OPENCODE_MEMORY_TRANSPORT=sidecar` for the temporary beta rollback path.
 
 Supported packages:
 
@@ -41,7 +50,7 @@ Supported packages:
 
 The first memory operation downloads the default GGUF model under `~/.local/share/opencode/memory/models/<model-revision>/` (or `$XDG_DATA_HOME/opencode/memory/models/<model-revision>/`). Override `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH` to use an existing local model and avoid a network download.
 
-The plugin automatically registers its packaged `rules/flow.md` as an OpenCode instruction while preserving existing project instructions. It never overwrites a project-owned rule file.
+The plugin automatically registers its packaged `rules/native-memory.md` as an OpenCode instruction while preserving existing project instructions. It never overwrites a project-owned rule file.
 
 ## Memory Tools
 
@@ -84,7 +93,7 @@ The default is:
 
 "Any Hugging Face model" means any **GGUF embedding model compatible with the bundled llama.cpp revision**. Safetensors-only repositories are not loaded directly. Model templates and pooling must match the chosen model.
 
-Changing model identity or embedding dimension requires rebuilding the project's vector index. The sidecar rejects a mismatched existing collection instead of silently mixing incompatible vectors.
+Changing model identity or vector-affecting preprocessing requires rebuilding the project's vector index. The daemon persists and validates a semantic configuration fingerprint in the collection manifest, hashes local GGUF content, and requires immutable 40-character Hugging Face commit revisions. A mismatch is rejected instead of opening a second engine or silently mixing incompatible vectors.
 
 ### Environment
 
@@ -103,13 +112,16 @@ Changing model identity or embedding dimension requires rebuilding the project's
 | `OPENCODE_MEMORY_EMBEDDING_NORMALIZE`        | `true`                                                                       |
 | `OPENCODE_MEMORY_EMBEDDING_DIMENSION`        | Native model dimension; lower values use MRL truncation then renormalization |
 | `OPENCODE_MEMORY_EMBEDDING_CONTEXT_SIZE`     | `8192`                                                                       |
-| `OPENCODE_MEMORY_EMBEDDING_THREADS`          | Available parallelism                                                        |
+| `OPENCODE_MEMORY_EMBEDDING_THREADS`          | Hard per-inference maximum; daemon default shares CPU capacity across actors |
 | `OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS`       | All layers when GPU offload is supported, otherwise `0`                      |
 | `OPENCODE_MEMORY_PROJECT_ROOT`               | Override project discovery root                                              |
 | `OPENCODE_MEMORY_DATA_DIR`                   | Override project store base directory                                        |
 | `OPENCODE_MEMORY_MODEL_CACHE`                | Replace the complete local Hugging Face model-cache path                     |
 | `OPENCODE_MEMORY_REQUEST_TIMEOUT_MS`         | Native RPC timeout in milliseconds; default 5 minutes, maximum 2 hours       |
-| `OPENCODE_NATIVE_MEMORY_BIN`                 | Development/debug sidecar override                                           |
+| `OPENCODE_NATIVE_MEMORY_BIN`                 | Development/debug native daemon binary override                              |
+| `OPENCODE_MEMORY_TRANSPORT`                  | `daemon` by default; temporary `sidecar` beta rollback                       |
+| `OPENCODE_MEMORY_PROJECT_IDLE_SECONDS`       | Release an unleased project actor after 5 minutes                            |
+| `OPENCODE_MEMORY_DAEMON_IDLE_SECONDS`        | Stop the daemon after 10 minutes with no sessions or project activity        |
 | `OPENCODE_MEMORY_WARMUP`                     | Enable model/shared-memory warmup; default `true`                            |
 | `OPENCODE_MEMORY_AUTO_RECALL`                | Enable automatic contextual recall; default `true`                           |
 | `OPENCODE_MEMORY_AUTO_CAPTURE`               | Evaluate compaction candidates through the capture gate; default `true`      |
@@ -130,7 +142,7 @@ export OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE="search_document: {text}"
 
 ## Storage and Sharing
 
-Private state uses the data directory under `opencode/memory/<project-id>/`. Downloaded models use OpenCode's data home under `opencode/memory/models/<model-revision>/`; versioning by immutable model revision avoids downloading the same multi-gigabyte GGUF again on plugin-only upgrades. Existing downloads under `~/.cache/opencode/memory/models/` are not moved automatically; point `OPENCODE_MEMORY_MODEL_CACHE` there to reuse them.
+Private state uses the data directory under `opencode/memory/projects/<project-id>/`. Downloaded models use OpenCode's data home under `opencode/memory/models/<model-revision>/`; versioning by immutable model revision avoids downloading the same multi-gigabyte GGUF again on plugin-only upgrades. Existing downloads under `~/.cache/opencode/memory/models/` are not moved automatically; point `OPENCODE_MEMORY_MODEL_CACHE` there to reuse them.
 
 Repository memory is canonical Markdown in:
 
@@ -152,15 +164,16 @@ Automatic document indexing scans the project at startup and after debounced doc
 
 ```text
 OpenCode plugin (TypeScript)
-  -> length-delimited Protobuf over stdin/stdout
-Rust sidecar
-  -> lifecycle/taxonomy policy
-  -> llama.cpp GGUF embedder
-  -> zvec vector + FTS collection
-  -> atomic JSON lifecycle state
+  -> daemon bootstrap + session/project lease
+  -> versioned Protobuf over a private Unix domain socket
+User-scoped Rust daemon
+  -> project registry keyed by canonical physical store
+  -> bounded, thread-affine ProjectActor
+  -> one MemoryEngine / writer.lock / model context per active project
+  -> zvec vector + FTS collection and atomic lifecycle state
 ```
 
-The Protobuf schema is `schema/opencode/memory/v1/memory.proto`. Rust bindings are generated at Cargo build time with `prost-build`; TypeScript bindings are committed under `opencode-memory/src/generated/opencode/memory/v1/` and reproduced with `bun run generate:protocol`.
+The domain schema is `schema/opencode/memory/v1/memory.proto`; daemon sessions, leases, deadlines, cancellation outcomes, status codes, and calls use `schema/opencode/memory/daemon/v1/daemon.proto`. Rust bindings are generated at Cargo build time with `prost-build`; TypeScript bindings are committed under `opencode-memory/src/generated/` and reproduced with `bun run generate:protocol`. The daemon currently uses the plan's framed-Protobuf UDS fallback because the supported Bun 1.3.14 runtime has not passed the required large-message HTTP/2 matrix for gRPC. The stable per-user endpoint lives under `$XDG_RUNTIME_DIR/opencode-memory/` on Linux or the OS-provided private temporary directory elsewhere, with a short `/tmp/opencode-memory-<uid>/` fallback only when required by Unix socket path limits. The client validates directory and socket ownership, type, and permissions before connecting.
 
 Lifecycle state schema v4 is intentionally new-only. Older state schemas are rejected instead of migrated; move or purge an older project store before using this build. Upserts are journaled before zvec mutation and replayed as an order-independent batch when the engine opens.
 
@@ -182,7 +195,7 @@ bun run pack:check
 
 ### OpenCode Demo Project
 
-An isolated project fixture is available at `tests/opencode-memory-demo`. Its config lives at `.opencode/opencode.jsonc`; it loads the local `dist/` plugin, uses the local release sidecar, keeps data under its own `.memory-data/`, and includes a `/memory-smoke` command.
+An isolated project fixture is available at `tests/opencode-memory-demo`. Its config lives at `.opencode/opencode.jsonc`; it loads the local `dist/` plugin, uses the local release daemon, keeps data under its own `.memory-data/`, and includes a `/memory-smoke` command.
 
 ```sh
 cd tests/opencode-memory-demo
@@ -190,7 +203,7 @@ bun run prepare
 bun run start
 ```
 
-Build the local sidecar:
+Build the local daemon binary:
 
 ```sh
 bun run build:native:release
@@ -198,7 +211,7 @@ bun run build:native:release
 
 Backend features are opt-in Cargo features: `metal`, `cuda`, `cuda-no-vmm`, `vulkan`, `openmp`, and `static-openmp`. The supported Apple Silicon macOS release is built explicitly with `--features metal`; Linux release builds remain featureless unless a platform-specific backend is intentionally added.
 
-To build the supported macOS native sidecar locally:
+To build the supported macOS native daemon locally:
 
 ```sh
 cargo build --release --locked --target aarch64-apple-darwin --features metal

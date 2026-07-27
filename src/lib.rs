@@ -1,6 +1,7 @@
 pub mod capture;
 mod config;
 mod contract;
+pub mod daemon;
 mod document;
 mod document_index;
 mod embedding;
@@ -14,6 +15,11 @@ mod validation;
 #[allow(clippy::enum_variant_names)]
 pub(crate) mod memory_proto {
     include!(concat!(env!("OUT_DIR"), "/opencode.memory.v1.rs"));
+}
+
+#[allow(clippy::enum_variant_names)]
+pub(crate) mod daemon_proto {
+    include!(concat!(env!("OUT_DIR"), "/opencode.memory.daemon.v1.rs"));
 }
 
 pub use capture::{

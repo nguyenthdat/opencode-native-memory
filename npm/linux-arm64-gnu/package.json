@@ -1,7 +1,7 @@
 {
   "name": "@nguyenthdat/opencode-memory-linux-arm64-gnu",
-  "version": "0.5.1",
-  "description": "Native OpenCode memory sidecar for Linux ARM64 glibc",
+  "version": "0.6.0-beta.0",
+  "description": "Shared native OpenCode memory daemon for Linux ARM64 glibc",
   "os": [
     "linux"
   ],

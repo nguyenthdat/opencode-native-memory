@@ -24,8 +24,10 @@ export const MAX_REQUEST_BYTES = 32 * MiB;
 export const MAX_RESPONSE_BYTES = 32 * MiB;
 const MAX_STDERR_BYTES = 8_192;
 const MAX_HANDSHAKE_RESTARTS = 1;
-const WRITER_LOCK_ERROR =
-  "another OpenCode process already owns this project's native memory writer lock";
+const WRITER_LOCK_ERRORS = [
+  "another OpenCode process already owns this project's native memory writer lock",
+  "project store is already owned by another native memory engine",
+] as const;
 
 const SUPPORTED_RPC_VERSION = 2;
 const require = createRequire(import.meta.url);
@@ -372,7 +374,7 @@ export class NativeMemoryClient {
         }
       } catch (error) {
         const failure = error instanceof Error ? error : new Error(String(error));
-        if (failure.message.includes(WRITER_LOCK_ERROR)) {
+        if (WRITER_LOCK_ERRORS.some((message) => failure.message.includes(message))) {
           this.fatalHandshakeError = failure;
         }
         this.failProcess(process, failure);

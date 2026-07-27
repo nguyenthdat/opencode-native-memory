@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { BackgroundJobQueue } from "./background-jobs.js";
+import { DaemonOutcomeUnknownError } from "./daemon-client.js";
 
 const flush = async (): Promise<void> => {
   await Promise.resolve();
@@ -66,6 +67,21 @@ describe("background job queue", () => {
     });
     await flush();
     expect(queue.get(nonErrorJob.job_id)).toMatchObject({ status: "failed", error: "bad input" });
+    await queue.dispose();
+  });
+
+  test("preserves ambiguous mutation call IDs without reporting a definite failure", async () => {
+    const queue = new BackgroundJobQueue<Record<string, never>, string>();
+    const job = queue.enqueue({}, async () => {
+      throw new DaemonOutcomeUnknownError("ingest outcome is unknown", "call-123");
+    });
+    await flush();
+
+    expect(queue.get(job.job_id)).toMatchObject({
+      status: "outcome_unknown",
+      error: "ingest outcome is unknown",
+      call_id: "call-123",
+    });
     await queue.dispose();
   });
 

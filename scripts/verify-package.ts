@@ -1,3 +1,5 @@
+export {};
+
 const process = Bun.spawn(["npm", "pack", "--dry-run", "--json"], {
   stdout: "pipe",
   stderr: "pipe",
@@ -19,7 +21,8 @@ const required = [
   "dist/server.js",
   "dist/server.d.ts",
   "dist/generated/opencode/memory/v1/memory_pb.js",
-  "rules/flow.md",
+  "dist/generated/opencode/memory/daemon/v1/daemon_pb.js",
+  "rules/native-memory.md",
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
   "notices/ZVEC_NOTICE",
@@ -45,7 +48,7 @@ const allowedExact = new Set([
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
   "notices/ZVEC_NOTICE",
-  "rules/flow.md",
+  "rules/native-memory.md",
 ]);
 const unexpected = [...files].filter(
   (file) => !file.startsWith("dist/") && !allowedExact.has(file),
@@ -53,9 +56,9 @@ const unexpected = [...files].filter(
 if (unexpected.length > 0) {
   throw new Error(`npm package contains files outside the allowlist: ${unexpected.join(", ")}`);
 }
-const instructions = await Bun.file("rules/flow.md").text();
+const instructions = await Bun.file("rules/native-memory.md").text();
 if (!instructions.includes("<!-- opencode-memory-instructions:v1 -->")) {
-  throw new Error("rules/flow.md is missing the managed instruction marker");
+  throw new Error("rules/native-memory.md is missing the managed instruction marker");
 }
 const manifest = (await Bun.file("package.json").json()) as {
   name?: string;

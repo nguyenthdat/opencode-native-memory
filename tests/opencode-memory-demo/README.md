@@ -1,6 +1,6 @@
 # OpenCode Native Memory Demo
 
-This project loads the local `0.5.1` source build from `../../dist/index.js` and keeps its memory store under `.memory-data/`, isolated from the parent repository store.
+This project loads the local `0.6.0-beta.0` source build from `../../dist/index.js` and keeps its memory store under `.memory-data/`, isolated from the parent repository store.
 
 ## Start
 
@@ -25,7 +25,7 @@ Inside OpenCode, run:
 /memory-smoke
 ```
 
-The plugin automatically registers its packaged `rules/flow.md`; the demo config intentionally lists only `AGENTS.md` to exercise that integration.
+The plugin automatically registers its packaged `rules/native-memory.md`; the demo config intentionally lists only `AGENTS.md` to exercise that integration.
 
 Useful manual checks:
 

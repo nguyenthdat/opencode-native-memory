@@ -1,6 +1,6 @@
 # Retrieval Benchmark v1
 
-This frozen smoke corpus compares the served output of four retrieval modes through the production Protobuf sidecar:
+This frozen smoke corpus compares the served output of four retrieval modes through the production Protobuf daemon client:
 
 - `no-memory`
 - `lexical`

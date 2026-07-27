@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { NativeMemoryClient } from "../opencode-memory/src/sidecar-client.js";
+import { NativeMemoryClient } from "../opencode-memory/src/daemon-client.js";
 import type { RetrievalMode, SearchResponse } from "../opencode-memory/src/contracts.js";
 import {
   computeRetrievalMetrics,
@@ -192,7 +192,7 @@ async function evaluateMode(
     });
     const latencyMs = performance.now() - started;
     if (response.retrieval_mode !== mode) {
-      throw new Error(`Requested ${mode}, sidecar reported ${response.retrieval_mode}`);
+      throw new Error(`Requested ${mode}, daemon reported ${response.retrieval_mode}`);
     }
     if (response.warnings.length > 0) {
       throw new Error(`${mode} search degraded: ${response.warnings.join("; ")}`);

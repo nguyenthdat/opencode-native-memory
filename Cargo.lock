@@ -2753,7 +2753,7 @@ checksum = "269bca4c2591a28585d6bf10d9ed0332b7d76900a1b02bec41bdc3a2cdcda107"
 
 [[package]]
 name = "opencode-memory"
-version = "0.5.1"
+version = "0.6.0-beta.0"
 dependencies = [
  "anyhow",
  "fs2",
@@ -2764,6 +2764,7 @@ dependencies = [
  "prost",
  "prost-build",
  "regex",
+ "rustix",
  "self_cell",
  "serde",
  "serde_json",

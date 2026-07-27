@@ -7,7 +7,19 @@ import {
   ValueObjectSchema,
   ValueSchema,
 } from "./generated/opencode/memory/v1/memory_pb.js";
-import { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";
+import {
+  DaemonRequestSchema,
+  DaemonResponseSchema,
+  DaemonStatusCode,
+  CancelCallRequestSchema,
+  GetDaemonInfoRequestSchema,
+} from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
+import {
+  decodeResponse,
+  DelimitedFrameDecoder,
+  encodeDelimited,
+  encodeRequest,
+} from "./protocol.js";
 
 describe("Protobuf memory protocol", () => {
   test("encodes a typed request with length-delimited framing", () => {
@@ -54,8 +66,18 @@ describe("Protobuf memory protocol", () => {
     });
   });
 
-  test("rejects unknown methods before writing to the sidecar", () => {
+  test("rejects unknown methods before writing to the native transport", () => {
     expect(() => encodeRequest(1, "unknown", {})).toThrow("Unknown memory method");
+  });
+
+  test("rejects integers outside the symmetric JavaScript safe range", () => {
+    expect(() => encodeRequest(1, "status", { value: Number.MAX_SAFE_INTEGER })).not.toThrow();
+    expect(() => encodeRequest(1, "status", { value: 2 ** 53 })).toThrow("safe range");
+    expect(() =>
+      encodeRequest(1, "status", { value: BigInt(Number.MAX_SAFE_INTEGER) + 1n }),
+    ).toThrow("safe range");
+    expect(() => encodeRequest(1, "status", { value: -(2n ** 63n) })).toThrow("safe range");
+    expect(() => encodeRequest(1, "status", { value: 2n ** 64n - 1n })).toThrow("safe range");
   });
 
   test("encodes document ingestion as its own method", () => {
@@ -70,6 +92,47 @@ describe("Protobuf memory protocol", () => {
     const [payload] = new DelimitedFrameDecoder(1024).push(frame);
     const request = fromBinary(RequestSchema, payload!);
     expect(request.method).toBe(Method.INDEX_DOCUMENTS);
+  });
+
+  test("encodes a versioned daemon envelope with opaque request IDs", () => {
+    const request = create(DaemonRequestSchema, {
+      requestId: "call-2^53-plus-one",
+      protocolGeneration: 1,
+      body: { case: "getDaemonInfo", value: create(GetDaemonInfoRequestSchema) },
+    });
+    const frame = encodeDelimited(toBinary(DaemonRequestSchema, request));
+    const [payload] = new DelimitedFrameDecoder(1024).push(frame);
+    const decoded = fromBinary(DaemonRequestSchema, payload!);
+    expect(decoded.requestId).toBe("call-2^53-plus-one");
+    expect(decoded.body.case).toBe("getDaemonInfo");
+  });
+
+  test("keeps daemon status codes separate from domain responses", () => {
+    const response = create(DaemonResponseSchema, {
+      requestId: "request-1",
+      status: { code: DaemonStatusCode.OUTCOME_UNKNOWN, message: "ambiguous" },
+    });
+    const decoded = fromBinary(DaemonResponseSchema, toBinary(DaemonResponseSchema, response));
+    expect(decoded.status?.code).toBe(DaemonStatusCode.OUTCOME_UNKNOWN);
+    expect(decoded.body.case).toBeUndefined();
+  });
+
+  test("encodes cancellation as a distinct daemon control operation", () => {
+    const request = create(DaemonRequestSchema, {
+      requestId: "cancel-request",
+      protocolGeneration: 1,
+      body: {
+        case: "cancelCall",
+        value: create(CancelCallRequestSchema, {
+          sessionId: "session-a",
+          projectHandle: "project-a",
+          leaseId: "lease-a",
+          callId: "call-a",
+        }),
+      },
+    });
+    const decoded = fromBinary(DaemonRequestSchema, toBinary(DaemonRequestSchema, request));
+    expect(decoded.body.case).toBe("cancelCall");
   });
 });
 

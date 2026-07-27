@@ -1,0 +1,191 @@
+syntax = "proto3";
+
+package opencode.memory.daemon.v1;
+
+import "opencode/memory/v1/memory.proto";
+
+enum DaemonStatusCode {
+  DAEMON_STATUS_CODE_UNSPECIFIED = 0;
+  DAEMON_STATUS_CODE_OK = 1;
+  DAEMON_STATUS_CODE_INVALID_ARGUMENT = 2;
+  DAEMON_STATUS_CODE_FAILED_PRECONDITION = 3;
+  DAEMON_STATUS_CODE_NOT_FOUND = 4;
+  DAEMON_STATUS_CODE_RESOURCE_EXHAUSTED = 5;
+  DAEMON_STATUS_CODE_DEADLINE_EXCEEDED = 6;
+  DAEMON_STATUS_CODE_CANCELLED = 7;
+  DAEMON_STATUS_CODE_UNAVAILABLE = 8;
+  DAEMON_STATUS_CODE_INTERNAL = 9;
+  DAEMON_STATUS_CODE_OUTCOME_UNKNOWN = 10;
+}
+
+enum DrainOutcome {
+  DRAIN_OUTCOME_UNSPECIFIED = 0;
+  DRAIN_OUTCOME_ACCEPTED = 1;
+  DRAIN_OUTCOME_BUSY = 2;
+  DRAIN_OUTCOME_UNSUPPORTED = 3;
+}
+
+enum CancelOutcome {
+  CANCEL_OUTCOME_UNSPECIFIED = 0;
+  CANCEL_OUTCOME_CANCELLED_BEFORE_START = 1;
+  CANCEL_OUTCOME_ALREADY_STARTED = 2;
+  CANCEL_OUTCOME_COMPLETED = 3;
+  CANCEL_OUTCOME_NOT_FOUND = 4;
+}
+
+message DaemonStatus {
+  DaemonStatusCode code = 1;
+  string message = 2;
+  uint32 retry_after_ms = 3;
+}
+
+message DaemonRequest {
+  string request_id = 1;
+  uint32 protocol_generation = 2;
+  oneof body {
+    GetDaemonInfoRequest get_daemon_info = 10;
+    OpenSessionRequest open_session = 11;
+    SessionHeartbeatRequest heartbeat = 12;
+    AcquireProjectRequest acquire_project = 13;
+    ProjectCallRequest project_call = 14;
+    ReleaseProjectRequest release_project = 15;
+    RequestDrainRequest request_drain = 16;
+    CancelCallRequest cancel_call = 17;
+  }
+}
+
+message DaemonResponse {
+  string request_id = 1;
+  DaemonStatus status = 2;
+  oneof body {
+    GetDaemonInfoResponse get_daemon_info = 10;
+    OpenSessionResponse open_session = 11;
+    SessionHeartbeatResponse heartbeat = 12;
+    AcquireProjectResponse acquire_project = 13;
+    ProjectCallResponse project_call = 14;
+    ReleaseProjectResponse release_project = 15;
+    RequestDrainResponse request_drain = 16;
+    CancelCallResponse cancel_call = 17;
+  }
+}
+
+message GetDaemonInfoRequest {}
+
+message GetDaemonInfoResponse {
+  string daemon_instance_id = 1;
+  string daemon_version = 2;
+  uint32 minimum_protocol_generation = 3;
+  uint32 maximum_protocol_generation = 4;
+  uint32 domain_schema_generation = 5;
+  repeated string capabilities = 6;
+  uint32 pid = 7;
+}
+
+message OpenSessionRequest {
+  string client_instance_id = 1;
+  uint32 minimum_protocol_generation = 2;
+  uint32 maximum_protocol_generation = 3;
+  uint32 domain_schema_generation = 4;
+  string plugin_version = 5;
+}
+
+message OpenSessionResponse {
+  string daemon_instance_id = 1;
+  string session_id = 2;
+  uint32 selected_protocol_generation = 3;
+  uint32 domain_schema_generation = 4;
+  repeated string capabilities = 5;
+  uint32 heartbeat_interval_seconds = 6;
+  uint32 lease_ttl_seconds = 7;
+}
+
+message SessionHeartbeatRequest {
+  string daemon_instance_id = 1;
+  string session_id = 2;
+}
+
+message SessionHeartbeatResponse {
+  uint64 server_monotonic_ms = 1;
+}
+
+message EmbeddingIdentity {
+  optional string local_model_path = 1;
+  optional string repository = 2;
+  optional string revision = 3;
+  optional string filename = 4;
+  optional string pooling = 5;
+  optional string attention = 6;
+  optional string query_template = 7;
+  optional string passage_template = 8;
+  optional bool add_bos = 9;
+  optional bool append_eos = 10;
+  optional bool normalize = 11;
+  optional uint32 dimension = 12;
+  optional uint32 context_size = 13;
+  optional int32 threads = 14;
+  optional uint32 gpu_layers = 15;
+}
+
+message AcquireProjectRequest {
+  string daemon_instance_id = 1;
+  string session_id = 2;
+  string project_root = 3;
+  string worktree = 4;
+  optional string data_dir = 5;
+  EmbeddingIdentity embedding = 6;
+  optional string model_cache = 7;
+}
+
+message AcquireProjectResponse {
+  string project_handle = 1;
+  string lease_id = 2;
+  string canonical_project_id = 3;
+  string store_key_hash = 4;
+}
+
+message ProjectCallRequest {
+  string daemon_instance_id = 1;
+  string session_id = 2;
+  string project_handle = 3;
+  string lease_id = 4;
+  string call_id = 5;
+  uint32 timeout_ms = 6;
+  opencode.memory.v1.Request request = 7;
+}
+
+message ProjectCallResponse {
+  string call_id = 1;
+  opencode.memory.v1.Response response = 2;
+}
+
+message ReleaseProjectRequest {
+  string daemon_instance_id = 1;
+  string session_id = 2;
+  string project_handle = 3;
+  string lease_id = 4;
+}
+
+message ReleaseProjectResponse {
+  bool released = 1;
+}
+
+message CancelCallRequest {
+  string daemon_instance_id = 1;
+  string session_id = 2;
+  string project_handle = 3;
+  string lease_id = 4;
+  string call_id = 5;
+}
+
+message CancelCallResponse {
+  CancelOutcome outcome = 1;
+}
+
+message RequestDrainRequest {
+  string expected_daemon_instance_id = 1;
+}
+
+message RequestDrainResponse {
+  DrainOutcome outcome = 1;
+  uint32 retry_after_ms = 2;
+}

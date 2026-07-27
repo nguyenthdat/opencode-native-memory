@@ -34,6 +34,8 @@ struct Manifest {
     project_id: String,
     embedding_model: String,
     embedding_dimension: usize,
+    #[serde(default)]
+    configuration_fingerprint: Option<String>,
     zvec_version: String,
     created_at_ms: i64,
 }
@@ -83,6 +85,7 @@ pub(crate) fn open_collection(
         project_id: config.project_id().to_string(),
         embedding_model: embedding_model.to_string(),
         embedding_dimension,
+        configuration_fingerprint: Some(config.configuration_fingerprint()?),
         zvec_version: zvec_rust::version().clone(),
         created_at_ms: now_ms,
     };
@@ -102,7 +105,7 @@ pub(crate) fn acquire_writer_lock(project_dir: &Path) -> Result<File> {
     set_private_file_permissions(&file)?;
     file.try_lock_exclusive().map_err(|error| {
         anyhow!(
-            "another OpenCode process already owns this project's native memory writer lock ({}): {error}",
+            "project store is already owned by another native memory engine ({}): {error}",
             lock_path.display()
         )
     })?;
@@ -201,6 +204,12 @@ fn validate_manifest(
         embedding_model,
         embedding_dimension
     );
+    if let Some(expected) = &manifest.configuration_fingerprint {
+        ensure!(
+            expected == &config.configuration_fingerprint()?,
+            "memory configuration fingerprint mismatch; vector-affecting embedding settings changed and require re-indexing the project collection"
+        );
+    }
     Ok(())
 }
 
@@ -237,7 +246,8 @@ fn path_text(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::acquire_writer_lock;
+    use super::{COLLECTION_SCHEMA_VERSION, Manifest, acquire_writer_lock, validate_manifest};
+    use crate::MemoryConfig;
 
     #[test]
     fn writer_lock_rejects_a_second_owner_and_recovers_after_drop() {
@@ -245,9 +255,37 @@ mod tests {
         let first = acquire_writer_lock(directory.path()).expect("acquire first writer lock");
 
         let error = acquire_writer_lock(directory.path()).expect_err("reject second writer lock");
-        assert!(error.to_string().contains("another OpenCode process"));
+        assert!(error.to_string().contains("another native memory engine"));
 
         drop(first);
         acquire_writer_lock(directory.path()).expect("reacquire released writer lock");
+    }
+
+    #[test]
+    fn manifest_rejects_a_vector_affecting_configuration_change() {
+        let directory = tempfile::tempdir().expect("create temporary project directory");
+        let config = MemoryConfig::new(
+            directory.path().to_path_buf(),
+            directory.path().join("data"),
+            directory.path().join("cache"),
+        );
+        let manifest = Manifest {
+            schema_version: COLLECTION_SCHEMA_VERSION,
+            project_root: config.project_root().display().to_string(),
+            project_id: config.project_id().to_string(),
+            embedding_model: "model-a".to_string(),
+            embedding_dimension: 4,
+            configuration_fingerprint: Some("different-fingerprint".to_string()),
+            zvec_version: "test".to_string(),
+            created_at_ms: 0,
+        };
+
+        let error = validate_manifest(&config, &manifest, "model-a", 4)
+            .expect_err("reject fingerprint mismatch");
+        assert!(
+            error
+                .to_string()
+                .contains("configuration fingerprint mismatch")
+        );
     }
 }

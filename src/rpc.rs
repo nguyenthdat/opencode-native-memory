@@ -1,4 +1,4 @@
-//! Length-delimited Protobuf service for the private sidecar protocol.
+//! Domain dispatch and legacy stdio transport for native memory.
 
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -22,13 +22,13 @@ pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_VALUE_DEPTH: usize = 64;
 
-struct Service {
+pub(crate) struct Service {
     config: MemoryConfig,
     engine: Option<MemoryEngine>,
 }
 
 impl Service {
-    fn new(config: MemoryConfig) -> Self {
+    pub(crate) fn new(config: MemoryConfig) -> Self {
         Self {
             config,
             engine: None,
@@ -44,7 +44,11 @@ impl Service {
             .ok_or_else(|| anyhow!("memory engine did not initialize"))
     }
 
-    fn handle(&mut self, request: Request) -> Result<(Response, bool)> {
+    pub(crate) fn initialize(&mut self) -> Result<()> {
+        self.engine().map(|_| ())
+    }
+
+    pub(crate) fn handle(&mut self, request: Request) -> Result<(Response, bool)> {
         let id = request.id;
         let method = Method::try_from(request.method)
             .map_err(|_| anyhow!("unknown memory method value: {}", request.method))?;
@@ -139,11 +143,24 @@ impl Service {
     }
 }
 
-/// Run a CLI mode or the Protobuf sidecar protocol selected by process args.
+/// Run daemon mode, a CLI mode, or the legacy stdio protocol selected by process args.
 pub fn run() -> Result<()> {
-    let config = MemoryConfig::discover()?;
-    match std::env::args().nth(1).as_deref() {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("--daemon") => {
+            anyhow::ensure!(
+                args.next().as_deref() == Some("--endpoint"),
+                "--daemon requires --endpoint"
+            );
+            let endpoint = args
+                .next()
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| anyhow!("--daemon requires an endpoint path"))?;
+            anyhow::ensure!(args.next().is_none(), "unexpected daemon arguments");
+            crate::daemon::run(endpoint)
+        }
         Some("--doctor") => {
+            let config = MemoryConfig::discover()?;
             let engine = MemoryEngine::open(config)?;
             println!(
                 "{}",
@@ -152,12 +169,13 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some("--warmup") => {
+            let config = MemoryConfig::discover()?;
             let engine = MemoryEngine::open(config)?;
             println!("{}", serde_json::to_string_pretty(&engine.status()?)?);
             Ok(())
         }
         Some(argument) => Err(anyhow!("unknown argument: {argument}")),
-        None => run_protocol(config),
+        None => run_protocol(MemoryConfig::discover()?),
     }
 }
 

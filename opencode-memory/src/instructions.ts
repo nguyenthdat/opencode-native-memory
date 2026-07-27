@@ -2,7 +2,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 
 export const MEMORY_INSTRUCTIONS_MARKER = "<!-- opencode-memory-instructions:v1 -->";
-const MEMORY_INSTRUCTIONS_RELATIVE_PATH = "rules/flow.md";
+const MEMORY_INSTRUCTIONS_RELATIVE_PATH = "rules/native-memory.md";
 const MAX_INSTRUCTIONS_BYTES = 16 * 1024;
 
 export interface MemoryInstructionsAsset {
