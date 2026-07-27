@@ -27,12 +27,15 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             package: darwin-arm64
+            cargo_features: "--features metal"
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: linux-x64-gnu
+            cargo_features: ""
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             package: linux-arm64-gnu
+            cargo_features: ""
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -67,7 +70,7 @@ jobs:
         run: bun run versions:check
 
       - name: Build native sidecar
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.cargo_features }}
 
       - name: Stage native npm package
         run: bun scripts/stage-native.ts --target ${{ matrix.target }} --profile release --destination npm/${{ matrix.package }}

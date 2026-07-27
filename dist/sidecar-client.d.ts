@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { MemoryMethod } from "./protocol.js";
-export declare const REQUEST_TIMEOUT_MS = 300000;
+export declare const REQUEST_TIMEOUT_MS: number;
 export declare const INITIALIZATION_TIMEOUT_MS: number;
 export declare const MAX_REQUEST_BYTES: number;
 export declare const MAX_RESPONSE_BYTES: number;
@@ -25,11 +25,15 @@ export declare class NativeMemoryClient {
     private pending;
     private generation;
     private handshake;
+    private stopping;
+    private fatalHandshakeError;
+    private requestQueue;
     private readonly spawnFn;
     private readonly usingSpawnOverride;
     private readonly requestTimeoutMs;
     constructor(root: string, worktree: string, spawnOverride?: SpawnFn, requestTimeoutMs?: number);
     request<T>(method: MemoryMethod, params?: unknown, signal?: AbortSignal): Promise<T>;
+    private requestUnqueued;
     dispose(): Promise<void>;
     private sendRequest;
     private waitForHandshake;

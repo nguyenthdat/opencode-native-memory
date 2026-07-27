@@ -1,9 +1,26 @@
+import { PassThrough } from "node:stream";
+import { EventEmitter } from "node:events";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { describe, expect, test } from "bun:test";
 import {
   NativeMemoryClient,
   NativeMemoryClientPool,
+  REQUEST_TIMEOUT_MS,
   resolveNativeMemoryBinary,
 } from "./sidecar-client.js";
+import {
+  RequestSchema,
+  ResponseSchema,
+  ValueObjectSchema,
+  ValueSchema,
+} from "./generated/opencode/memory/v1/memory_pb.js";
+import { DelimitedFrameDecoder } from "./protocol.js";
+
+test("bounds the configured native request timeout", () => {
+  expect(REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(1_000);
+  expect(REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(2 * 60 * 60_000);
+});
 
 test("rejects Intel macOS as unsupported", () => {
   const platform = process.platform;
@@ -121,3 +138,117 @@ describe("native memory client pool", () => {
     await replacement.release();
   });
 });
+
+describe("native memory client lifecycle", () => {
+  test("terminates a timed-out sidecar before allowing a replacement", async () => {
+    const children: FakeChild[] = [];
+    const spawn = (_binary: string, _args: string[], _options: unknown) => {
+      const child = new FakeChild(children.length > 0);
+      children.push(child);
+      return child.asChildProcess();
+    };
+    const client = new NativeMemoryClient(".", ".", spawn, 20);
+
+    await expect(client.request("ingest", { path: "paper.pdf" })).rejects.toThrow(
+      "Native memory ingest timed out after 20 ms",
+    );
+    expect(children).toHaveLength(1);
+    expect(children[0]?.killSignals).toEqual(["SIGTERM"]);
+
+    const replacement = client.request<{ rpc_protocol_version: number }>("status");
+    await Promise.resolve();
+    expect(children).toHaveLength(1);
+
+    children[0]?.finishClose();
+    await expect(replacement).resolves.toEqual({ rpc_protocol_version: 2 });
+    expect(children).toHaveLength(2);
+  });
+
+  test("cleans up a sidecar that loses the writer lock during handshake", async () => {
+    const child = new FakeChild(
+      false,
+      "another OpenCode process already owns this project's native memory writer lock",
+    );
+    const spawn = () => child.asChildProcess();
+    const client = new NativeMemoryClient(".", ".", spawn, 20);
+
+    await expect(client.request("status")).rejects.toThrow("another OpenCode process already owns");
+    expect(child.killSignals).toEqual(["SIGTERM"]);
+
+    await expect(client.request("status")).rejects.toThrow("another OpenCode process already owns");
+    expect(child.killSignals).toEqual(["SIGTERM"]);
+  });
+});
+
+class FakeChild extends EventEmitter {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly pid = 999_999;
+  readonly killSignals: NodeJS.Signals[] = [];
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  private closed = false;
+
+  constructor(
+    private readonly respondToAll: boolean,
+    private readonly handshakeError?: string,
+  ) {
+    super();
+    const decoder = new DelimitedFrameDecoder(1024 * 1024);
+    let responseCount = 0;
+    this.stdin.on("data", (chunk: Buffer) => {
+      for (const frame of decoder.push(chunk)) {
+        const request = fromBinary(RequestSchema, frame);
+        if (!this.respondToAll && responseCount > 0) continue;
+        responseCount += 1;
+        this.stdout.write(responseFrame(Number(request.id), this.handshakeError));
+      }
+    });
+  }
+
+  kill(signal?: NodeJS.Signals): boolean {
+    this.killSignals.push(signal ?? "SIGTERM");
+    this.signalCode = signal ?? "SIGTERM";
+    this.emit("exit", null, this.signalCode);
+    return true;
+  }
+
+  finishClose(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.emit("close", null, this.signalCode);
+  }
+
+  asChildProcess(): ChildProcessWithoutNullStreams {
+    return this as unknown as ChildProcessWithoutNullStreams;
+  }
+}
+
+function responseFrame(id: number, error?: string): Uint8Array {
+  const result = create(ValueSchema, {
+    kind: {
+      case: "objectValue",
+      value: create(ValueObjectSchema, {
+        fields: {
+          rpc_protocol_version: create(ValueSchema, {
+            kind: { case: "unsignedValue", value: 2n },
+          }),
+        },
+      }),
+    },
+  });
+  const response =
+    error === undefined
+      ? create(ResponseSchema, { id: BigInt(id), ok: true, result })
+      : create(ResponseSchema, { id: BigInt(id), ok: false, error });
+  const payload = toBinary(ResponseSchema, response);
+  const frame: number[] = [];
+  let length = payload.byteLength;
+  while (length >= 0x80) {
+    frame.push((length & 0x7f) | 0x80);
+    length >>>= 7;
+  }
+  frame.push(length);
+  return Uint8Array.from([...frame, ...payload]);
+}

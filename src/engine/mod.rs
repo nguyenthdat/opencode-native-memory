@@ -22,8 +22,7 @@ use crate::contract::{
     SyncSharedRequest, SyncSharedResponse, TombstoneSnapshot, UpdateRequest, UpdateResponse,
 };
 use crate::document::{
-    ExtractedDocument, extract_document, extract_inspected_document, inspect_document,
-    split_markdown,
+    ExtractedDocument, extract_inspected_document, inspect_document, split_markdown,
 };
 use crate::document_index::{DocumentIndexManifest, IndexedDocument, discover_documents};
 use crate::embedding::{Embedder, LlamaCppEmbedder};
@@ -36,10 +35,12 @@ use crate::storage::state::{
     memory_fingerprint,
 };
 use crate::storage::zvec::{self, RESULT_FIELDS, ensure_write_succeeded};
+use crate::taxonomy::MemoryTaxonomy;
 use crate::validation::{
     MAX_ID_COUNT, MAX_LIST_RESULTS, MAX_SHARED_RECORDS, NormalizedStoreRequest, anchors_stale,
-    capture_code_anchors, classify_capture_safety, git_head, normalize_scope_key, truncate_chars,
-    validate_ids, validate_retrieval_id, validate_shared_source, validate_store_request,
+    capture_code_anchors, classify_capture_safety, git_head, normalize_scope_key, normalize_tags,
+    resolve_confidence, truncate_chars, validate_ids, validate_retrieval_id,
+    validate_shared_source, validate_store_request,
 };
 
 const SESSION_DEFAULT_TTL_DAYS: u32 = 7;
@@ -242,14 +243,15 @@ impl MemoryEngine {
             request.scope != MemoryScope::Repository,
             "document ingestion cannot write canonical repository memory; promote reviewed conclusions instead"
         );
-        let extracted = extract_document(&self.config, &request.path)?;
-        let path = extracted.path.clone();
+        let inspected = inspect_document(&self.config, &request.path)?;
+        let path = inspected.normalized_path.clone();
         let scope_key = normalize_scope_key(request.scope, request.scope_key.as_deref())?;
         let previous_ids = self
             .ingested_memory_ids_by_path(request.scope, scope_key.as_deref())?
             .remove(&path)
             .unwrap_or_default();
-        let response = self.ingest_extracted(&request, extracted, Vec::new())?;
+        let extracted = extract_inspected_document(inspected)?;
+        let response = self.ingest_extracted(&request, extracted, Some(&previous_ids))?;
         let current_ids = response.memory_ids.iter().cloned().collect::<HashSet<_>>();
         let mut stale_ids = previous_ids
             .into_iter()
@@ -266,7 +268,7 @@ impl MemoryEngine {
         &mut self,
         request: &IngestRequest,
         extracted: ExtractedDocument,
-        code_paths: Vec<String>,
+        previous_ids: Option<&[String]>,
     ) -> Result<IngestResponse> {
         let mut chunks = split_markdown(&extracted.content)?;
         let mut seen = HashSet::new();
@@ -295,6 +297,18 @@ impl MemoryEngine {
         if tags.len() < 12 && !tags.iter().any(|tag| tag.eq_ignore_ascii_case("document")) {
             tags.push("document".to_string());
         }
+        if let Some(previous_ids) = previous_ids
+            && let Some(response) = self.reused_ingested_document(
+                request,
+                &extracted,
+                &chunks,
+                previous_ids,
+                &base_title,
+                &tags,
+            )?
+        {
+            return Ok(response);
+        }
 
         let mut prepared = Vec::with_capacity(chunk_count);
         for (index, content) in chunks.into_iter().enumerate() {
@@ -319,7 +333,8 @@ impl MemoryEngine {
                     scope_key: request.scope_key.clone(),
                     origin: MemoryOrigin::IngestedDocument,
                     expires_in_days: request.expires_in_days,
-                    code_paths: code_paths.clone(),
+                    // Extracted documents are evidence, not verified source-code anchors.
+                    code_paths: Vec::new(),
                     revive: request.revive,
                     taxonomy: request.taxonomy,
                     confidence: request.confidence,
@@ -349,6 +364,85 @@ impl MemoryEngine {
             memory_ids: responses.into_iter().map(|response| response.id).collect(),
             warnings: extracted.warnings,
         })
+    }
+
+    fn reused_ingested_document(
+        &self,
+        request: &IngestRequest,
+        extracted: &ExtractedDocument,
+        chunks: &[String],
+        previous_ids: &[String],
+        base_title: &str,
+        tags: &[String],
+    ) -> Result<Option<IngestResponse>> {
+        if previous_ids.is_empty()
+            || previous_ids.len() != chunks.len()
+            || request.revive
+            || request.expires_in_days.is_some()
+            || request.scope == MemoryScope::Session
+        {
+            return Ok(None);
+        }
+        let documents = self.fetch_documents(previous_ids)?;
+        if documents.len() != chunks.len() {
+            return Ok(None);
+        }
+        let expected_tags = normalize_tags(tags.to_vec())?;
+        let expected_taxonomy = request
+            .taxonomy
+            .unwrap_or_else(|| MemoryTaxonomy::infer_anchored(request.kind, request.scope, false));
+        let expected_confidence = resolve_confidence(
+            request.confidence,
+            request.importance,
+            MemoryOrigin::IngestedDocument,
+        )?;
+        let mut memory_ids = vec![String::new(); chunks.len()];
+
+        for document in &documents {
+            let stored = stored_memory_from_doc(document)?;
+            let Some((ordinal, total)) = document_chunk_from_source(&stored.source) else {
+                return Ok(None);
+            };
+            if ordinal == 0 || ordinal > chunks.len() || total != chunks.len() {
+                return Ok(None);
+            }
+            let content = &chunks[ordinal - 1];
+            let expected_title = if total == 1 {
+                base_title.to_string()
+            } else {
+                format!("{base_title} (chunk {ordinal} of {total})")
+            };
+            let metadata = self.state.metadata(&stored.id)?;
+            if metadata.locked
+                || required_string(document, "content_hash")? != hash_hex(content.as_bytes())
+                || stored.content != *content
+                || stored.kind != request.kind
+                || stored.importance != request.importance
+                || stored.tags != expected_tags
+                || stored.title != expected_title
+                || document_path_from_source(&stored.source) != Some(extracted.path.as_str())
+                || metadata.taxonomy != expected_taxonomy
+                || metadata.confidence != expected_confidence
+            {
+                return Ok(None);
+            }
+            memory_ids[ordinal - 1] = stored.id;
+        }
+        if memory_ids.iter().any(String::is_empty) {
+            return Ok(None);
+        }
+
+        Ok(Some(IngestResponse {
+            path: extracted.path.clone(),
+            mime_type: extracted.mime_type.clone(),
+            content_hash: extracted.content_hash.clone(),
+            extracted_chars: extracted.content.chars().count(),
+            chunk_count: chunks.len(),
+            inserted: 0,
+            updated: chunks.len(),
+            memory_ids,
+            warnings: extracted.warnings.clone(),
+        }))
     }
 
     /// Discover supported project documents and incrementally synchronize their
@@ -422,17 +516,16 @@ impl MemoryEngine {
                 taxonomy: None,
                 confidence: Some(0.6),
             };
-            let response =
-                match self.ingest_extracted(&ingest_request, extracted, vec![path.clone()]) {
-                    Ok(response) => response,
-                    Err(error) => {
-                        rejections.push(DocumentIndexRejection {
-                            path,
-                            message: format!("{error:#}"),
-                        });
-                        continue;
-                    }
-                };
+            let response = match self.ingest_extracted(&ingest_request, extracted, None) {
+                Ok(response) => response,
+                Err(error) => {
+                    rejections.push(DocumentIndexRejection {
+                        path,
+                        message: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
 
             let mut previous_ids = previous
                 .as_ref()
@@ -1646,16 +1739,25 @@ impl MemoryEngine {
             .cloned()
             .collect::<Vec<_>>();
         ids.sort();
-        for id in &ids {
-            let pending = self
-                .state
-                .pending_upserts
-                .get(id)
-                .cloned()
-                .ok_or_else(|| anyhow!("pending upsert disappeared during recovery: {id}"))?;
-            self.write_pending_document(&pending.document)
-                .with_context(|| format!("cannot recover pending memory upsert {id}"))?;
+        if ids.is_empty() {
+            return Ok(());
         }
+        let pending = ids
+            .iter()
+            .map(|id| {
+                self.state
+                    .pending_upserts
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("pending upsert disappeared during recovery: {id}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let documents = pending
+            .iter()
+            .map(|item| &item.document)
+            .collect::<Vec<_>>();
+        self.write_pending_documents(&documents)
+            .context("cannot recover pending memory upsert batch")?;
         self.finalize_pending_upserts(&ids)
     }
 
@@ -1690,7 +1792,7 @@ impl MemoryEngine {
         })
     }
 
-    fn write_pending_document(&mut self, pending: &PendingDocument) -> Result<()> {
+    fn build_pending_document(&self, pending: &PendingDocument) -> Result<Doc> {
         ensure!(
             pending.embedding.len() == self.embedder.dimension(),
             "pending embedding dimension does not match configured model"
@@ -1710,9 +1812,19 @@ impl MemoryEngine {
         doc.add_i64("created_at", pending.created_at_ms)?;
         doc.add_i64("updated_at", pending.updated_at_ms)?;
         doc.add_vector_f32("embedding", &pending.embedding)?;
+        Ok(doc)
+    }
 
-        let write = self.collection.upsert(&[&doc])?;
-        ensure_write_succeeded("store memory", &write)?;
+    fn write_pending_documents(&mut self, pending: &[&PendingDocument]) -> Result<()> {
+        ensure!(!pending.is_empty(), "pending upsert batch cannot be empty");
+        let documents = pending
+            .iter()
+            .map(|item| self.build_pending_document(item))
+            .collect::<Result<Vec<_>>>()?;
+        for document in &documents {
+            let write = self.collection.upsert(&[document])?;
+            ensure_write_succeeded("store memory", &write)?;
+        }
         self.collection.flush()?;
         Ok(())
     }
@@ -1755,15 +1867,12 @@ impl MemoryEngine {
             self.state = before_prepare;
             return Err(error);
         }
-        for item in &pending {
-            self.write_pending_document(&item.document)
-                .with_context(|| {
-                    format!(
-                        "memory upsert {} is journaled and will be recovered on next open",
-                        item.document.id
-                    )
-                })?;
-        }
+        let documents = pending
+            .iter()
+            .map(|item| &item.document)
+            .collect::<Vec<_>>();
+        self.write_pending_documents(&documents)
+            .context("memory upsert batch is journaled and will be recovered on next open")?;
         self.finalize_pending_upserts(&ids)
     }
 
@@ -2341,6 +2450,12 @@ fn document_path_from_source(source: &str) -> Option<&str> {
         .map(|(path, _)| path)
 }
 
+fn document_chunk_from_source(source: &str) -> Option<(usize, usize)> {
+    let chunk = source.strip_prefix("document:")?.rsplit_once("#chunk=")?.1;
+    let (ordinal, total) = chunk.split_once('/')?;
+    Some((ordinal.parse().ok()?, total.parse().ok()?))
+}
+
 fn management_visible(
     metadata: &MemoryMetadata,
     session_scope_key: Option<&str>,
@@ -2363,8 +2478,8 @@ fn now_ms() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pending_upsert_to_state, deterministic_memory_id, document_path_from_source,
-        legacy_deterministic_memory_id,
+        apply_pending_upsert_to_state, deterministic_memory_id, document_chunk_from_source,
+        document_path_from_source, legacy_deterministic_memory_id,
     };
     use crate::contract::{FeedbackStats, MemoryKind, MemoryOrigin, MemoryScope, StoreRequest};
     use crate::storage::state::{
@@ -2459,6 +2574,11 @@ mod tests {
             document_path_from_source("document:docs/first.md#chunk=1/3"),
             Some("docs/first.md")
         );
+        assert_eq!(
+            document_chunk_from_source("document:docs/first.md#chunk=2/3"),
+            Some((2, 3))
+        );
+        assert_eq!(document_chunk_from_source("document:docs/first.md"), None);
     }
 
     fn document_store_request(source: &str) -> StoreRequest {

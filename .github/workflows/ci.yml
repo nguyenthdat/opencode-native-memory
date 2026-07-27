@@ -72,6 +72,36 @@ jobs:
       - name: Audit JavaScript dependencies
         run: bun audit
 
+  macos-metal:
+    name: macOS Metal
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.0
+          targets: aarch64-apple-darwin
+          components: clippy
+
+      - name: Setup Protobuf
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ github.token }}
+
+      - name: Check Rust with Metal
+        run: cargo clippy --all-targets --locked --features metal -- -D warnings
+
+      - name: Test Rust with Metal
+        run: cargo test --locked --lib --features metal
+
+      - name: Build macOS native sidecar with Metal
+        run: cargo build --release --locked --target aarch64-apple-darwin --features metal
+
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

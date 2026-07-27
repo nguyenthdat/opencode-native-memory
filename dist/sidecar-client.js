@@ -4,12 +4,22 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { decodeResponse, DelimitedFrameDecoder, encodeRequest } from "./protocol.js";
 const MiB = 1024 * 1024;
-export const REQUEST_TIMEOUT_MS = 300_000;
-export const INITIALIZATION_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 300_000;
+const MAX_REQUEST_TIMEOUT_MS = 2 * 60 * 60_000;
+const MIN_REQUEST_TIMEOUT_MS = 1_000;
+function configuredRequestTimeoutMs() {
+    const configured = Number(process.env.OPENCODE_MEMORY_REQUEST_TIMEOUT_MS);
+    if (!Number.isFinite(configured) || configured <= 0)
+        return DEFAULT_REQUEST_TIMEOUT_MS;
+    return Math.min(Math.max(Math.trunc(configured), MIN_REQUEST_TIMEOUT_MS), MAX_REQUEST_TIMEOUT_MS);
+}
+export const REQUEST_TIMEOUT_MS = configuredRequestTimeoutMs();
+export const INITIALIZATION_TIMEOUT_MS = Math.max(REQUEST_TIMEOUT_MS, 30 * 60_000);
 export const MAX_REQUEST_BYTES = 32 * MiB;
 export const MAX_RESPONSE_BYTES = 32 * MiB;
 const MAX_STDERR_BYTES = 8_192;
 const MAX_HANDSHAKE_RESTARTS = 1;
+const WRITER_LOCK_ERROR = "another OpenCode process already owns this project's native memory writer lock";
 const SUPPORTED_RPC_VERSION = 2;
 const require = createRequire(import.meta.url);
 const NATIVE_PACKAGES = {
@@ -65,6 +75,9 @@ export class NativeMemoryClient {
     pending = new Map();
     generation = 0;
     handshake;
+    stopping;
+    fatalHandshakeError;
+    requestQueue = Promise.resolve();
     spawnFn;
     usingSpawnOverride;
     requestTimeoutMs;
@@ -79,13 +92,26 @@ export class NativeMemoryClient {
     async request(method, params = {}, signal) {
         if (this.disposed)
             throw new Error("Native memory client is disposed");
+        if (this.fatalHandshakeError)
+            throw this.fatalHandshakeError;
+        if (signal?.aborted)
+            throw new Error("Native memory request was cancelled");
+        const operation = this.requestQueue.then(() => this.requestUnqueued(method, params, signal));
+        this.requestQueue = operation.then(() => undefined, () => undefined);
+        return await operation;
+    }
+    async requestUnqueued(method, params, signal) {
+        if (this.disposed)
+            throw new Error("Native memory client is disposed");
+        if (this.fatalHandshakeError)
+            throw this.fatalHandshakeError;
         if (signal?.aborted)
             throw new Error("Native memory request was cancelled");
         if (method === "shutdown") {
-            return await this.sendRequest(this.start(), method, params, signal);
+            return await this.sendRequest(await this.start(), method, params, signal);
         }
         for (let restart = 0; restart <= MAX_HANDSHAKE_RESTARTS; restart += 1) {
-            const process = this.start();
+            const process = await this.start();
             try {
                 await this.waitForHandshake(process, signal);
             }
@@ -110,6 +136,10 @@ export class NativeMemoryClient {
     }
     async dispose() {
         this.disposed = true;
+        if (this.stopping) {
+            await this.stopping.promise;
+            return;
+        }
         const ps = this.process;
         if (!ps)
             return;
@@ -165,8 +195,7 @@ export class NativeMemoryClient {
                 const active = this.pending.get(id);
                 if (!active)
                     return;
-                this.finishPending(id, active);
-                rejectRequest(new Error(`Native memory ${method} timed out after ${timeout} ms`));
+                this.failProcess(process, new Error(`Native memory ${method} timed out after ${timeout} ms`));
             }, timeout);
             timer.unref?.();
             const entry = {
@@ -178,10 +207,9 @@ export class NativeMemoryClient {
             };
             if (signal) {
                 entry.abort = () => {
-                    if (!this.pending.delete(id))
+                    if (!this.pending.has(id))
                         return;
-                    clearTimeout(timer);
-                    rejectRequest(new Error(`Native memory ${method} was cancelled`));
+                    this.failProcess(process, new Error(`Native memory ${method} was cancelled`));
                 };
                 signal.addEventListener("abort", entry.abort, { once: true });
             }
@@ -192,8 +220,7 @@ export class NativeMemoryClient {
                 const active = this.pending.get(id);
                 if (!active)
                     return;
-                this.finishPending(id, active);
-                active.reject(new Error(`Cannot write native memory request: ${error.message}`));
+                this.failProcess(process, new Error(`Cannot write native memory request: ${error.message}`));
             });
         });
     }
@@ -237,22 +264,34 @@ export class NativeMemoryClient {
         };
         this.handshake = handshake;
         handshake.promise = Promise.resolve().then(async () => {
-            const status = await this.sendRequest(process, "status", {}, undefined, INITIALIZATION_TIMEOUT_MS);
-            const protocolVer = status.rpc_protocol_version;
-            if (protocolVer !== SUPPORTED_RPC_VERSION) {
-                if (protocolVer === undefined || protocolVer === null) {
-                    throw new Error(`Native memory backend does not report its RPC protocol version. ` +
+            try {
+                const status = await this.sendRequest(process, "status", {}, undefined, INITIALIZATION_TIMEOUT_MS);
+                const protocolVer = status.rpc_protocol_version;
+                if (protocolVer !== SUPPORTED_RPC_VERSION) {
+                    if (protocolVer === undefined || protocolVer === null) {
+                        throw new Error(`Native memory backend does not report its RPC protocol version. ` +
+                            `Run \`bun run build:native:release\` to rebuild the binary.`);
+                    }
+                    throw new Error(`Native memory RPC protocol version mismatch: ` +
+                        `client supports ${SUPPORTED_RPC_VERSION}, backend reports ${protocolVer}. ` +
                         `Run \`bun run build:native:release\` to rebuild the binary.`);
                 }
-                throw new Error(`Native memory RPC protocol version mismatch: ` +
-                    `client supports ${SUPPORTED_RPC_VERSION}, backend reports ${protocolVer}. ` +
-                    `Run \`bun run build:native:release\` to rebuild the binary.`);
+            }
+            catch (error) {
+                const failure = error instanceof Error ? error : new Error(String(error));
+                if (failure.message.includes(WRITER_LOCK_ERROR)) {
+                    this.fatalHandshakeError = failure;
+                }
+                this.failProcess(process, failure);
+                throw failure;
             }
         });
         return handshake;
     }
     // ---- Internal: process management ---------------------------------------
-    start() {
+    async start() {
+        if (this.stopping)
+            await this.stopping.promise;
         if (this.process && this.isCurrentAndRunning(this.process))
             return this.process;
         const binary = this.usingSpawnOverride
@@ -360,11 +399,30 @@ export class NativeMemoryClient {
         }
     }
     failProcess(process, error) {
-        if (this.process?.generation === process.generation)
-            this.process = undefined;
         if (this.handshake?.generation === process.generation)
             this.handshake = undefined;
         this.rejectGeneration(process.generation, error);
+        if (this.stopping?.generation === process.generation)
+            return;
+        const closePromise = new Promise((resolveClose) => {
+            if (process.child.exitCode !== null || process.child.signalCode !== null) {
+                resolveClose();
+                return;
+            }
+            process.child.once("close", () => resolveClose());
+        });
+        const forceKill = setTimeout(() => {
+            stopProcessTree(process.child, "SIGKILL");
+        }, 1_000);
+        forceKill.unref?.();
+        this.stopping = {
+            generation: process.generation,
+            promise: closePromise.finally(() => {
+                clearTimeout(forceKill);
+                if (this.stopping?.generation === process.generation)
+                    this.stopping = undefined;
+            }),
+        };
         stopProcessTree(process.child, "SIGTERM");
     }
     isCurrentAndRunning(process) {

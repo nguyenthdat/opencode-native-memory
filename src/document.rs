@@ -31,13 +31,6 @@ pub(crate) struct InspectedDocument {
     bytes: Vec<u8>,
 }
 
-pub(crate) fn extract_document(
-    config: &MemoryConfig,
-    requested_path: &str,
-) -> Result<ExtractedDocument> {
-    extract_inspected_document(inspect_document(config, requested_path)?)
-}
-
 pub(crate) fn inspect_document(
     config: &MemoryConfig,
     requested_path: &str,
@@ -363,8 +356,9 @@ mod tests {
             directory.path().join("models"),
         );
 
+        let inspected = super::inspect_document(&config, "paper.md").expect("inspect Markdown");
         let extracted =
-            super::extract_document(&config, "paper.md").expect("xberg should extract Markdown");
+            super::extract_inspected_document(inspected).expect("xberg should extract Markdown");
 
         assert_eq!(extracted.path, "paper.md");
         assert!(extracted.content.contains("durable finding"));

@@ -204,7 +204,11 @@ pub(crate) fn validate_store_request(request: StoreRequest) -> Result<Normalized
     })
 }
 
-fn resolve_confidence(supplied: Option<f32>, importance: f32, origin: MemoryOrigin) -> Result<f32> {
+pub(crate) fn resolve_confidence(
+    supplied: Option<f32>,
+    importance: f32,
+    origin: MemoryOrigin,
+) -> Result<f32> {
     if let Some(confidence) = supplied {
         ensure!(confidence.is_finite(), "memory confidence must be finite");
         ensure!(
@@ -437,7 +441,7 @@ pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
     output
 }
 
-fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>> {
+pub(crate) fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>> {
     ensure!(
         tags.len() <= MAX_TAGS,
         "at most {MAX_TAGS} tags are allowed"

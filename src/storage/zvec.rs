@@ -13,13 +13,14 @@ use zvec_rust::{Collection, CollectionSchema, DataType, FieldSchema, IndexParams
 use crate::MemoryConfig;
 
 const COLLECTION_SCHEMA_VERSION: u32 = 1;
-pub(crate) const RESULT_FIELDS: [&str; 8] = [
+pub(crate) const RESULT_FIELDS: [&str; 9] = [
     "title",
     "content",
     "kind",
     "importance",
     "tags",
     "source",
+    "content_hash",
     "created_at",
     "updated_at",
 ];
@@ -232,4 +233,21 @@ fn path_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("memory path is not valid UTF-8: {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::acquire_writer_lock;
+
+    #[test]
+    fn writer_lock_rejects_a_second_owner_and_recovers_after_drop() {
+        let directory = tempfile::tempdir().expect("create temporary project directory");
+        let first = acquire_writer_lock(directory.path()).expect("acquire first writer lock");
+
+        let error = acquire_writer_lock(directory.path()).expect_err("reject second writer lock");
+        assert!(error.to_string().contains("another OpenCode process"));
+
+        drop(first);
+        acquire_writer_lock(directory.path()).expect("reacquire released writer lock");
+    }
 }

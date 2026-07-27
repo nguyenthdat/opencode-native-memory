@@ -107,6 +107,7 @@ Changing model identity or embedding dimension requires rebuilding the project's
 | `OPENCODE_MEMORY_PROJECT_ROOT`               | Override project discovery root                                              |
 | `OPENCODE_MEMORY_DATA_DIR`                   | Override project store base directory                                        |
 | `OPENCODE_MEMORY_MODEL_CACHE`                | Replace the complete local Hugging Face model-cache path                     |
+| `OPENCODE_MEMORY_REQUEST_TIMEOUT_MS`         | Native RPC timeout in milliseconds; default 5 minutes, maximum 2 hours       |
 | `OPENCODE_NATIVE_MEMORY_BIN`                 | Development/debug sidecar override                                           |
 | `OPENCODE_MEMORY_WARMUP`                     | Enable model/shared-memory warmup; default `true`                            |
 | `OPENCODE_MEMORY_AUTO_RECALL`                | Enable automatic contextual recall; default `true`                           |
@@ -142,7 +143,7 @@ Repository memory is canonical Markdown in:
 
 Shared Markdown is treated as untrusted data: paths are contained under `.opencode/memory`, YAML is parsed with a strict schema, instruction-shaped content and likely secrets are rejected, and imported records cannot be pinned or locked through RPC.
 
-`memory_ingest` accepts only project-relative `.pdf`, `.md`, `.markdown`, `.html`, and `.htm` files. Rust-side `xberg` extracts Markdown, chunks it below the 6,000-character memory limit, and stores the chunks with source hashes and document provenance. Extracted document content is untrusted evidence and is never treated as an instruction.
+`memory_ingest` accepts only project-relative `.pdf`, `.md`, `.markdown`, `.html`, and `.htm` files. Rust-side `xberg` extracts Markdown, chunks it below the 6,000-character memory limit, and stores the chunks with source hashes and document provenance. Re-ingesting unchanged project/agent documents with matching metadata reuses their existing chunks instead of running embedding again. Extracted document content is untrusted evidence and is never treated as an instruction.
 
 Automatic document indexing scans the project at startup and after debounced document watcher events. It respects `.gitignore`, `.ignore`, `.git/info/exclude`, global Git ignores, hidden directories, and the 32 MiB per-file limit; `.opencode/memory/` remains managed exclusively by repository-memory sync. A private derived manifest at `document-index.json` tracks source hashes and chunk ownership, so unchanged files skip extraction/embedding, changed files replace their previous chunks, deleted files are removed without tombstones, and a malformed file retains its last valid index. Set `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS=false` to disable automatic synchronization, or call `memory_index_documents` for an explicit/forced run.
 
@@ -164,7 +165,7 @@ Lifecycle state schema v4 is intentionally new-only. Older state schemas are rej
 
 ## Development
 
-Requirements: Bun 1.3+, Rust 1.97+, `protoc`, and Buf.
+Requirements: Bun 1.3+, Rust 1.97+, `protoc`, and Buf. Native builds also require CMake and a working C/C++ toolchain; Apple Silicon macOS builds use the system Metal frameworks.
 
 ```sh
 bun install
@@ -194,7 +195,13 @@ Build the local sidecar:
 bun run build:native:release
 ```
 
-GPU features are opt-in Cargo features: `metal`, `cuda`, `cuda-no-vmm`, `vulkan`, `openmp`, and `static-openmp`.
+Backend features are opt-in Cargo features: `metal`, `cuda`, `cuda-no-vmm`, `vulkan`, `openmp`, and `static-openmp`. The supported Apple Silicon macOS release is built explicitly with `--features metal`; Linux release builds remain featureless unless a platform-specific backend is intentionally added.
+
+To build the supported macOS native sidecar locally:
+
+```sh
+cargo build --release --locked --target aarch64-apple-darwin --features metal
+```
 
 ### Retrieval Benchmark
 
