@@ -2763,6 +2763,7 @@ dependencies = [
  "llama-cpp-2",
  "prost",
  "prost-build",
+ "regex",
  "self_cell",
  "serde",
  "serde_json",

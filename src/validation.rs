@@ -4,8 +4,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path};
 use std::process::Command;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use regex::Regex;
 
 use crate::MemoryConfig;
 use crate::capture::{CaptureSafety, SourceTrust};
@@ -31,17 +33,49 @@ const MAX_TAG_CHARS: usize = 64;
 const MAX_CODE_PATHS: usize = 12;
 const MAX_CODE_PATH_CHARS: usize = 512;
 const MAX_CODE_FILE_BYTES: u64 = 2 * 1_024 * 1_024;
-const TOKEN_PREFIXES: [&str; 9] = [
-    "ghp_",
-    "github_pat_",
-    "sk-proj-",
-    "sk_live_",
-    "sk_test_",
-    "xoxb-",
-    "xoxp-",
-    "akia",
-    "eyjhb",
-];
+static KNOWN_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)
+        (?:
+            gh[pousr]_[a-z0-9]{20,}
+          | github_pat_[a-z0-9_]{20,}
+          | sk-proj-[a-z0-9_-]{16,}
+          | sk_(?:live|test)_[a-z0-9]{16,}
+          | sk-[a-z0-9]{20,}
+          | xox[baprs]-[a-z0-9-]{16,}
+          | akia[0-9a-z]{16}
+          | eyj[a-z0-9_-]{5,}\.eyj[a-z0-9_-]{5,}\.[a-z0-9_-]{10,}
+        )",
+    )
+    .expect("known credential regex must compile")
+});
+static CREDENTIAL_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?ix)
+        ^\s*
+        (?:export\s+|set\s+|(?:const|let|var)\s+|\$env:)?
+        ["']?
+        (?:[a-z0-9]+[_-])*
+        (?:
+            api[_-]?key
+          | access[_-]?key
+          | access[_-]?token
+          | auth[_-]?token
+          | bearer[_-]?token
+          | client[_-]?secret
+          | secret[_-]?access[_-]?key
+          | (?:app|application|api|auth|oauth|jwt|shared|signing|webhook)[_-]?secret
+          | password
+          | passwd
+          | private[_-]?key
+          | token
+        )
+        ["']?\s*[:=]\s*
+        (?P<value>["']?[a-z0-9_./+=-]{16,}["']?)
+        \s*[,;]?\s*$"#,
+    )
+    .expect("credential assignment regex must compile")
+});
 
 pub(crate) fn classify_capture_safety(
     request: &StoreRequest,
@@ -479,25 +513,14 @@ fn sensitive_content_reason(content: &str) -> Option<&'static str> {
     if lower.contains("-----begin ") && lower.contains("private key-----") {
         return Some("a private key");
     }
-    if TOKEN_PREFIXES.iter().any(|prefix| lower.contains(prefix)) {
+    if KNOWN_CREDENTIAL.is_match(content) {
         return Some("an access token or credential");
     }
     for line in content.lines() {
-        let Some((name, value)) = line.split_once(['=', ':']) else {
+        let Some(captures) = CREDENTIAL_ASSIGNMENT.captures(line) else {
             continue;
         };
-        let name = name.trim().to_lowercase();
-        let sensitive_name = [
-            "api_key",
-            "apikey",
-            "secret",
-            "password",
-            "token",
-            "private_key",
-        ]
-        .iter()
-        .any(|marker| name.ends_with(marker));
-        if sensitive_name && looks_like_secret_value(value.trim()) {
+        if looks_like_secret_value(&captures["value"]) {
             return Some("a credential assignment");
         }
     }
@@ -505,16 +528,34 @@ fn sensitive_content_reason(content: &str) -> Option<&'static str> {
 }
 
 fn looks_like_secret_value(value: &str) -> bool {
-    if value.is_empty()
-        || value.contains(char::is_whitespace)
-        || value.contains("REDACTED")
-        || value.contains("redacted")
-        || value.starts_with('<')
-        || value.starts_with("${")
+    let unquoted = value.trim_matches(['\'', '"']);
+    let lower = unquoted.to_ascii_lowercase();
+    if unquoted.is_empty()
+        || unquoted.contains(char::is_whitespace)
+        || unquoted.starts_with('<')
+        || unquoted.starts_with("${")
+        || [
+            "redacted",
+            "placeholder",
+            "example",
+            "sample",
+            "dummy",
+            "fake",
+            "not-a-secret",
+            "not_a_secret",
+            "your_",
+            "your-",
+            "replace",
+            "change-me",
+            "changeme",
+            "insert_",
+            "insert-",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
     {
         return false;
     }
-    let unquoted = value.trim_matches(['\'', '"']);
     unquoted.len() >= 16
         && unquoted
             .bytes()
@@ -674,11 +715,31 @@ mod tests {
     #[test]
     fn rejects_likely_secrets_in_all_fields() {
         assert!(sensitive_content_reason("API_KEY=abcdefghijklmnop123456").is_some());
+        assert!(sensitive_content_reason("export GITHUB_TOKEN='abcdefghijklmnop123456'").is_some());
+        assert!(
+            sensitive_content_reason("\"client_secret\": \"abcdefghijklmnop123456\",").is_some()
+        );
+        assert!(sensitive_content_reason("ghp_abcdefghijklmnopqrstuvwxyz1234567890").is_some());
         assert!(sensitive_content_reason("token=<redacted>").is_none());
         assert!(sensitive_content_reason("Use the API_KEY environment variable").is_none());
         let mut tagged = request("Safe content");
         tagged.tags = vec!["token:abcdefghijklmnop123456".to_string()];
         assert!(validate_store_request(tagged).is_err());
+    }
+
+    #[test]
+    fn allows_credential_prose_and_placeholders() {
+        for content in [
+            "Authentication token: abcdefghijklmnop123456 is passed by the caller.",
+            "credential assignment: abcdefghijklmnop123456",
+            "TODO: support API_KEY=abcdefghijklmnop123456 in the parser docs",
+            "API_KEY=your_api_key_here",
+            "api_key: ${API_KEY}",
+            "password: this value is descriptive prose, not a stored password",
+            "Fix a TODO in the codebase: memory content rejected because it may contain a credential assignment; redact the value first",
+        ] {
+            assert_eq!(sensitive_content_reason(content), None, "{content}");
+        }
     }
 
     #[test]
