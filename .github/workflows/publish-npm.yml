@@ -171,9 +171,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARBALL: ${{ steps.pack.outputs.tarball }}
         run: |
+          PRERELEASE_ARGS=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            PRERELEASE_ARGS+=(--prerelease)
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "$TARBALL" "$TARBALL.sha256" artifacts/*.tgz --clobber
           else
             gh release create "$RELEASE_TAG" "$TARBALL" "$TARBALL.sha256" artifacts/*.tgz \
-              --verify-tag --generate-notes --title "$RELEASE_TAG"
+              --verify-tag --generate-notes --title "$RELEASE_TAG" "${PRERELEASE_ARGS[@]}"
           fi
