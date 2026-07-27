@@ -1,6 +1,6 @@
 # OpenCode Native Memory Demo
 
-This project loads the local `0.4.2` source build from `../../dist/index.js` and keeps its memory store under `.memory-data/`, isolated from the parent repository store.
+This project loads the local `0.5.0` source build from `../../dist/index.js` and keeps its memory store under `.memory-data/`, isolated from the parent repository store.
 
 ## Start
 

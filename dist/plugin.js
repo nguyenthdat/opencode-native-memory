@@ -6,6 +6,7 @@ import { MEMORY_INSTRUCTIONS_MARKER, loadMemoryInstructions, registerMemoryInstr
 import { SHARED_MEMORY_RELATIVE_DIR, loadSharedMemories, writeSharedMemory, } from "./shared-markdown.js";
 import { SessionContext } from "./session-context.js";
 import { validateDeleteRecords, validateUpdateArgs } from "./validation.js";
+import { BACKGROUND_JOB_ID_PATTERN, BackgroundJobQueue } from "./background-jobs.js";
 export function createMemoryPlugin(options) {
     return async ({ client: opencode, directory, worktree }) => {
         const settings = resolveMemoryPluginOptions(options);
@@ -18,6 +19,7 @@ export function createMemoryPlugin(options) {
         let sharedSync;
         let documentSync;
         let documentSyncTimer;
+        const ingestJobs = new BackgroundJobQueue();
         const syncSharedMemories = async (force = false) => {
             if (!settings.sharedSync)
                 return;
@@ -94,6 +96,7 @@ export function createMemoryPlugin(options) {
             dispose: async () => {
                 if (documentSyncTimer)
                     clearTimeout(documentSyncTimer);
+                await ingestJobs.dispose();
                 if (documentSync)
                     await documentSync.catch(() => undefined);
                 for (const sessID of session.pendingRecall.keys())
@@ -489,7 +492,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                     },
                 }),
                 memory_ingest: tool({
-                    description: "Extract a project-local PDF, Markdown, or HTML document with xberg and persist its text as bounded, searchable memory chunks.",
+                    description: "Queue a project-local PDF, Markdown, or HTML document for background ingestion. Returns immediately with a job_id; poll memory_ingest_status for the result.",
                     args: {
                         path: tool.schema
                             .string()
@@ -533,14 +536,47 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                             });
                         }
                         const scopeKey = await session.scopeKey(args.scope, context.sessionID, context.agent);
-                        const response = await native.request("ingest", { ...args, scope_key: scopeKey }, context.abort);
-                        for (const warning of response.warnings)
-                            session.warnOnce(new Error(warning));
-                        session.invalidateRecall();
-                        return result("Ingested document", response, {
-                            path: response.path,
-                            chunk_count: response.chunk_count,
-                            inserted: response.inserted,
+                        if (context.abort.aborted)
+                            throw new Error("Background memory ingestion was cancelled");
+                        const request = { ...args, scope_key: scopeKey };
+                        const job = ingestJobs.enqueue({ path: args.path, scope: args.scope }, async (signal) => {
+                            try {
+                                const response = await native.request("ingest", request, signal);
+                                if (signal.aborted)
+                                    throw new Error("Background memory ingestion was cancelled");
+                                for (const warning of response.warnings)
+                                    session.warnOnce(new Error(warning));
+                                session.invalidateRecall();
+                                return response;
+                            }
+                            catch (error) {
+                                if (!signal.aborted)
+                                    session.warnOnce(error);
+                                throw error;
+                            }
+                        });
+                        const currentJob = ingestJobs.get(job.job_id) ?? job;
+                        return result("Started document ingestion", currentJob, {
+                            job_id: currentJob.job_id,
+                            status: currentJob.status,
+                            path: args.path,
+                        });
+                    },
+                }),
+                memory_ingest_status: tool({
+                    description: "Poll background memory_ingest jobs. Returns queued, running, succeeded with the ingestion result, or failed with an error message.",
+                    args: {
+                        job_ids: tool.schema
+                            .array(tool.schema.string().regex(BACKGROUND_JOB_ID_PATTERN))
+                            .min(1)
+                            .max(100)
+                            .optional()
+                            .describe("Job IDs returned by memory_ingest. Omit to list recent jobs."),
+                    },
+                    async execute(args) {
+                        const jobs = ingestJobs.list(args.job_ids);
+                        return result("Document ingestion jobs", { jobs, count: jobs.length }, {
+                            count: jobs.length,
                         });
                     },
                 }),
