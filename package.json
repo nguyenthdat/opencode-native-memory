@@ -19,6 +19,11 @@
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js",
       "default": "./dist/server.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js",
+      "default": "./dist/tui.js"
     }
   },
   "files": [
@@ -56,7 +61,17 @@
     "yaml": "^2.9.0"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.18.4 <2"
+    "@opencode-ai/plugin": ">=1.18.4 <2",
+    "@opentui/solid": ">=0.4.5",
+    "solid-js": "1.9.12"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "optionalDependencies": {
     "@nguyenthdat/opencode-memory-darwin-arm64": "0.6.0-beta.0",
@@ -65,10 +80,12 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.4",
+    "@opentui/solid": "0.4.5",
     "@bufbuild/protoc-gen-es": "2.13.0",
     "@types/bun": "^1.3.14",
     "@types/node": "^22.20.1",
     "prettier": "^3.9.0",
+    "solid-js": "1.9.12",
     "typescript": "^5.9.3"
   },
   "publishConfig": {

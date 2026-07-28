@@ -32,10 +32,8 @@ describe("shared daemon client", () => {
   });
 
   test("rejects invalid custom request timeouts before opening a transport", () => {
-    expect(() => new NativeMemoryClient(".", ".", undefined, 0)).toThrow("request timeout");
-    expect(() => new NativeMemoryClient(".", ".", undefined, Number.NaN)).toThrow(
-      "request timeout",
-    );
+    expect(() => new NativeMemoryClient(".", ".", 0)).toThrow("request timeout");
+    expect(() => new NativeMemoryClient(".", ".", Number.NaN)).toThrow("request timeout");
   });
 
   test("releases the shared project client only after the final local lease", async () => {

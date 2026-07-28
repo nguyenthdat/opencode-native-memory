@@ -20,6 +20,8 @@ const required = [
   "dist/index.d.ts",
   "dist/server.js",
   "dist/server.d.ts",
+  "dist/tui.js",
+  "dist/tui.d.ts",
   "dist/generated/opencode/memory/v1/memory_pb.js",
   "dist/generated/opencode/memory/daemon/v1/daemon_pb.js",
   "rules/native-memory.md",
@@ -72,13 +74,31 @@ if (
 ) {
   throw new Error("package.json must expose the dedicated ./server plugin entrypoint");
 }
+const tuiExport = manifest.exports?.["./tui"];
+if (
+  tuiExport?.types !== "./dist/tui.d.ts" ||
+  tuiExport.import !== "./dist/tui.js" ||
+  tuiExport.default !== "./dist/tui.js"
+) {
+  throw new Error("package.json must expose the dedicated ./tui plugin entrypoint");
+}
 const serverModule = (await import("../dist/server.js")) as {
   default?: { id?: string; server?: unknown };
 };
+const serverPlugin = serverModule.default;
 if (
-  serverModule.default?.id !== manifest.name ||
-  typeof serverModule.default.server !== "function"
+  !serverPlugin ||
+  serverPlugin.id !== manifest.name ||
+  typeof serverPlugin.server !== "function"
 ) {
   throw new Error("dist/server.js must default-export an OpenCode server plugin module");
+}
+const tuiEntrypoint = "../dist/tui.js";
+const tuiModule = (await import(tuiEntrypoint)) as {
+  default?: { id?: string; tui?: unknown };
+};
+const tuiPlugin = tuiModule.default;
+if (!tuiPlugin || tuiPlugin.id !== manifest.name || typeof tuiPlugin.tui !== "function") {
+  throw new Error("dist/tui.js must default-export an OpenCode TUI plugin module");
 }
 console.log(`npm package contains ${files.size} allowlisted files`);

@@ -8,7 +8,7 @@ Use native project memory as a retrieval aid, not as an invisible source of trut
 
 For a substantial task, **call `memory_search` before inspecting or editing code**. A substantial task includes debugging, changing behavior, reviewing unfamiliar code, making a multi-file change, or continuing work from an earlier session. Skip the call only for trivial requests where project history cannot matter.
 
-Use one focused hybrid query first. Include the user goal, the relevant component or symbol, and the failure or constraint when known. Good queries are specific sentences such as `background document ingest queue sidecar lifecycle timeout` or `writer lock duplicate sidecar process zvec project store`. Do not search with a vague query such as `memory` or paste the entire task transcript.
+Use one focused hybrid query first. Include the user goal, the relevant component or symbol, and the failure or constraint when known. Good queries are specific sentences such as `background document ingest queue daemon lifecycle timeout` or `writer lock duplicate daemon actor zvec project store`. Do not search with a vague query such as `memory` or paste the entire task transcript.
 
 ```text
 memory_search({

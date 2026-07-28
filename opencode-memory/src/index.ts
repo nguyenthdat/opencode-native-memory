@@ -34,6 +34,11 @@ export type {
   CuratedCandidate,
   SharedMemoryRecord,
   SharedSyncResponse,
+  NativeMemoryStatus,
+  MemoryPluginHealthStatus,
+  MemoryPluginHealthIssue,
+  MemoryPluginHealth,
+  MemoryStatusResponse,
 } from "./contracts.js";
 
 // Shared daemon client
@@ -55,7 +60,6 @@ export type {
   DaemonControlInfo,
   NativeMemoryClientLease,
   NativeMemoryRequester,
-  SpawnFn,
 } from "./daemon-client.js";
 
 export {

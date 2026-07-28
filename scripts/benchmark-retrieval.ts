@@ -132,7 +132,7 @@ async function runRetrievalModes(
   try {
     const status = await client.request<StatusResponse>("status");
     if (!status.capabilities.includes("search_retrieval_modes_v1")) {
-      throw new Error("Sidecar does not advertise search_retrieval_modes_v1");
+      throw new Error("Native memory daemon does not advertise search_retrieval_modes_v1");
     }
     const productionToFixture = new Map<string, string>();
     for (const memory of [...memories].sort((left, right) =>

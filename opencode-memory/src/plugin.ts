@@ -8,6 +8,7 @@ import type {
   CaptureResponse,
   IngestResponse,
   DocumentIndexResponse,
+  NativeMemoryStatus,
 } from "./contracts.js";
 import {
   MEMORY_KINDS,
@@ -40,6 +41,7 @@ import {
 import { SessionContext } from "./session-context.js";
 import { validateDeleteRecords, validateUpdateArgs } from "./validation.js";
 import { BACKGROUND_JOB_ID_PATTERN, BackgroundJobQueue } from "./background-jobs.js";
+import { buildMemoryStatusResponse } from "./plugin-health.js";
 
 export interface MemoryPluginOptions {
   root: string;
@@ -1079,14 +1081,26 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         }),
         memory_status: tool({
           description:
-            "Inspect the current project's native memory backend, collection, embedding model, indexes, and document count.",
+            "Health-check the memory plugin and inspect its native backend, collection, embedding model, indexes, and document count.",
           args: {},
           async execute(_args, context) {
-            await syncProjectIndexes();
-            const response = await native.request<Record<string, unknown>>(
-              "status",
-              {},
-              context.abort,
+            const [backend, sharedSyncResult, documentIndexResult] = await Promise.allSettled([
+              native.request<NativeMemoryStatus>("status", {}, context.abort),
+              syncSharedMemories(),
+              settings.automaticDocumentIndex
+                ? indexDocuments()
+                : Promise.resolve<DocumentIndexResponse | undefined>(undefined),
+            ]);
+            if (context.abort.aborted) {
+              const reason = backend.status === "rejected" ? backend.reason : context.abort.reason;
+              throw reason instanceof Error
+                ? reason
+                : new Error("Memory status check was cancelled");
+            }
+            const response = buildMemoryStatusResponse(
+              backend,
+              sharedSyncResult,
+              documentIndexResult,
             );
             return result("Memory status", response, response);
           },

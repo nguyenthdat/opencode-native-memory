@@ -7,6 +7,12 @@
     "declarationMap": true,
     "sourceMap": true
   },
-  "include": ["opencode-memory/src/**/*.ts"],
-  "exclude": ["opencode-memory/src/**/*.test.ts", "tests", "dist", "node_modules"]
+  "include": ["opencode-memory/src/**/*.ts", "opencode-memory/src/**/*.tsx"],
+  "exclude": [
+    "opencode-memory/src/**/*.test.ts",
+    "opencode-memory/src/**/*.test.tsx",
+    "tests",
+    "dist",
+    "node_modules"
+  ]
 }

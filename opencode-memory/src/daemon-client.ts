@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -10,6 +11,7 @@ import {
   unlink,
   type FileHandle,
 } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createConnection, type Socket } from "node:net";
@@ -37,11 +39,6 @@ import type {
 } from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
 import type { Response as MemoryResponse } from "./generated/opencode/memory/v1/memory_pb.js";
 import {
-  NativeMemoryClient as LegacySidecarClient,
-  resolveNativeMemoryBinary,
-} from "./sidecar-client.js";
-import type { SpawnFn } from "./sidecar-client.js";
-import {
   createMemoryRequest,
   decodeMemoryResponse,
   DelimitedFrameDecoder,
@@ -59,6 +56,12 @@ const START_LOCK_STALE_MS = 30_000;
 const START_LOCK_TIMEOUT_MS = START_LOCK_STALE_MS + STARTUP_TIMEOUT_MS;
 const DAEMON_PROTOCOL_GENERATION = 1;
 const DOMAIN_SCHEMA_GENERATION = 1;
+const require = createRequire(import.meta.url);
+const NATIVE_PACKAGES: Partial<Record<string, string>> = {
+  "darwin-arm64": "@nguyenthdat/opencode-memory-darwin-arm64",
+  "linux-arm64": "@nguyenthdat/opencode-memory-linux-arm64-gnu",
+  "linux-x64": "@nguyenthdat/opencode-memory-linux-x64-gnu",
+};
 
 export const MAX_REQUEST_BYTES = 32 * MiB;
 export const MAX_RESPONSE_BYTES = 32 * MiB;
@@ -69,10 +72,6 @@ const RETRY_SAFE_METHODS = new Set<MemoryMethod>(["get", "list", "status", "doct
 
 export interface NativeMemoryRequester {
   request<T>(method: MemoryMethod, params?: unknown, signal?: AbortSignal): Promise<T>;
-}
-
-interface MemoryClientDelegate extends NativeMemoryRequester {
-  dispose(): Promise<void>;
 }
 
 interface PendingDaemonRequest {
@@ -145,7 +144,7 @@ class NativeMemoryOperationError extends Error {
   readonly name = "NativeMemoryOperationError";
 }
 
-class DaemonProjectClient implements MemoryClientDelegate {
+class DaemonProjectClient implements NativeMemoryRequester {
   private socket: Socket | undefined;
   private generation = 0;
   private ready: ReadyProject | undefined;
@@ -661,41 +660,23 @@ function createDaemonRequest(body: DaemonRequestMessage["body"], requestId = ran
   });
 }
 
-export class NativeMemoryClient implements MemoryClientDelegate {
-  private readonly daemon: DaemonProjectClient | undefined;
-  private readonly delegate: MemoryClientDelegate;
+export class NativeMemoryClient {
+  private readonly daemon: DaemonProjectClient;
 
-  constructor(
-    root: string,
-    worktree: string,
-    spawnOverride?: SpawnFn,
-    requestTimeoutMs = REQUEST_TIMEOUT_MS,
-  ) {
+  constructor(root: string, worktree: string, requestTimeoutMs = REQUEST_TIMEOUT_MS) {
     validateRequestTimeout(requestTimeoutMs);
-    const transport = process.env.OPENCODE_MEMORY_TRANSPORT ?? "daemon";
-    if (transport !== "daemon" && transport !== "sidecar") {
-      throw new Error(
-        `Invalid OPENCODE_MEMORY_TRANSPORT: expected daemon or sidecar, received ${transport}`,
-      );
-    }
-    if (spawnOverride || transport === "sidecar") {
-      this.delegate = new LegacySidecarClient(root, worktree, spawnOverride, requestTimeoutMs);
-      return;
-    }
     this.daemon = new DaemonProjectClient(root, worktree, requestTimeoutMs);
-    this.delegate = this.daemon;
   }
 
   request<T>(method: MemoryMethod, params: unknown = {}, signal?: AbortSignal): Promise<T> {
-    return this.delegate.request<T>(method, params, signal);
+    return this.daemon.request<T>(method, params, signal);
   }
 
   dispose(): Promise<void> {
-    return this.delegate.dispose();
+    return this.daemon.dispose();
   }
 
   async daemonInfo(): Promise<DaemonClientInfo> {
-    if (!this.daemon) throw new Error("Native memory client is using the legacy sidecar transport");
     return await this.daemon.info();
   }
 }
@@ -791,6 +772,51 @@ export function resolveDaemonEndpoint(): string {
   return Buffer.byteLength(endpoint) <= 100
     ? endpoint
     : join("/tmp", `opencode-memory-${uid}`, "daemon.sock");
+}
+
+export function resolveNativeMemoryBinary(root: string): string {
+  const platform = `${process.platform}-${process.arch}`;
+  const packageName = NATIVE_PACKAGES[platform];
+  if (!packageName) {
+    throw new Error(
+      `Native memory supports only macOS arm64 and glibc Linux arm64/x64, not ${platform}`,
+    );
+  }
+  const override = process.env.OPENCODE_NATIVE_MEMORY_BIN;
+  const binaryName = "opencode-memory";
+  const packaged = resolvePackagedBinary(packageName, binaryName);
+  const candidates = override
+    ? [resolve(override)]
+    : [
+        resolve(root, "target", "release", binaryName),
+        resolve(root, "target", "debug", binaryName),
+        ...(packaged ? [packaged] : []),
+      ];
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    const binary = realpathSync(candidate);
+    if (!override) {
+      const library = resolve(
+        binary,
+        "..",
+        "memory-libs",
+        process.platform === "darwin" ? "libzvec_c_api.dylib" : "libzvec_c_api.so",
+      );
+      if (!existsSync(library)) continue;
+    }
+    return binary;
+  }
+  throw new Error(
+    `Native memory binary was not found. Reinstall with optional dependencies or run \`bun run build:native:release\`. Checked: ${candidates.join(", ")}`,
+  );
+}
+
+function resolvePackagedBinary(packageName: string, binaryName: string): string | undefined {
+  try {
+    return require.resolve(`${packageName}/bin/${binaryName}`);
+  } catch {
+    return undefined;
+  }
 }
 
 async function bootstrapDaemon(root: string, endpoint: string): Promise<void> {
@@ -1127,6 +1153,3 @@ function asError(error: unknown): Error {
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
-
-export { resolveNativeMemoryBinary };
-export type { SpawnFn };

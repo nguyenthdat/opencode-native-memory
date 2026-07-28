@@ -165,6 +165,48 @@ export interface DocumentIndexResponse {
   warnings: string[];
 }
 
+export interface NativeMemoryStatus {
+  ready: boolean;
+  rpc_protocol_version: number;
+  backend: string;
+  zvec_version: string;
+  embedding_model: string;
+  embedding_dimension: number;
+  project_root: string;
+  project_id: string;
+  collection_path: string;
+  document_count: number;
+  indexed_document_count: number;
+  state_schema_version: number;
+  metadata_count: number;
+  tombstone_count: number;
+  retrieval_count: number;
+  pending_upsert_count: number;
+  pending_delete_count: number;
+  indexes: Array<{ name: string; completeness: number }>;
+  capabilities: string[];
+}
+
+export type MemoryPluginHealthStatus = "healthy" | "degraded" | "unavailable";
+
+export interface MemoryPluginHealthIssue {
+  component: "backend" | "shared_sync" | "document_index";
+  message: string;
+}
+
+export interface MemoryPluginHealth {
+  status: MemoryPluginHealthStatus;
+  ready: boolean;
+  checked_at_ms: number;
+  issues: MemoryPluginHealthIssue[];
+}
+
+export type MemoryStatusResponse = Record<string, unknown> &
+  (
+    | (NativeMemoryStatus & { plugin_health: MemoryPluginHealth })
+    | { plugin_health: MemoryPluginHealth }
+  );
+
 export interface SharedMemoryRecord extends CuratedCandidate {
   source: string;
 }
@@ -192,12 +234,4 @@ export interface RpcResponse {
   ok: boolean;
   result?: unknown | undefined;
   error?: string | undefined;
-}
-
-export interface PendingRequest {
-  resolve(value: unknown): void;
-  reject(error: Error): void;
-  timer: ReturnType<typeof setTimeout>;
-  abort?: (() => void) | undefined;
-  signal?: AbortSignal | undefined;
 }

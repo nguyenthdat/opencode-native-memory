@@ -30,7 +30,7 @@ The plugin automatically registers its packaged `rules/native-memory.md`; the de
 Useful manual checks:
 
 ```text
-Call memory_status and show protocol, schema, model, dimensions, and capabilities.
+Call memory_status and show plugin health, protocol, schema, model, dimensions, and capabilities.
 Search memory for the demo server entry point.
 Try deleting the repository-scoped architecture record and confirm the backend rejects it.
 Export a snapshot, purge with explicit confirmation, import the snapshot JSON, then search again.

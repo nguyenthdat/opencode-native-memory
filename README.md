@@ -28,6 +28,17 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 }
 ```
 
+The package also includes an OpenCode TUI companion. Enable it in `tui.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": ["@nguyenthdat/opencode-memory@0.6.0-beta.0"]
+}
+```
+
+Use the project `.opencode/tui.json` or the user-level `~/.config/opencode/tui.json` depending on the desired scope. The companion displays `Memory: checking`, `Memory: healthy`, `Memory: degraded`, or `Memory: unavailable` in the TUI bottom bar. Run `/memory-health` to refresh it and show the detailed result as a toast. OpenCode's plugin installer can configure both the server and TUI entrypoints from the same package.
+
 On a supported platform, npm installs one matching optional native package. Reinstall without `--omit=optional`; the plugin intentionally has no postinstall script or runtime binary download.
 
 ### How the daemon is installed
@@ -36,7 +47,7 @@ The plugin does not install a global daemon, `systemd` unit, `launchd` service, 
 
 When OpenCode loads the TypeScript plugin, no native process is started yet. On the first memory request, the plugin resolves the executable from the installed native package, validates the private per-user runtime directory and socket, and connects to an existing compatible daemon when one is already running. If no daemon is available, one contender acquires the startup lock and launches the packaged executable in detached `--daemon` mode; concurrent OpenCode processes wait for the same endpoint instead of starting additional daemons.
 
-The daemon is therefore installed and upgraded as part of the npm plugin dependency graph, but started lazily at runtime. It exits automatically after the configured idle interval and is started again on the next memory request. Set `OPENCODE_NATIVE_MEMORY_BIN` only for a development binary override, or `OPENCODE_MEMORY_TRANSPORT=sidecar` for the temporary beta rollback path.
+The daemon is therefore installed and upgraded as part of the npm plugin dependency graph, but started lazily at runtime. It exits automatically after the configured idle interval and is started again on the next memory request. Set `OPENCODE_NATIVE_MEMORY_BIN` only for a development binary override.
 
 Supported packages:
 
@@ -72,7 +83,7 @@ The plugin automatically registers its packaged `rules/native-memory.md` as an O
 | `memory_import`          | Validate and restore a portable JSON snapshot                             |
 | `memory_feedback`        | Record whether recalled memories were useful                              |
 | `memory_optimize`        | Prune expired records and optimize indexes                                |
-| `memory_status`          | Inspect backend, model, and schema status                                 |
+| `memory_status`          | Health-check the plugin and inspect backend, model, and schema status     |
 | `memory_doctor`          | Run shallow or deep integrity checks                                      |
 | `memory_purge`           | Confirm and delete the complete project store                             |
 
@@ -119,7 +130,6 @@ Changing model identity or vector-affecting preprocessing requires rebuilding th
 | `OPENCODE_MEMORY_MODEL_CACHE`                | Replace the complete local Hugging Face model-cache path                     |
 | `OPENCODE_MEMORY_REQUEST_TIMEOUT_MS`         | Native RPC timeout in milliseconds; default 5 minutes, maximum 2 hours       |
 | `OPENCODE_NATIVE_MEMORY_BIN`                 | Development/debug native daemon binary override                              |
-| `OPENCODE_MEMORY_TRANSPORT`                  | `daemon` by default; temporary `sidecar` beta rollback                       |
 | `OPENCODE_MEMORY_PROJECT_IDLE_SECONDS`       | Release an unleased project actor after 5 minutes                            |
 | `OPENCODE_MEMORY_DAEMON_IDLE_SECONDS`        | Stop the daemon after 10 minutes with no sessions or project activity        |
 | `OPENCODE_MEMORY_WARMUP`                     | Enable model/shared-memory warmup; default `true`                            |

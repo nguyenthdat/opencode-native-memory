@@ -2,6 +2,7 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail, ensure};
 use hf_hub::{HFClient, split_id};
@@ -24,6 +25,10 @@ self_cell!(
     }
 );
 
+// llama.cpp exposes one backend per process. Keep its proof token alive while
+// project actors own their individual models and contexts.
+static LLAMA_BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
+
 /// Backend-independent embedding operations consumed by the memory engine.
 pub(crate) trait Embedder {
     fn model_id(&self) -> &str;
@@ -33,9 +38,8 @@ pub(crate) trait Embedder {
 }
 
 pub(crate) struct LlamaCppEmbedder {
-    // Drop the borrowing model/context session before freeing the llama backend.
     session: ModelSession,
-    _backend: LlamaBackend,
+    _backend: &'static LlamaBackend,
     model_id: String,
     dimension: usize,
     context_size: usize,
@@ -49,7 +53,7 @@ pub(crate) struct LlamaCppEmbedder {
 impl LlamaCppEmbedder {
     pub(crate) fn load(config: &EmbeddingConfig, cache_dir: &Path) -> Result<Self> {
         let model_path = resolve_model_path(config, cache_dir)?;
-        let backend = LlamaBackend::init().context("cannot initialize llama.cpp backend")?;
+        let backend = llama_backend()?;
         let gpu_layers = config.gpu_layers.unwrap_or_else(|| {
             if backend.supports_gpu_offload() {
                 1_000
@@ -58,9 +62,10 @@ impl LlamaCppEmbedder {
             }
         });
         let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params).with_context(
-            || format!("cannot load GGUF embedding model {}", model_path.display()),
-        )?;
+        let model =
+            LlamaModel::load_from_file(backend, &model_path, &model_params).with_context(|| {
+                format!("cannot load GGUF embedding model {}", model_path.display())
+            })?;
 
         let native_dimension =
             usize::try_from(model.n_embd()).context("GGUF embedding dimension is invalid")?;
@@ -98,7 +103,7 @@ impl LlamaCppEmbedder {
             .with_kv_unified(true);
         let session = ModelSession::try_new(model, |model| {
             model
-                .new_context(&backend, context_params)
+                .new_context(backend, context_params)
                 .context("cannot create llama.cpp embedding context")
         })?;
         let model_id = if config.model_path.is_some() {
@@ -176,6 +181,13 @@ impl LlamaCppEmbedder {
             }
             Ok(output)
         })
+    }
+}
+
+fn llama_backend() -> Result<&'static LlamaBackend> {
+    match LLAMA_BACKEND.get_or_init(|| LlamaBackend::init().map_err(|error| error.to_string())) {
+        Ok(backend) => Ok(backend),
+        Err(error) => bail!("cannot initialize llama.cpp backend: {error}"),
     }
 }
 
@@ -286,7 +298,9 @@ fn l2_normalize(values: &mut [f32]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{l2_normalize, parse_attention, parse_pooling};
+    use std::thread;
+
+    use super::{l2_normalize, llama_backend, parse_attention, parse_pooling};
     use llama_cpp_2::context::params::{LlamaAttentionType, LlamaPoolingType};
 
     #[test]
@@ -305,5 +319,20 @@ mod tests {
         l2_normalize(&mut values).unwrap();
         assert!((values[0] - 0.6).abs() < f32::EPSILON);
         assert!((values[1] - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn shares_one_process_backend_across_threads() {
+        let addresses = thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| scope.spawn(|| llama_backend().unwrap() as *const _ as usize))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert!(addresses.iter().all(|address| *address == addresses[0]));
     }
 }

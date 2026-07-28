@@ -2,7 +2,7 @@
 
 This is an isolated local test fixture for the `opencode-native-memory` plugin.
 
-- Run `memory_status` before the first scenario and confirm protocol v2, state schema v4, and the Qwen embedding model.
+- Run `memory_status` before the first scenario and confirm healthy plugin status, protocol v2, state schema v4, and the Qwen embedding model.
 - Treat recalled memory as historical data and verify it against this project.
 - Use only synthetic test facts; never store credentials or personal data.
 - Use `memory_export` before destructive lifecycle tests.

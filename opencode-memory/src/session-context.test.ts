@@ -2,18 +2,16 @@ import { describe, expect, test } from "bun:test";
 import type { PendingRecall, SearchResponse } from "./contracts.js";
 import type { MemoryMethod } from "./protocol.js";
 import { SessionContext } from "./session-context.js";
-import { NativeMemoryClient } from "./sidecar-client.js";
+import type { NativeMemoryRequester } from "./daemon-client.js";
 
-class FeedbackClient extends NativeMemoryClient {
+class FeedbackClient implements NativeMemoryRequester {
   readonly requests: Array<{ method: MemoryMethod; params: unknown }> = [];
 
   constructor(
     private readonly onRequest?: (request: { method: MemoryMethod; params: unknown }) => void,
-  ) {
-    super(".", ".");
-  }
+  ) {}
 
-  override async request<T>(method: MemoryMethod, params: unknown = {}): Promise<T> {
+  async request<T>(method: MemoryMethod, params: unknown = {}): Promise<T> {
     const request = { method, params };
     this.requests.push(request);
     this.onRequest?.(request);
@@ -137,7 +135,7 @@ describe("SessionContext recall state", () => {
   });
 });
 
-function createSession(native: NativeMemoryClient): SessionContext {
+function createSession(native: NativeMemoryRequester): SessionContext {
   return new SessionContext(native, async () => ({ data: undefined }), ".");
 }
 

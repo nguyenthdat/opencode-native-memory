@@ -4,6 +4,8 @@
     "module": "ESNext",
     "lib": ["ES2023"],
     "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/solid",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -14,6 +16,11 @@
     "skipLibCheck": true,
     "types": ["bun", "node"]
   },
-  "include": ["opencode-memory/src/**/*.ts", "tests/ts/**/*.ts", "tests/benchmark/**/*.ts"],
+  "include": [
+    "opencode-memory/src/**/*.ts",
+    "opencode-memory/src/**/*.tsx",
+    "tests/ts/**/*.ts",
+    "tests/benchmark/**/*.ts"
+  ],
   "exclude": ["dist", "node_modules", "target"]
 }
