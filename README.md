@@ -24,7 +24,7 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@nguyenthdat/opencode-memory@0.6.0-beta.0"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.6.0-beta.2"]
 }
 ```
 
@@ -33,7 +33,7 @@ The package also includes an OpenCode TUI companion. Enable it in `tui.json`:
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["@nguyenthdat/opencode-memory@0.6.0-beta.0"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.6.0-beta.2"]
 }
 ```
 
