@@ -13,6 +13,7 @@ import { buildMemoryStatusResponse } from "./plugin-health.js";
 
 const PLUGIN_ID = "@nguyenthdat/opencode-memory";
 const DEFAULT_REFRESH_INTERVAL_MS = 30_000;
+const DEFAULT_HEALTH_CHECK_TIMEOUT_MS = 15_000;
 
 export interface MemoryTuiHealth {
   status: MemoryPluginHealthStatus | "checking";
@@ -22,6 +23,7 @@ export interface MemoryTuiHealth {
 
 interface MemoryTuiDependencies {
   acquireClient?: (root: string, worktree: string) => Promise<NativeMemoryClientLease>;
+  healthCheckTimeoutMs?: number;
   refreshIntervalMs?: number;
 }
 
@@ -30,6 +32,8 @@ export function createMemoryTui(root: string, dependencies: MemoryTuiDependencie
     if (options?.enabled === false) return;
 
     const acquireClient = dependencies.acquireClient ?? acquireNativeMemoryClient;
+    const healthCheckTimeoutMs =
+      dependencies.healthCheckTimeoutMs ?? DEFAULT_HEALTH_CHECK_TIMEOUT_MS;
     const refreshIntervalMs = dependencies.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS;
     const worktree = api.state.path.worktree || api.state.path.directory;
     const lease = await acquireClient(root, worktree);
@@ -42,10 +46,10 @@ export function createMemoryTui(root: string, dependencies: MemoryTuiDependencie
 
     const checkHealth = async (): Promise<MemoryTuiHealth> => {
       try {
-        const status = await lease.client.request<NativeMemoryStatus>(
-          "status",
-          {},
+        const status = await requestHealthStatus(
+          lease.client,
           api.lifecycle.signal,
+          healthCheckTimeoutMs,
         );
         const next = tuiHealth(
           buildMemoryStatusResponse(
@@ -127,6 +131,35 @@ export function createMemoryTui(root: string, dependencies: MemoryTuiDependencie
 
 export function memoryHealthText(health: MemoryTuiHealth): string {
   return `Memory: ${health.status.replace("_", " ")}`;
+}
+
+export async function requestHealthStatus(
+  client: NativeMemoryClientLease["client"],
+  lifecycleSignal: AbortSignal,
+  timeoutMs: number,
+): Promise<NativeMemoryStatus> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Memory health check timeout must be greater than zero");
+  }
+  const timeoutController = new AbortController();
+  const requestSignal = AbortSignal.any([lifecycleSignal, timeoutController.signal]);
+  const timeoutError = new Error(`Memory health check timed out after ${timeoutMs} ms`);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(timeoutError);
+      timeoutController.abort(timeoutError);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      client.request<NativeMemoryStatus>("status", {}, requestSignal),
+      timeoutPromise,
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    timeoutController.abort();
+  }
 }
 
 function MemoryHealthBadge(props: { api: TuiPluginApi; health: () => MemoryTuiHealth }) {

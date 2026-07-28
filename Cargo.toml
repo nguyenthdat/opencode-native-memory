@@ -32,7 +32,7 @@ serde_json = "1.0"
 sha2 = "0.11"
 rustix = { version = "1.1", features = ["fs", "process"] }
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
-xberg = { version = "=1.0.0-rc.39", default-features = false, features = ["tokio-runtime", "simd-utf8", "pdf"] }
+xberg = { version = "=1.0.0", default-features = false, features = ["tokio-runtime", "simd-utf8", "pdf"] }
 zvec-rust = "=0.6.0"
 
 [build-dependencies]

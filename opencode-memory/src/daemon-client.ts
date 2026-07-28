@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -158,13 +158,16 @@ class DaemonProjectClient implements NativeMemoryRequester {
   private pending = new Map<string, PendingDaemonRequest>();
   private heartbeat: ReturnType<typeof setInterval> | undefined;
   private heartbeatInFlight = false;
+  private readonly pluginVersion: string;
   readonly endpoint = resolveDaemonEndpoint();
 
   constructor(
     private readonly root: string,
     private readonly worktree: string,
     private readonly requestTimeoutMs: number,
-  ) {}
+  ) {
+    this.pluginVersion = resolvePluginVersion(root);
+  }
 
   async request<T>(method: MemoryMethod, params: unknown = {}, signal?: AbortSignal): Promise<T> {
     if (this.disposed) throw new Error("Native memory client is disposed");
@@ -309,7 +312,7 @@ class DaemonProjectClient implements NativeMemoryRequester {
         minimumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
         maximumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
         domainSchemaGeneration: DOMAIN_SCHEMA_GENERATION,
-        pluginVersion: process.env.npm_package_version ?? "development",
+        pluginVersion: this.pluginVersion,
       });
       const session = await this.send({ case: "openSession", value: hello }, CONNECT_TIMEOUT_MS);
       if (session.body.case !== "openSession") {
@@ -409,12 +412,13 @@ class DaemonProjectClient implements NativeMemoryRequester {
           "Close active OpenCode processes and restart the native memory daemon.",
       );
     }
+    assertDaemonVersionCompatible(this.pluginVersion, daemon.daemonVersion, daemon.pid);
     const hello = create(OpenSessionRequestSchema, {
       clientInstanceId: randomUUID(),
       minimumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
       maximumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
       domainSchemaGeneration: DOMAIN_SCHEMA_GENERATION,
-      pluginVersion: process.env.npm_package_version ?? "development",
+      pluginVersion: this.pluginVersion,
     });
     const sessionResponse = await this.send(
       { case: "openSession", value: hello },
@@ -811,12 +815,39 @@ export function resolveNativeMemoryBinary(root: string): string {
   );
 }
 
+export function assertDaemonVersionCompatible(
+  pluginVersion: string,
+  daemonVersion: string,
+  daemonPid?: number,
+): void {
+  if (pluginVersion === "development" || pluginVersion === daemonVersion) return;
+  const pid = daemonPid === undefined ? "" : ` (pid ${daemonPid})`;
+  throw new Error(
+    `Native memory daemon version mismatch${pid}: plugin ${pluginVersion}, daemon ${daemonVersion}. ` +
+      "Close all OpenCode processes using memory and restart OpenCode to replace the daemon.",
+  );
+}
+
 function resolvePackagedBinary(packageName: string, binaryName: string): string | undefined {
   try {
     return require.resolve(`${packageName}/bin/${binaryName}`);
   } catch {
     return undefined;
   }
+}
+
+function resolvePluginVersion(root: string): string {
+  try {
+    const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8")) as {
+      version?: unknown;
+    };
+    if (typeof packageJson.version === "string" && packageJson.version.length > 0) {
+      return packageJson.version;
+    }
+  } catch {
+    // Development callers may not have a package manifest at their root.
+  }
+  return "development";
 }
 
 async function bootstrapDaemon(root: string, endpoint: string): Promise<void> {

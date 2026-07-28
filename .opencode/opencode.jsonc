@@ -27,6 +27,12 @@
         "BW_SESSION": "{env:BW_SESSION}"
       }
     },
+    "huggingface": {
+      "type": "remote",
+      "url": "https://huggingface.co/mcp",
+      "headers": { "Authorization": "Bearer {env:HF_TOKEN}" },
+      "enabled": true,
+    }
   },
   "instructions": [".opencode/instructions/parallel-agents.md"],
 }

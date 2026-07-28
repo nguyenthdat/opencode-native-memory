@@ -2845,9 +2845,9 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pdf_oxide"
-version = "0.3.75"
+version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e00ca5f52780bb764da7fc1783c0c6f549fcf960d69734c8d7cf7996bdbb49d"
+checksum = "a5ec03a138df06a1b063e5053bd957aab153ccfb5a59a326e285b57b3e1bd600"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -5328,9 +5328,9 @@ dependencies = [
 
 [[package]]
 name = "xberg"
-version = "1.0.0-rc.39"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09031aaea0b1eb0d4449308c099ba0a13f8dbe504eb8e586032b6e4cedef0ba9"
+checksum = "168f315820177c06756e6203c1095a48cfb7232481266e38c6dcb46b92aebfce"
 dependencies = [
  "ahash",
  "async-trait",

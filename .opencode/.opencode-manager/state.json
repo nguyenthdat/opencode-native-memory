@@ -30,6 +30,12 @@
       "sourcePath": "typescript-coding",
       "name": "typescript-coding",
       "digest": "69a49dc45760a4230823f31d7b705d4e26d8de960ca98f03a1d31e9a15d5e686"
+    },
+    "custom:design-patterns": {
+      "source": "custom",
+      "sourcePath": "design-patterns",
+      "name": "design-patterns",
+      "digest": "c9c57296a0ba4e461e2908c5b4ded329b52feef2696301e31df5487687c890f6"
     }
   },
   "rules": {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  assertDaemonVersionCompatible,
   NativeMemoryClient,
   NativeMemoryClientPool,
   resolveDaemonEndpoint,
@@ -34,6 +35,14 @@ describe("shared daemon client", () => {
   test("rejects invalid custom request timeouts before opening a transport", () => {
     expect(() => new NativeMemoryClient(".", ".", 0)).toThrow("request timeout");
     expect(() => new NativeMemoryClient(".", ".", Number.NaN)).toThrow("request timeout");
+  });
+
+  test("rejects a stale daemon version but permits development clients", () => {
+    expect(() => assertDaemonVersionCompatible("0.6.0-beta.2", "0.6.0-beta.0", 64346)).toThrow(
+      "Close all OpenCode processes using memory and restart OpenCode",
+    );
+    expect(() => assertDaemonVersionCompatible("0.6.0-beta.2", "0.6.0-beta.2")).not.toThrow();
+    expect(() => assertDaemonVersionCompatible("development", "0.6.0-beta.0")).not.toThrow();
   });
 
   test("releases the shared project client only after the final local lease", async () => {

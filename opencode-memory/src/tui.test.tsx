@@ -2,7 +2,8 @@
 import { describe, expect, test } from "bun:test";
 import type { NativeMemoryStatus } from "./contracts.js";
 import type { NativeMemoryClientLease } from "./daemon-client.js";
-import memoryTui, { createMemoryTui, memoryHealthText } from "./tui.js";
+import type { MemoryMethod } from "./protocol.js";
+import memoryTui, { createMemoryTui, memoryHealthText, requestHealthStatus } from "./tui.js";
 
 interface TestCommand {
   name: string;
@@ -129,5 +130,30 @@ describe("memory TUI plugin", () => {
     expect(memoryHealthText({ status: "unavailable", ready: false, message: "down" })).toBe(
       "Memory: unavailable",
     );
+  });
+
+  test("times out a health request that never completes", async () => {
+    const controller = new AbortController();
+    let aborted = false;
+    const client: NativeMemoryClientLease["client"] = {
+      async request<T>(_method: MemoryMethod, _params?: unknown, signal?: AbortSignal): Promise<T> {
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        return await new Promise<T>(() => undefined);
+      },
+    };
+
+    await expect(requestHealthStatus(client, controller.signal, 5)).rejects.toThrow(
+      "Memory health check timed out after 5 ms",
+    );
+    expect(aborted).toBe(true);
   });
 });
