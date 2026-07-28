@@ -53,7 +53,7 @@ OpenCode process
   -> one zvec collection + state + embedding model
 ```
 
-The client pool in `opencode-memory/src/sidecar-client.ts` is process-local. `globalThis` and `Symbol.for(...)` share clients only inside one JavaScript process; they cannot coordinate separate OpenCode processes.
+The old client pool was process-local. `globalThis` and `Symbol.for(...)` share clients only inside one JavaScript process; they cannot coordinate separate OpenCode processes.
 
 The first request performs the following sequence:
 
@@ -793,7 +793,7 @@ The migration must update:
 
 ### Replace sidecar ownership with daemon connection ownership
 
-Refactor `opencode-memory/src/sidecar-client.ts` into a daemon client, or introduce `daemon-client.ts` behind a stable `NativeMemoryClient`-like interface.
+Refactor the old client into a daemon client, or introduce `daemon-client.ts` behind a stable `NativeMemoryClient`-like interface.
 
 The plugin-facing interface should continue to expose:
 
@@ -1065,13 +1065,7 @@ Running
 
 An incompatible client must not create a generation-specific endpoint. If the current daemon is busy, the client returns its version, PID, and a clear restart action. If the daemon is idle and the local control policy permits it, the client can request drain; otherwise the user restarts after active clients exit. The daemon itself, not a plugin, owns endpoint removal and lifetime-lock release.
 
-During the transition, keep a temporary environment flag:
-
-```text
-OPENCODE_MEMORY_TRANSPORT=sidecar|daemon
-```
-
-Use `sidecar` only as a rollback path during beta testing. Remove the flag after the daemon path is proven in release CI unless a permanent compatibility mode is explicitly required.
+The temporary sidecar rollback flag was removed after the daemon path became the default. The TypeScript plugin now uses only the shared daemon transport.
 
 ## Rollout Phases
 
@@ -1136,7 +1130,7 @@ Deliverables:
 - timeout behavior that does not kill the daemon;
 - session reconnect and lease reacquisition without replaying admitted mutations;
 - protocol-version conflict detection and controlled drain request;
-- temporary sidecar fallback flag;
+- daemon-only transport after removal of the temporary sidecar fallback;
 - plugin integration in `createMemoryPlugin`.
 
 Exit criteria:
@@ -1342,7 +1336,7 @@ The migration is complete when all of the following are true:
 
 ### TypeScript
 
-- `opencode-memory/src/sidecar-client.ts`: replace child lifecycle with daemon connection lifecycle, or move implementation to a new `daemon-client.ts`.
+- `opencode-memory/src/daemon-client.ts`: own daemon bootstrap, connection, session, project lease, and reconnect lifecycle.
 - `opencode-memory/src/plugin.ts`: acquire/release daemon project lease; preserve tool behavior.
 - `opencode-memory/src/protocol.ts`: retain domain mapping and add daemon envelope/client bindings as appropriate.
 - `opencode-memory/src/background-jobs.ts`: later move durable job state to daemon.
@@ -1371,7 +1365,7 @@ Protocol generation and verification:
 
 Tests and CI:
 
-- `opencode-memory/src/sidecar-client.test.ts`: migrate lifecycle tests to daemon connection semantics.
+- `opencode-memory/src/daemon-client.test.ts`: cover daemon connection and shared lease lifecycle.
 - `opencode-memory/src/protocol.test.ts`: add daemon envelopes and generated service tests.
 - `tests/`: add Rust daemon integration tests.
 - `scripts/` or `tests/`: add multi-process black-box tests.
@@ -1381,7 +1375,7 @@ Tests and CI:
 
 ### Repository evidence
 
-- Current client pool and child process lifecycle: [`opencode-memory/src/sidecar-client.ts`](../opencode-memory/src/sidecar-client.ts)
+- Current daemon client pool and connection lifecycle: [`opencode-memory/src/daemon-client.ts`](../opencode-memory/src/daemon-client.ts)
 - Plugin lease and disposal lifecycle: [`opencode-memory/src/plugin.ts`](../opencode-memory/src/plugin.ts)
 - Lazy engine initialization and status dispatch: [`src/rpc.rs`](../src/rpc.rs)
 - Engine ownership and model load order: [`src/engine/mod.rs`](../src/engine/mod.rs)
