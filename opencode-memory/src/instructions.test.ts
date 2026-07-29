@@ -34,6 +34,17 @@ describe("memory instructions", () => {
     expect(asset.content).toContain("existing regular files verified relative to the project root");
   });
 
+  test("the packaged workflow defines native personalization semantics", async () => {
+    const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+
+    const asset = await loadMemoryInstructions(packageRoot);
+
+    expect(asset.content).toContain("`default_user`");
+    expect(asset.content).toContain("automatic recall");
+    expect(asset.content).toContain("Do not begin a response with `Remembering...`");
+    expect(asset.content).toContain("user_relationship");
+  });
+
   test("registers once while preserving existing instructions", async () => {
     const root = await createRoot();
     const asset = await loadMemoryInstructions(root);

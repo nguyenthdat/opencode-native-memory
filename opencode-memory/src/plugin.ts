@@ -17,6 +17,7 @@ import {
   LOCK_ACTIONS,
   MEMORY_TAXONOMIES,
   RETRIEVAL_MODES,
+  isUserProfileTaxonomy,
 } from "./contracts.js";
 import { acquireNativeMemoryClient } from "./daemon-client.js";
 import {
@@ -26,6 +27,8 @@ import {
   contextBudgetChars,
   parseCuratedCandidates,
   deriveRecallQuery,
+  extractDirectUserEvidence,
+  hasDirectUserEvidence,
 } from "./policy.js";
 import {
   MEMORY_INSTRUCTIONS_MARKER,
@@ -248,7 +251,8 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             path: { id: event.properties.sessionID },
             query: { directory, limit: 50 },
           });
-          const summary = response.data
+          const messages = response.data ?? [];
+          const summary = messages
             ?.toReversed()
             .find((message) => message.info.role === "assistant" && message.info.summary === true);
           if (!summary) return;
@@ -257,14 +261,15 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             .join("\n")
             .trim();
           if (!content) return;
-          const candidates = parseCuratedCandidates(content);
+          const candidates = parseCuratedCandidates(content, extractDirectUserEvidence(messages));
           let storedAny = false;
           for (const candidate of candidates) {
             try {
+              const userProfile = isUserProfileTaxonomy(candidate.taxonomy);
               const capture = await captureWithOutcomeReconciliation(native, {
                 candidate: {
                   ...candidate,
-                  source: `session:${event.properties.sessionID}:compaction`,
+                  source: `session:${event.properties.sessionID}:compaction${userProfile ? ":user" : ""}`,
                   scope: "project",
                   origin: "auto_compaction",
                   revive: false,
@@ -272,8 +277,8 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 significance: candidate.importance,
                 impact: candidate.kind === "decision" || candidate.kind === "gotcha" ? 0.8 : 0.6,
                 rarity: candidate.code_paths.length > 0 ? 0.7 : 0.5,
-                source_trust: "agent",
-                has_valid_evidence: candidate.code_paths.length > 0,
+                source_trust: userProfile ? "user" : "agent",
+                has_valid_evidence: userProfile || candidate.code_paths.length > 0,
                 suggested_supersession_ids: [],
                 suggested_conflict_ids: [],
               });
@@ -526,7 +531,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         }),
         memory_store: tool({
           description:
-            "Store one distilled, durable project memory. Never store secrets, raw conversations, temporary logs, unverified guesses, or guessed code_paths.",
+            "Store one distilled, durable project memory or explicit default_user personalization observation. Never store secrets, raw conversations, inferred sensitive traits, temporary logs, unverified guesses, or guessed code_paths.",
           args: {
             content: tool.schema
               .string()
@@ -581,7 +586,17 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             taxonomy: tool.schema
               .enum(MEMORY_TAXONOMIES)
               .optional()
-              .describe("Explicit memory taxonomy; usually omit so it is inferred."),
+              .describe(
+                "Explicit taxonomy. Use user_identity, user_behavior, user_preference, user_goal, or user_relationship only for information stated directly by default_user.",
+              ),
+            evidence_quote: tool.schema
+              .string()
+              .min(3)
+              .max(500)
+              .optional()
+              .describe(
+                "Required for user_* personalization taxonomies: a short verbatim excerpt from the current default_user message. Used only for provenance validation and never stored.",
+              ),
             confidence: tool.schema
               .number()
               .min(0)
@@ -590,6 +605,20 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .describe("Confidence in this memory; defaults from importance."),
           },
           async execute(args, context) {
+            const { evidence_quote: evidenceQuote, ...storeArgs } = args;
+            const userProfile = isUserProfileTaxonomy(storeArgs.taxonomy);
+            if (userProfile) {
+              const expectedKind = storeArgs.taxonomy === "user_preference" ? "preference" : "fact";
+              if (storeArgs.kind !== expectedKind) {
+                throw new Error(`${storeArgs.taxonomy} requires memory kind ${expectedKind}`);
+              }
+              const currentUserText = session.latestQuery.get(context.sessionID)?.query;
+              if (!currentUserText || !hasDirectUserEvidence(evidenceQuote, [currentUserText])) {
+                throw new Error(
+                  `${storeArgs.taxonomy} requires evidence_quote copied verbatim from the current default_user message`,
+                );
+              }
+            }
             if (args.revive) {
               await context.ask({
                 permission: "memory_revive",
@@ -602,7 +631,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             const response = await native.request<Record<string, unknown>>(
               "store",
               {
-                ...args,
+                ...storeArgs,
                 scope_key: key,
                 origin: "manual",
                 source: `session:${context.sessionID}`,

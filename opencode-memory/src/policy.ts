@@ -1,14 +1,15 @@
 import type { CuratedCandidate, SearchResponse } from "./contracts.js";
-import { MEMORY_KINDS } from "./contracts.js";
+import { MEMORY_KINDS, MEMORY_TAXONOMIES, isUserProfileTaxonomy } from "./contracts.js";
 
 export const CANDIDATES_OPEN = "<durable-memory-candidates>";
 export const CANDIDATES_CLOSE = "</durable-memory-candidates>";
 
-export const COMPACTION_CONTEXT = `Preserve durable project knowledge across compaction, but never copy the full summary into memory. Exclude secrets, guesses, transient progress, and conversational detail. End the summary with exactly this block containing a JSON array of at most three verified, atomic candidates (or []):
+export const COMPACTION_CONTEXT = `Preserve durable project knowledge across compaction, but never copy the full summary into memory. Exclude secrets, guesses, transient progress, and conversational detail. The current user is default_user. End the summary with exactly this block containing a JSON array of at most three verified, atomic candidates (or []):
 ${CANDIDATES_OPEN}
-[{"title":"...","content":"...","kind":"decision|preference|fact|pattern|gotcha","importance":0.0,"tags":["..."],"code_paths":[]}]
+[{"title":"...","content":"...","kind":"decision|preference|fact|pattern|gotcha","taxonomy":"decision","importance":0.0,"tags":["..."],"code_paths":[]}]
 ${CANDIDATES_CLOSE}
-Importance must be between 0 and 0.6 inclusive. code_paths entries must be verified existing regular files relative to the project root; never infer or guess a path. Facts require at least one such verified path, so omit a fact candidate when no verified file applies. Do not include Markdown fences.`;
+Importance must be between 0 and 0.6 inclusive. code_paths entries must be verified existing regular files relative to the project root; never infer or guess a path. Project facts require at least one such verified path, so omit a project fact candidate when no verified file applies.
+Personalization is limited to explicit, durable information stated directly by default_user and relevant to future coding collaboration. Use taxonomy user_identity, user_behavior, user_preference, user_goal, or user_relationship; use kind preference only for user_preference and fact for the other four. Add evidence_quote containing a short verbatim excerpt from default_user's message. Never infer sensitive traits, expand a relationship beyond what the user stated, or preserve the evidence quote in content. Omit personal candidates without exact user evidence. Do not include Markdown fences.`;
 
 interface RecallQueryPart {
   type: string;
@@ -19,6 +20,11 @@ interface RecallQueryPart {
   mime?: unknown;
   url?: unknown;
   source?: unknown;
+}
+
+interface ConversationMessage {
+  info?: { role?: unknown };
+  parts?: readonly RecallQueryPart[];
 }
 
 export function deriveRecallQuery(parts: readonly RecallQueryPart[]): string | undefined {
@@ -53,6 +59,24 @@ export function deriveRecallQuery(parts: readonly RecallQueryPart[]): string | u
   return query || undefined;
 }
 
+export function extractDirectUserEvidence(messages: readonly ConversationMessage[]): string[] {
+  return messages.flatMap((message) => {
+    if (message.info?.role !== "user" || !message.parts) return [];
+    const text = message.parts
+      .flatMap((part) =>
+        part.type === "text" &&
+        typeof part.text === "string" &&
+        part.synthetic !== true &&
+        part.ignored !== true
+          ? [part.text]
+          : [],
+      )
+      .join("\n")
+      .trim();
+    return text ? [text] : [];
+  });
+}
+
 export function formatRecalledMemories(
   response: SearchResponse,
   budgetChars: number,
@@ -72,6 +96,11 @@ export function formatRecalledMemories(
       tags: memory.tags,
       code_paths: memory.code_anchors.map((anchor) => anchor.path),
       source: memory.source,
+      taxonomy: memory.taxonomy,
+      confidence: memory.confidence,
+      superseded_by: memory.superseded_by,
+      supersedes: memory.supersedes,
+      conflict_with: memory.conflict_with,
     };
     const next = [...memories, candidate];
     const serialized = safeJson(next);
@@ -103,7 +132,10 @@ export function safeJson(value: unknown): string {
   return JSON.stringify(value, null, 2).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e");
 }
 
-export function parseCuratedCandidates(content: string): CuratedCandidate[] {
+export function parseCuratedCandidates(
+  content: string,
+  directUserEvidence: readonly string[] = [],
+): CuratedCandidate[] {
   const start = content.lastIndexOf(CANDIDATES_OPEN);
   const end = content.indexOf(CANDIDATES_CLOSE, start + CANDIDATES_OPEN.length);
   if (start < 0 || end < 0) return [];
@@ -117,17 +149,39 @@ export function parseCuratedCandidates(content: string): CuratedCandidate[] {
   if (!Array.isArray(parsed)) return [];
   const candidates: CuratedCandidate[] = [];
   for (const value of parsed) {
-    const candidate = parseCuratedCandidate(value);
+    const candidate = parseCuratedCandidate(value, directUserEvidence);
     if (candidate) candidates.push(candidate);
     if (candidates.length === 3) break;
   }
   return candidates;
 }
 
-function parseCuratedCandidate(value: unknown): CuratedCandidate | undefined {
+function parseCuratedCandidate(
+  value: unknown,
+  directUserEvidence: readonly string[],
+): CuratedCandidate | undefined {
   if (!isObject(value)) return undefined;
-  const allowed = new Set(["title", "content", "kind", "importance", "tags", "code_paths"]);
+  const allowed = new Set([
+    "title",
+    "content",
+    "kind",
+    "taxonomy",
+    "importance",
+    "tags",
+    "code_paths",
+    "evidence_quote",
+  ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) return undefined;
+  const taxonomy = MEMORY_TAXONOMIES.includes(value.taxonomy as (typeof MEMORY_TAXONOMIES)[number])
+    ? (value.taxonomy as (typeof MEMORY_TAXONOMIES)[number])
+    : undefined;
+  if (value.taxonomy !== undefined && taxonomy === undefined) return undefined;
+  const userProfile = isUserProfileTaxonomy(taxonomy);
+  const expectedUserKind = taxonomy === "user_preference" ? "preference" : "fact";
+  if (userProfile && value.kind !== expectedUserKind) return undefined;
+  if (userProfile && !hasDirectUserEvidence(value.evidence_quote, directUserEvidence)) {
+    return undefined;
+  }
   if (
     typeof value.title !== "string" ||
     value.title.length === 0 ||
@@ -143,7 +197,7 @@ function parseCuratedCandidate(value: unknown): CuratedCandidate | undefined {
     value.importance > 0.6 ||
     !isStringArray(value.tags, 12, 64) ||
     !isStringArray(value.code_paths, 12, 512) ||
-    (value.kind === "fact" && value.code_paths.length === 0)
+    (value.kind === "fact" && value.code_paths.length === 0 && !userProfile)
   ) {
     return undefined;
   }
@@ -154,7 +208,22 @@ function parseCuratedCandidate(value: unknown): CuratedCandidate | undefined {
     importance: value.importance,
     tags: value.tags,
     code_paths: value.code_paths,
+    ...(taxonomy ? { taxonomy } : {}),
   };
+}
+
+export function hasDirectUserEvidence(
+  value: unknown,
+  directUserEvidence: readonly string[],
+): boolean {
+  if (typeof value !== "string") return false;
+  const quote = normalizeEvidence(value);
+  if (quote.length < 3 || quote.length > 500) return false;
+  return directUserEvidence.some((message) => normalizeEvidence(message).includes(quote));
+}
+
+function normalizeEvidence(value: string): string {
+  return value.split(/\s+/u).filter(Boolean).join(" ").trim();
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

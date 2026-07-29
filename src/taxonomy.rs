@@ -2,7 +2,7 @@
 //!
 //! The taxonomy is a deterministic, type-aware classification layer that sits
 //! on top of the existing `MemoryKind`/`MemoryScope`/code-anchor signals. It
-//! drives retrieval profile selection in Phase 1 and is stored on every v3
+//! drives retrieval profile selection in Phase 1 and is stored on every v4
 //! lifecycle record. Inference is a pure fallback used when a caller does not
 //! supply an explicit taxonomy; it never overrides an explicit value.
 
@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::{CodeAnchor, MemoryKind, MemoryScope};
 
-/// The 15-variant Phase 1 memory taxonomy.
+/// The 20-variant memory taxonomy.
 ///
-/// Variants are serialised as `snake_case` strings and are stable for the v3
+/// Variants are serialised as `snake_case` strings and are stable for the v4
 /// state schema. The `Default` variant is `SessionSummary` to match the
 /// `MemoryKind::Summary` default so that `MemoryTaxonomy::default()` agrees
 /// with `MemoryTaxonomy::infer(MemoryKind::default(), MemoryScope::default(),
@@ -27,6 +27,11 @@ pub enum MemoryTaxonomy {
     ArchitectureFact,
     CodebaseFact,
     UserFact,
+    UserIdentity,
+    UserBehavior,
+    UserPreference,
+    UserGoal,
+    UserRelationship,
     FixPattern,
     CodeTemplate,
     ToolHeuristic,
@@ -49,6 +54,11 @@ impl MemoryTaxonomy {
             Self::ArchitectureFact => "architecture_fact",
             Self::CodebaseFact => "codebase_fact",
             Self::UserFact => "user_fact",
+            Self::UserIdentity => "user_identity",
+            Self::UserBehavior => "user_behavior",
+            Self::UserPreference => "user_preference",
+            Self::UserGoal => "user_goal",
+            Self::UserRelationship => "user_relationship",
             Self::FixPattern => "fix_pattern",
             Self::CodeTemplate => "code_template",
             Self::ToolHeuristic => "tool_heuristic",
@@ -74,6 +84,11 @@ impl MemoryTaxonomy {
             "architecture_fact" => Ok(Self::ArchitectureFact),
             "codebase_fact" => Ok(Self::CodebaseFact),
             "user_fact" => Ok(Self::UserFact),
+            "user_identity" => Ok(Self::UserIdentity),
+            "user_behavior" => Ok(Self::UserBehavior),
+            "user_preference" => Ok(Self::UserPreference),
+            "user_goal" => Ok(Self::UserGoal),
+            "user_relationship" => Ok(Self::UserRelationship),
             "fix_pattern" => Ok(Self::FixPattern),
             "code_template" => Ok(Self::CodeTemplate),
             "tool_heuristic" => Ok(Self::ToolHeuristic),
@@ -92,9 +107,17 @@ impl MemoryTaxonomy {
     pub const fn family(self) -> MemoryFamily {
         match self {
             Self::TaskAttempt | Self::ToolCall | Self::SessionSummary => MemoryFamily::Episodic,
-            Self::ArchitectureFact | Self::CodebaseFact | Self::UserFact => MemoryFamily::Semantic,
+            Self::ArchitectureFact
+            | Self::CodebaseFact
+            | Self::UserFact
+            | Self::UserIdentity
+            | Self::UserBehavior
+            | Self::UserGoal
+            | Self::UserRelationship => MemoryFamily::Semantic,
             Self::FixPattern | Self::CodeTemplate | Self::ToolHeuristic => MemoryFamily::Procedural,
-            Self::CodeStyle | Self::LibraryPref | Self::WorkflowPref => MemoryFamily::Preference,
+            Self::UserPreference | Self::CodeStyle | Self::LibraryPref | Self::WorkflowPref => {
+                MemoryFamily::Preference
+            }
             Self::Decision | Self::ProjectStandard => MemoryFamily::Decision,
             Self::TeamConvention => MemoryFamily::Team,
         }
@@ -221,6 +244,11 @@ mod tests {
             MemoryTaxonomy::ArchitectureFact,
             MemoryTaxonomy::CodebaseFact,
             MemoryTaxonomy::UserFact,
+            MemoryTaxonomy::UserIdentity,
+            MemoryTaxonomy::UserBehavior,
+            MemoryTaxonomy::UserPreference,
+            MemoryTaxonomy::UserGoal,
+            MemoryTaxonomy::UserRelationship,
             MemoryTaxonomy::FixPattern,
             MemoryTaxonomy::CodeTemplate,
             MemoryTaxonomy::ToolHeuristic,
@@ -250,6 +278,14 @@ mod tests {
         assert_eq!(
             MemoryTaxonomy::ArchitectureFact.family(),
             MemoryFamily::Semantic
+        );
+        assert_eq!(
+            MemoryTaxonomy::UserIdentity.family(),
+            MemoryFamily::Semantic
+        );
+        assert_eq!(
+            MemoryTaxonomy::UserPreference.family(),
+            MemoryFamily::Preference
         );
         assert_eq!(
             MemoryTaxonomy::FixPattern.family(),

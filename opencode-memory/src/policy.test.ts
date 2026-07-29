@@ -4,6 +4,8 @@ import {
   CANDIDATES_OPEN,
   COMPACTION_CONTEXT,
   deriveRecallQuery,
+  extractDirectUserEvidence,
+  hasDirectUserEvidence,
   parseCuratedCandidates,
 } from "./policy.js";
 
@@ -78,7 +80,86 @@ describe("parseCuratedCandidates", () => {
     expect(COMPACTION_CONTEXT).not.toContain('"code_paths":["relative/path"]');
     expect(COMPACTION_CONTEXT).toContain("verified existing regular files");
     expect(COMPACTION_CONTEXT).toContain("never infer or guess a path");
-    expect(COMPACTION_CONTEXT).toContain("omit a fact candidate when no verified file applies");
+    expect(COMPACTION_CONTEXT).toContain(
+      "omit a project fact candidate when no verified file applies",
+    );
+  });
+
+  test("accepts a personal observation only with exact direct-user evidence", () => {
+    const personal = {
+      title: "default_user preferred language",
+      content: "default_user prefers responses in Vietnamese.",
+      kind: "preference" as const,
+      taxonomy: "user_preference" as const,
+      importance: 0.6,
+      tags: [],
+      code_paths: [],
+      evidence_quote: "trả lời bằng tiếng Việt",
+    };
+
+    expect(parseCuratedCandidates(candidateBlock([personal]))).toEqual([]);
+    expect(
+      parseCuratedCandidates(candidateBlock([personal]), [
+        "Từ giờ hãy trả lời bằng tiếng Việt cho dự án này.",
+      ]),
+    ).toEqual([
+      {
+        title: personal.title,
+        content: personal.content,
+        kind: personal.kind,
+        taxonomy: personal.taxonomy,
+        importance: personal.importance,
+        tags: [],
+        code_paths: [],
+      },
+    ]);
+  });
+
+  test("rejects inferred personal facts and incompatible kinds", () => {
+    const base = {
+      title: "default_user location",
+      content: "default_user lives in Ho Chi Minh City.",
+      kind: "fact",
+      taxonomy: "user_identity",
+      importance: 0.6,
+      tags: [],
+      code_paths: [],
+      evidence_quote: "Tôi sống ở Thành phố Hồ Chí Minh",
+    };
+    const evidence = ["Tôi sống ở Thành phố Hồ Chí Minh"];
+
+    expect(
+      parseCuratedCandidates(candidateBlock([{ ...base, evidence_quote: "Vietnam" }]), evidence),
+    ).toEqual([]);
+    expect(
+      parseCuratedCandidates(candidateBlock([{ ...base, kind: "preference" }]), evidence),
+    ).toEqual([]);
+  });
+});
+
+describe("extractDirectUserEvidence", () => {
+  test("keeps only non-synthetic user text", () => {
+    expect(
+      extractDirectUserEvidence([
+        {
+          info: { role: "user" },
+          parts: [
+            { type: "text", text: "Remember this preference" },
+            { type: "text", text: "synthetic", synthetic: true },
+          ],
+        },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "not evidence" }] },
+      ]),
+    ).toEqual(["Remember this preference"]);
+  });
+
+  test("normalizes whitespace but still requires a verbatim substring", () => {
+    expect(
+      hasDirectUserEvidence("trả lời bằng tiếng Việt", [
+        "Hãy   trả lời bằng tiếng Việt\ncho dự án này",
+      ]),
+    ).toBeTrue();
+    expect(hasDirectUserEvidence("I prefer concise answers", ["Please be concise"])).toBeFalse();
   });
 });
 

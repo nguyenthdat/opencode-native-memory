@@ -163,23 +163,30 @@ export async function requestHealthStatus(
 }
 
 function MemoryHealthBadge(props: { api: TuiPluginApi; health: () => MemoryTuiHealth }) {
-  const color = () => {
-    switch (props.health().status) {
-      case "healthy":
-        return props.api.theme.current.success;
-      case "degraded":
-        return props.api.theme.current.warning;
-      case "unavailable":
-        return props.api.theme.current.error;
-      case "checking":
-        return props.api.theme.current.textMuted;
-    }
-  };
   return (
     <box paddingLeft={1} paddingRight={1}>
-      <text fg={color()}>{memoryHealthText(props.health())}</text>
+      {() => {
+        const current = props.health();
+        return <text fg={healthColor(props.api, current.status)}>{memoryHealthText(current)}</text>;
+      }}
     </box>
   );
+}
+
+function healthColor(
+  api: TuiPluginApi,
+  status: MemoryTuiHealth["status"],
+): TuiPluginApi["theme"]["current"]["success"] {
+  switch (status) {
+    case "healthy":
+      return api.theme.current.success;
+    case "degraded":
+      return api.theme.current.warning;
+    case "unavailable":
+      return api.theme.current.error;
+    case "checking":
+      return api.theme.current.textMuted;
+  }
 }
 
 function tuiHealth(health: MemoryPluginHealth): MemoryTuiHealth {

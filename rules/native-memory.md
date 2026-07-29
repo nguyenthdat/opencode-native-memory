@@ -2,24 +2,15 @@
 
 # OpenCode Native Memory Workflow
 
-Use native project memory as a retrieval aid, not as an invisible source of truth. Follow this workflow whenever a task is substantial enough that prior project decisions, implementation patterns, gotchas, or user preferences could affect the result.
+Use native memory as scoped historical evidence for the current project, never as an invisible source of truth. The plugin performs automatic recall before model execution; do not duplicate that search merely to satisfy this instruction and do not announce background recall.
 
-## Before Work
+## User And Recall
 
-For a substantial task, **call `memory_search` before inspecting or editing code**. A substantial task includes debugging, changing behavior, reviewing unfamiliar code, making a multi-file change, or continuing work from an earlier session. Skip the call only for trivial requests where project history cannot matter.
-
-Use one focused hybrid query first. Include the user goal, the relevant component or symbol, and the failure or constraint when known. Good queries are specific sentences such as `background document ingest queue daemon lifecycle timeout` or `writer lock duplicate daemon actor zvec project store`. Do not search with a vague query such as `memory` or paste the entire task transcript.
-
-```text
-memory_search({
-  query: "the task goal plus the relevant component and constraint",
-  retrieval_mode: "hybrid",
-  limit: 8,
-  budget_chars: 12000
-})
-```
-
-If the first search is relevant, use it to form the implementation hypothesis. If it is empty or irrelevant, proceed with current code and user requirements; do not keep issuing broad searches. Run a second narrower search only when a concrete missing decision or gotcha remains.
+1. Treat the current user as `default_user`. Do not ask for an identity or probe for personal details unless ambiguity blocks the task.
+2. Do not begin a response with `Remembering...`. OpenCode recall is silent infrastructure; mention a memory only when it materially affects the answer or the user asks.
+3. Automatic recall uses the current request and project scope. Call `memory_search` manually only when the injected context is insufficient, the task changes direction, or a concrete prior decision, preference, relationship, or gotcha remains unresolved.
+4. For manual recall, use one focused hybrid query containing the goal, relevant component or subject, and known constraint. Do not paste the transcript or issue repeated broad searches.
+5. If recall is empty or irrelevant, continue from current code and user requirements.
 
 ## Use Retrieved Memory
 
@@ -33,11 +24,11 @@ If the first search is relevant, use it to form the implementation hypothesis. I
 memory_get({ ids: ["mem_<exact-id-from-search>"] })
 ```
 
-Do not silently let a retrieved memory decide an implementation. State the relevant decision or gotcha in your working reasoning, verify it, and then apply it only if it still matches the repository.
+Do not silently let a retrieved memory decide an implementation. Verify it and apply it only if it still matches the repository. When records conflict, prefer an explicit current user correction, then current repository evidence, then the newest high-confidence active record; never merge contradictions into a new fact.
 
 ## During Work
 
-Search again when the task changes direction or when you encounter an unfamiliar subsystem, prior workaround, migration constraint, or suspicious failure. Use the narrowest query that describes the new question. Do not use memory retrieval as a replacement for reading the current implementation or running tests.
+Search again only when the task changes direction or when you encounter an unfamiliar subsystem, prior workaround, migration constraint, relationship, or suspicious failure. Use the narrowest query that describes the new question. Do not use memory retrieval as a replacement for reading the current implementation or running tests.
 
 When a memory materially influenced the change, record precise feedback after the decision is made:
 
@@ -57,11 +48,23 @@ Use `memory_index_documents` for project-wide supported documents and `memory_in
 
 `memory_ingest` is asynchronous. It returns a `job_id` immediately so the agent does not block the task. For one or more submitted documents, call `memory_ingest_status` with their exact job IDs and wait for `succeeded` before relying on their contents. Handle `failed` explicitly; a job ID expiring does not undo already persisted memory. Multiple ingestion jobs are processed in order by one writer-safe worker.
 
-## Write Durable Memory
+## Capture Durable Memory
 
-Store only verified, reusable, non-obvious knowledge after the task produces a confirmed result. Good candidates are a project decision, a repeatable fix pattern, a tested performance gotcha, or a stable user/project preference.
+Store one atomic observation at a time. Good project candidates are a verified decision, stable fact, repeatable fix pattern, tested gotcha, team convention, or durable workflow preference. Treat the MCP entity-relation-observation model as follows: named people, organizations, projects, and significant events are entities in the observation text; active-voice relationship facts use `user_relationship`; corrections use `memory_update` so lifecycle history records supersession instead of silently duplicating the old fact.
 
-Do not store secrets, credentials, raw conversations, temporary logs, unverified guesses, or transient progress. Never guess `code_paths`; include only existing regular files verified relative to the project root, otherwise leave it empty. Keep raw research-paper text in document storage, not repository-shared Markdown.
+Personalization must be explicit, durable, useful for future coding collaboration, and stated directly by `default_user`:
+
+- `user_identity`: relevant identity the user chose to disclose, such as role, location, or experience.
+- `user_behavior`: a recurring habit or working pattern explicitly described by the user.
+- `user_preference`: communication, language, tooling, library, or workflow preference.
+- `user_goal`: a durable target or aspiration; update it when status or target changes.
+- `user_relationship`: an explicitly stated personal or professional relation to a named person or organization. Preserve only the stated relation; do not infer or recursively expand a social graph.
+
+When calling `memory_store` with one of these five taxonomies, pass `evidence_quote` as a short verbatim excerpt from the current user message. It is checked for provenance and is never persisted. Use kind `preference` only with `user_preference`; use kind `fact` with the other four.
+
+Do not infer age, gender, location, beliefs, health, identity, relationships, or other sensitive attributes from indirect evidence. Do not store secrets, credentials, raw conversations, temporary logs, unverified guesses, or transient progress. Never guess `code_paths`; include only existing regular files verified relative to the project root, otherwise leave it empty. Personal observations do not require `code_paths`, but they do require direct user evidence. Keep raw research-paper text in document storage, not repository-shared Markdown.
+
+Before storing a correction to an existing personal observation, search the same subject and topic. Use `memory_update` on the exact active ID when the user corrected or replaced it; use a separate record only for an independent fact. Use `conflict_with` only when both claims must remain unresolved.
 
 Use the narrowest scope:
 

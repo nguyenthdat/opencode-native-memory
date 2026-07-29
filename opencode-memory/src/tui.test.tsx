@@ -1,5 +1,8 @@
 /** @jsxImportSource @opentui/solid */
 import { describe, expect, test } from "bun:test";
+import { createRequire } from "node:module";
+import { testRender } from "@opentui/solid";
+import { createSignal as pluginCreateSignal } from "solid-js";
 import type { NativeMemoryStatus } from "./contracts.js";
 import type { NativeMemoryClientLease } from "./daemon-client.js";
 import type { MemoryMethod } from "./protocol.js";
@@ -32,6 +35,12 @@ const nativeStatus: NativeMemoryStatus = {
   indexes: [{ name: "embedding", completeness: 1 }],
   capabilities: ["test_v1"],
 };
+
+const require = createRequire(import.meta.url);
+const rendererCreateSignal = (
+  require("solid-js/dist/solid.js") as { createSignal: typeof pluginCreateSignal }
+).createSignal;
+const usesSharedSolidRuntime = pluginCreateSignal === rendererCreateSignal;
 
 describe("memory TUI plugin", () => {
   test("registers a persistent health slot and refresh command", async () => {
@@ -119,6 +128,79 @@ describe("memory TUI plugin", () => {
     await Promise.all(disposers.map((dispose) => dispose()));
     expect(releases).toBe(1);
   });
+
+  test.skipIf(!usesSharedSolidRuntime)(
+    "updates the mounted health badge after the initial check",
+    async () => {
+      const slots: Array<{ slots?: { app_bottom?: () => unknown } }> = [];
+      const disposers: Array<() => void | Promise<void>> = [];
+      const controller = new AbortController();
+      let resolveStatus: (status: NativeMemoryStatus) => void = () => undefined;
+      const pendingStatus = new Promise<NativeMemoryStatus>((resolve) => {
+        resolveStatus = resolve;
+      });
+      const lease: NativeMemoryClientLease = {
+        client: {
+          async request<T>(): Promise<T> {
+            return (await pendingStatus) as T;
+          },
+        },
+        async release() {},
+      };
+      const tui = createMemoryTui("/plugin", {
+        acquireClient: async () => lease,
+        refreshIntervalMs: 60_000,
+      });
+      const api = {
+        state: { path: { worktree: "/project", directory: "/project" } },
+        slots: {
+          register(slot: { slots?: { app_bottom?: () => unknown } }) {
+            slots.push(slot);
+            return "memory-health";
+          },
+        },
+        keymap: {
+          registerLayer() {
+            return () => undefined;
+          },
+        },
+        lifecycle: {
+          signal: controller.signal,
+          onDispose(disposer: () => void | Promise<void>) {
+            disposers.push(disposer);
+            return () => undefined;
+          },
+        },
+        ui: { toast() {} },
+        theme: {
+          current: {
+            success: "#00ff00",
+            warning: "#ffff00",
+            error: "#ff0000",
+            textMuted: "#888888",
+          },
+        },
+      };
+
+      await tui(api as never, undefined, {} as never);
+      const appBottom = slots[0]?.slots?.app_bottom;
+      expect(appBottom).toBeFunction();
+      const rendered = await testRender(() => appBottom?.() as never, { width: 40, height: 2 });
+
+      try {
+        await rendered.flush();
+        expect(rendered.captureCharFrame()).toContain("Memory: checking");
+
+        resolveStatus(nativeStatus);
+        const frame = await rendered.waitForFrame((next) => next.includes("Memory: healthy"));
+        expect(frame).not.toContain("Memory: checking");
+      } finally {
+        controller.abort();
+        await Promise.all(disposers.map((dispose) => dispose()));
+        rendered.renderer.destroy();
+      }
+    },
+  );
 
   test("formats each badge state", () => {
     expect(memoryHealthText({ status: "checking", ready: false, message: "checking" })).toBe(

@@ -10,7 +10,7 @@ Local-first persistent memory for OpenCode. The plugin connects to one user-scop
 - Local GGUF embeddings through `utilityai/llama-cpp-rs`
 - Default pinned `Qwen3-Embedding-4B` model from Hugging Face
 - Session-family, agent, project, and repository scopes
-- Durable taxonomy, confidence, supersession, conflict, pin, lock, expiry, and tombstone metadata
+- Durable project and default-user taxonomy, confidence, supersession, conflict, pin, lock, expiry, and tombstone metadata
 - Deterministic capture gate with quarantine, skip, duplicate, supersession, and conflict outcomes
 - Crash-recoverable batch upsert journal and portable export/import snapshots
 - Markdown-backed shared repository memory under `.opencode/memory/`
@@ -110,7 +110,13 @@ The current release performs preflight only. It never changes an existing
 project's model or mixes incompatible vectors. Durable collection-generation
 migration, cancellation, resume, and rollback are a later phase.
 
-The 15 stable taxonomy values are `task_attempt`, `tool_call`, `session_summary`, `architecture_fact`, `codebase_fact`, `user_fact`, `fix_pattern`, `code_template`, `tool_heuristic`, `code_style`, `library_pref`, `workflow_pref`, `decision`, `team_convention`, and `project_standard`.
+The 20 stable taxonomy values are `task_attempt`, `tool_call`, `session_summary`, `architecture_fact`, `codebase_fact`, `user_fact`, `user_identity`, `user_behavior`, `user_preference`, `user_goal`, `user_relationship`, `fix_pattern`, `code_template`, `tool_heuristic`, `code_style`, `library_pref`, `workflow_pref`, `decision`, `team_convention`, and `project_standard`.
+
+### Personalization Policy
+
+OpenCode treats the current user as `default_user`, but memory remains scoped to the current project store. Automatic recall is silent and relevance-bounded; the plugin does not force a visible `Remembering...` preamble or issue a second tool search when automatic recall already supplied enough context.
+
+The five dedicated personalization taxonomies map the reference MCP entity-relation-observation vocabulary onto native atomic records: `user_identity`, `user_behavior`, `user_preference`, `user_goal`, and `user_relationship`. Both manual storage and automatic compaction capture accept these records only when `evidence_quote` matches text from the current or recorded user message. The quote validates provenance and is removed before persistence. Secret and prompt-injection scanning still runs, personal facts are never inferred from assistant text, and relationship memories do not recursively expand a third-party social graph. Corrections use the existing update/supersession lifecycle; unresolved contradictions use `conflict_with`.
 
 Session scope is shared by the primary session and every nested or sibling subagent that resolves to the same root session. Agent scope is limited to the agent role, while project scope is durable and private across project sessions. Repository scope is reviewed canonical Markdown intended for Git sharing. Documents ingested by `memory_ingest` remain private project/agent/session memory; promote only reviewed conclusions to repository Markdown.
 

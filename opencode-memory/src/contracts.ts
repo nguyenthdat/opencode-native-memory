@@ -16,6 +16,11 @@ export const MEMORY_TAXONOMIES = [
   "architecture_fact",
   "codebase_fact",
   "user_fact",
+  "user_identity",
+  "user_behavior",
+  "user_preference",
+  "user_goal",
+  "user_relationship",
   "fix_pattern",
   "code_template",
   "tool_heuristic",
@@ -26,6 +31,20 @@ export const MEMORY_TAXONOMIES = [
   "team_convention",
   "project_standard",
 ] as const;
+
+export const USER_PROFILE_TAXONOMIES = [
+  "user_identity",
+  "user_behavior",
+  "user_preference",
+  "user_goal",
+  "user_relationship",
+] as const;
+
+export function isUserProfileTaxonomy(
+  value: string | undefined,
+): value is (typeof USER_PROFILE_TAXONOMIES)[number] {
+  return value !== undefined && (USER_PROFILE_TAXONOMIES as readonly string[]).includes(value);
+}
 
 export const RETRIEVAL_MODES = ["lexical", "dense", "hybrid"] as const;
 export type RetrievalMode = (typeof RETRIEVAL_MODES)[number];
@@ -121,6 +140,7 @@ export interface CuratedCandidate {
   importance: number;
   tags: string[];
   code_paths: string[];
+  taxonomy?: (typeof MEMORY_TAXONOMIES)[number];
 }
 
 export interface CaptureResponse {
