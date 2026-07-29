@@ -3,6 +3,7 @@ mod retrieval;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -51,6 +52,7 @@ pub struct MemoryEngine {
     config: MemoryConfig,
     collection: Collection,
     embedder: LlamaCppEmbedder,
+    inference_lock: Arc<Mutex<()>>,
     state: MemoryState,
     document_index: DocumentIndexManifest,
     shared_sync_rejections: Vec<SharedMemoryRejection>,
@@ -70,6 +72,13 @@ impl MemoryEngine {
     /// Returns an error when storage cannot be locked/opened, state is
     /// incompatible, or the embedding model cannot be loaded.
     pub fn open(config: MemoryConfig) -> Result<Self> {
+        Self::open_with_inference_lock(config, Arc::new(Mutex::new(())))
+    }
+
+    pub(crate) fn open_with_inference_lock(
+        config: MemoryConfig,
+        inference_lock: Arc<Mutex<()>>,
+    ) -> Result<Self> {
         zvec::initialize()?;
         zvec::secure_create_dir(&config.project_data_dir())?;
         zvec::secure_create_dir(config.model_cache())?;
@@ -89,6 +98,7 @@ impl MemoryEngine {
             config,
             collection,
             embedder,
+            inference_lock,
             state,
             document_index,
             shared_sync_rejections: Vec::new(),
@@ -97,6 +107,22 @@ impl MemoryEngine {
         engine.recover_pending_upserts()?;
         engine.recover_pending_deletes()?;
         Ok(engine)
+    }
+
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
+        let _guard = self
+            .inference_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.embedder.embed_query(text)
+    }
+
+    fn embed_passage(&mut self, text: &str) -> Result<Vec<f32>> {
+        let _guard = self
+            .inference_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.embedder.embed_passage(text)
     }
 
     /// Validate, embed, deduplicate, and durably upsert one memory.
@@ -1470,45 +1496,60 @@ impl MemoryEngine {
 
         let mut imported = 0;
         let mut rejections = Vec::new();
+        let mut pending = Vec::new();
+        let mut pending_ids = HashSet::new();
+        let mut replacements = Vec::new();
         for record in request.records {
             let shared_source = record.source.clone();
-            let stored = self.store(StoreRequest {
-                content: record.content,
-                title: Some(record.title),
-                kind: record.kind,
-                importance: record.importance,
-                tags: record.tags,
-                source: Some(format!("shared:{}", record.source)),
-                scope: MemoryScope::Repository,
-                scope_key: None,
-                origin: MemoryOrigin::SharedMarkdown,
-                expires_in_days: None,
-                code_paths: record.code_paths,
-                revive: false,
-                taxonomy: None,
-                confidence: None,
-            });
-            match stored {
-                Ok(stored) => {
+            let prepared = self.prepare_store_upsert(
+                StoreRequest {
+                    content: record.content,
+                    title: Some(record.title),
+                    kind: record.kind,
+                    importance: record.importance,
+                    tags: record.tags,
+                    source: Some(format!("shared:{}", record.source)),
+                    scope: MemoryScope::Repository,
+                    scope_key: None,
+                    origin: MemoryOrigin::SharedMarkdown,
+                    expires_in_days: None,
+                    code_paths: record.code_paths,
+                    revive: false,
+                    taxonomy: None,
+                    confidence: None,
+                },
+                Vec::new(),
+                Vec::new(),
+            );
+            match prepared {
+                Ok(prepared) if pending_ids.insert(prepared.pending.document.id.clone()) => {
                     if let Some(old_id) = existing.get(&shared_source)
-                        && old_id != &stored.id
+                        && old_id != &prepared.pending.document.id
                     {
-                        removed += usize::try_from(
-                            self.delete_internal(
-                                std::slice::from_ref(old_id),
-                                false,
-                                DeleteReason::Obsolete,
-                            )?
-                            .deleted,
-                        )?;
+                        replacements.push(old_id.clone());
                     }
-                    imported += 1;
+                    pending.push(prepared.pending);
                 }
+                Ok(_) => rejections.push(SharedMemoryRejection {
+                    source: shared_source,
+                    message: "duplicate deterministic memory ID in shared batch".to_string(),
+                }),
                 Err(error) => rejections.push(SharedMemoryRejection {
                     source: shared_source,
                     message: format!("{error:#}"),
                 }),
             }
+        }
+        if !pending.is_empty() {
+            self.commit_pending_upserts(pending)
+                .context("shared memory batch commit failed")?;
+            imported = pending_ids.len();
+        }
+        for old_id in replacements {
+            removed += usize::try_from(
+                self.delete_internal(std::slice::from_ref(&old_id), false, DeleteReason::Obsolete)?
+                    .deleted,
+            )?;
         }
         let rejected = rejections.len();
         self.shared_sync_rejections.clone_from(&rejections);
@@ -1775,7 +1816,7 @@ impl MemoryEngine {
             &normalized.tags,
             &normalized.content,
         );
-        let embedding = self.embedder.embed_passage(&search_text)?;
+        let embedding = self.embed_passage(&search_text)?;
         Ok(PendingDocument {
             id: id.to_string(),
             title: normalized.title.clone(),
@@ -1821,10 +1862,9 @@ impl MemoryEngine {
             .iter()
             .map(|item| self.build_pending_document(item))
             .collect::<Result<Vec<_>>>()?;
-        for document in &documents {
-            let write = self.collection.upsert(&[document])?;
-            ensure_write_succeeded("store memory", &write)?;
-        }
+        let document_refs = documents.iter().collect::<Vec<_>>();
+        let write = self.collection.upsert(&document_refs)?;
+        ensure_write_succeeded("store memory batch", &write)?;
         self.collection.flush()?;
         Ok(())
     }

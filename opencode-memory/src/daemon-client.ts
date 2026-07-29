@@ -38,13 +38,15 @@ import type {
   OpenSessionResponse,
 } from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
 import type { Response as MemoryResponse } from "./generated/opencode/memory/v1/memory_pb.js";
+import type { ModelResponse } from "./generated/opencode/memory/model/v1/model_pb.js";
 import {
-  createMemoryRequest,
+  createProjectRequest,
   decodeMemoryResponse,
+  decodeModelResponse,
   DelimitedFrameDecoder,
   encodeDelimited,
 } from "./protocol.js";
-import type { MemoryMethod } from "./protocol.js";
+import type { MemoryMethod, ModelMethod } from "./protocol.js";
 
 const MiB = 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300_000;
@@ -55,7 +57,7 @@ const STARTUP_TIMEOUT_MS = 15_000;
 const START_LOCK_STALE_MS = 30_000;
 const START_LOCK_TIMEOUT_MS = START_LOCK_STALE_MS + STARTUP_TIMEOUT_MS;
 const DAEMON_PROTOCOL_GENERATION = 1;
-const DOMAIN_SCHEMA_GENERATION = 1;
+const DOMAIN_SCHEMA_GENERATION = 2;
 const require = createRequire(import.meta.url);
 const NATIVE_PACKAGES: Partial<Record<string, string>> = {
   "darwin-arm64": "@nguyenthdat/opencode-memory-darwin-arm64",
@@ -68,7 +70,19 @@ export const MAX_RESPONSE_BYTES = 32 * MiB;
 export const REQUEST_TIMEOUT_MS = configuredRequestTimeoutMs();
 export const INITIALIZATION_TIMEOUT_MS = Math.max(REQUEST_TIMEOUT_MS, 30 * 60_000);
 
-const RETRY_SAFE_METHODS = new Set<MemoryMethod>(["get", "list", "status", "doctor", "export"]);
+const RETRY_SAFE_METHODS = new Set<MemoryMethod>([
+  "get",
+  "list",
+  "status",
+  "doctor",
+  "export",
+  "model_profiles",
+  "model_switch_status",
+]);
+
+export function isRetrySafeMemoryMethod(method: MemoryMethod): boolean {
+  return RETRY_SAFE_METHODS.has(method);
+}
 
 export interface NativeMemoryRequester {
   request<T>(method: MemoryMethod, params?: unknown, signal?: AbortSignal): Promise<T>;
@@ -182,7 +196,7 @@ class DaemonProjectClient implements NativeMemoryRequester {
 
     try {
       const callId = randomUUID();
-      const isRetrySafe = RETRY_SAFE_METHODS.has(method);
+      const isRetrySafe = isRetrySafeMemoryMethod(method);
       for (let attempt = 0; attempt < 2; attempt += 1) {
         let dispatched = false;
         let ready: ReadyProject | undefined;
@@ -195,7 +209,7 @@ class DaemonProjectClient implements NativeMemoryRequester {
             );
           }
           const requestId = this.nextMemoryId++;
-          const memoryRequest = createMemoryRequest(requestId, method, params);
+          const projectRequest = createProjectRequest(requestId, method, params);
           const body = create(ProjectCallRequestSchema, {
             daemonInstanceId: ready.daemon.daemonInstanceId,
             sessionId: ready.session.sessionId,
@@ -203,7 +217,9 @@ class DaemonProjectClient implements NativeMemoryRequester {
             leaseId: ready.project.leaseId,
             callId,
             timeoutMs: this.requestTimeoutMs,
-            request: memoryRequest,
+            ...(projectRequest.kind === "memory"
+              ? { request: projectRequest.request }
+              : { modelRequest: projectRequest.modelRequest }),
           });
           const pending = this.send(
             { case: "projectCall", value: body },
@@ -219,13 +235,28 @@ class DaemonProjectClient implements NativeMemoryRequester {
             throw new Error("Native memory daemon returned a mismatched call ID");
           }
           const memoryResponse = response.body.value.response;
-          if (!memoryResponse) {
-            throw new Error("Native memory daemon omitted the memory response");
+          const modelResponse = response.body.value.modelResponse;
+          if (Boolean(memoryResponse) === Boolean(modelResponse)) {
+            throw new Error(
+              "Native memory daemon project response must contain exactly one domain response",
+            );
           }
-          if (memoryResponse.id !== BigInt(requestId)) {
-            throw new Error("Native memory daemon returned a mismatched domain response ID");
+          if (projectRequest.kind === "memory") {
+            if (!memoryResponse) {
+              throw new Error("Native memory daemon returned the wrong domain response branch");
+            }
+            if (memoryResponse.id !== BigInt(requestId)) {
+              throw new Error("Native memory daemon returned a mismatched domain response ID");
+            }
+            return this.unwrapMemoryResponse<T>(memoryResponse);
           }
-          return this.unwrapMemoryResponse<T>(memoryResponse);
+          if (!modelResponse) {
+            throw new Error("Native memory daemon returned the wrong domain response branch");
+          }
+          if (modelResponse.id !== BigInt(requestId)) {
+            throw new Error("Native memory daemon returned a mismatched model response ID");
+          }
+          return this.unwrapModelResponse<T>(modelResponse, projectRequest.method);
         } catch (error) {
           const failure = asError(error);
           const retryableTransport = failure instanceof DaemonTransportError;
@@ -594,6 +625,14 @@ class DaemonProjectClient implements NativeMemoryRequester {
     const decoded = decodeMemoryResponse(response);
     if (!decoded.ok) {
       throw new NativeMemoryOperationError(decoded.error || "Native memory operation failed");
+    }
+    return decoded.result as T;
+  }
+
+  private unwrapModelResponse<T>(response: ModelResponse, method: ModelMethod): T {
+    const decoded = decodeModelResponse(response, method);
+    if (!decoded.ok) {
+      throw new NativeMemoryOperationError(decoded.error || "Native memory model operation failed");
     }
     return decoded.result as T;
   }

@@ -5,7 +5,6 @@ import type {
   ListResponse,
   SearchResponse,
   SharedSyncResponse,
-  CaptureResponse,
   IngestResponse,
   DocumentIndexResponse,
   NativeMemoryStatus,
@@ -42,6 +41,10 @@ import { SessionContext } from "./session-context.js";
 import { validateDeleteRecords, validateUpdateArgs } from "./validation.js";
 import { BACKGROUND_JOB_ID_PATTERN, BackgroundJobQueue } from "./background-jobs.js";
 import { buildMemoryStatusResponse } from "./plugin-health.js";
+import { listModelProfiles, preflightModelSwitch } from "./model-control.js";
+import { MemoryMaintenanceScheduler } from "./maintenance.js";
+import { requestIdempotently } from "./outcome-reconciliation.js";
+import { captureWithOutcomeReconciliation } from "./capture-reconciliation.js";
 
 export interface MemoryPluginOptions {
   root: string;
@@ -50,6 +53,8 @@ export interface MemoryPluginOptions {
   automaticCapture?: boolean;
   automaticDocumentIndex?: boolean;
   documentIndexDebounceMs?: number;
+  automaticOptimize?: boolean;
+  optimizeDebounceMs?: number;
   sharedSync?: boolean;
   feedbackTracking?: boolean;
   minScore?: number;
@@ -68,6 +73,11 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
       (path, query) => opencode.session.get({ path, query }),
       directory,
     );
+    const maintenance = new MemoryMaintenanceScheduler(native, {
+      enabled: settings.automaticOptimize,
+      debounceMs: settings.optimizeDebounceMs,
+      onError: session.warnOnce,
+    });
     let sharedSignature: string | undefined;
     let sharedSync: Promise<void> | undefined;
     let documentSync: Promise<DocumentIndexResponse> | undefined;
@@ -87,7 +97,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
           session.warnOnce(new Error(`${error.source}: ${error.message}`));
         }
         if (!force && loaded.signature === sharedSignature) return;
-        const response = await native.request<SharedSyncResponse>("sync_shared", {
+        const { response } = await requestIdempotently<SharedSyncResponse>(native, "sync_shared", {
           records: loaded.records,
         });
         if (response.rejected > 0) {
@@ -99,6 +109,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
         }
         sharedSignature = loaded.signature;
         session.invalidateRecall();
+        if (response.imported > 0 || response.removed > 0) maintenance.schedule();
       })().finally(() => {
         sharedSync = undefined;
       });
@@ -107,8 +118,13 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
 
     const indexDocuments = async (force = false): Promise<DocumentIndexResponse> => {
       if (documentSync) return await documentSync;
-      documentSync = native
-        .request<DocumentIndexResponse>("index_documents", { force })
+      documentSync = requestIdempotently<DocumentIndexResponse>(native, "index_documents", {
+        force,
+      })
+        .then(({ response, reconciled }) => {
+          if (reconciled) maintenance.schedule();
+          return response;
+        })
         .then((response) => {
           for (const rejection of response.rejections) {
             session.warnOnce(new Error(`${rejection.path}: ${rejection.message}`));
@@ -116,6 +132,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
           for (const warning of response.warnings) session.warnOnce(new Error(warning));
           if (response.added > 0 || response.updated > 0 || response.removed > 0) {
             session.invalidateRecall();
+            maintenance.schedule();
           }
           return response;
         })
@@ -145,7 +162,12 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
 
     if (settings.warmup || settings.automaticDocumentIndex) {
       const startup = settings.warmup
-        ? [native.request("status"), syncProjectIndexes()]
+        ? [
+            native
+              .request<NativeMemoryStatus>("status")
+              .then((status) => maintenance.observeStatus(status)),
+            syncProjectIndexes(),
+          ]
         : [syncDocuments()];
       void Promise.all(startup).catch(session.warnOnce);
     }
@@ -153,6 +175,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     return {
       dispose: async () => {
         if (documentSyncTimer) clearTimeout(documentSyncTimer);
+        await maintenance.dispose();
         await ingestJobs.dispose();
         if (sharedSync) await sharedSync.catch(() => undefined);
         if (documentSync) await documentSync.catch(() => undefined);
@@ -174,6 +197,13 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
 
 When no arguments are supplied, call memory_status and memory_list, then summarize active scopes, stale/expired records, and suggested cleanup.
 Use memory_search for semantic lookup, memory_get for full records, memory_update for corrections, memory_delete for removal, memory_promote for reviewed Git-shareable Markdown, and memory_doctor for diagnostics.
+
+For model requests:
+- "model profiles": call memory_model_profiles exactly once and distinguish stable, preview, and unsupported profiles.
+- "model switch <profile>": call memory_model_switch with dry_run=true. This phase performs preflight only; do not claim that a model was switched.
+- "model switch <profile> --allow-dense-downtime": set allow_dense_downtime=true in the dry-run preflight.
+Never change embedding environment variables or restart the daemon to switch an existing project profile. A real switch becomes available only after generation migration is enabled.
+
 Never modify repository-scoped memory through memory_update; edit its .opencode/memory Markdown source instead. Ask through the tool permission flow before destructive or sharing operations.`,
         };
       },
@@ -231,7 +261,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           let storedAny = false;
           for (const candidate of candidates) {
             try {
-              const response = await native.request<CaptureResponse>("capture", {
+              const capture = await captureWithOutcomeReconciliation(native, {
                 candidate: {
                   ...candidate,
                   source: `session:${event.properties.sessionID}:compaction`,
@@ -247,12 +277,15 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 suggested_supersession_ids: [],
                 suggested_conflict_ids: [],
               });
-              storedAny ||= response.stored !== undefined;
+              storedAny ||= capture.storedOrDuplicate;
             } catch (error) {
               session.warnOnce(error);
             }
           }
-          if (storedAny) session.invalidateRecall();
+          if (storedAny) {
+            session.invalidateRecall();
+            maintenance.schedule();
+          }
         } catch (error) {
           session.warnOnce(error);
         }
@@ -360,6 +393,38 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         output.context.push(COMPACTION_CONTEXT);
       },
       tool: {
+        memory_model_profiles: tool({
+          description:
+            "List daemon-approved embedding model profiles for the current project. This is read-only and does not synchronize documents or load an embedding model.",
+          args: {},
+          async execute(_args, context) {
+            const response = await listModelProfiles(native, context.abort);
+            return result("Embedding model profiles", response, {
+              active_profile_id: response.active_profile_id,
+              active_generation_id: response.active_generation_id,
+              profile_count: response.profiles.length,
+              selectable_count: response.profiles.filter((profile) => profile.selectable).length,
+            });
+          },
+        }),
+        memory_model_switch: tool({
+          description:
+            "Run a safe dry-run preflight for switching the current project's embedding model. Actual generation migration is not enabled in this phase, so never report a successful switch.",
+          args: {
+            profile_id: tool.schema.string().min(1).max(128),
+            allow_dense_downtime: tool.schema.boolean().default(false),
+            force_rebuild: tool.schema.boolean().default(false),
+            expected_active_profile_id: tool.schema.string().min(1).max(128).optional(),
+          },
+          async execute(args, context) {
+            const response = await preflightModelSwitch(native, args, context.abort);
+            return result("Embedding model switch preflight", response, {
+              target_profile_id: response.target_profile_id,
+              can_start: response.preflight.can_start,
+              blocker_count: response.preflight.blockers.length,
+            });
+          },
+        }),
         memory_search: tool({
           description:
             "Semantically search durable memory for the current project. Use before substantial work when prior decisions, preferences, facts, patterns, or gotchas may matter.",
@@ -1051,7 +1116,8 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             "Prune expired memories and retrieval logs, compact zvec, and rebuild indexes.",
           args: {},
           async execute(_args, context) {
-            const response = await native.request<Record<string, unknown>>(
+            const { response } = await requestIdempotently<Record<string, unknown>>(
+              native,
               "optimize",
               {},
               context.abort,
@@ -1097,6 +1163,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 ? reason
                 : new Error("Memory status check was cancelled");
             }
+            if (backend.status === "fulfilled") maintenance.observeStatus(backend.value);
             const response = buildMemoryStatusResponse(
               backend,
               sharedSyncResult,
@@ -1116,6 +1183,8 @@ interface ResolvedMemoryPluginOptions {
   automaticCapture: boolean;
   automaticDocumentIndex: boolean;
   documentIndexDebounceMs: number;
+  automaticOptimize: boolean;
+  optimizeDebounceMs: number;
   sharedSync: boolean;
   feedbackTracking: boolean;
   minScore: number;
@@ -1137,6 +1206,15 @@ export function resolveMemoryPluginOptions(
   ) {
     throw new Error("memory documentIndexDebounceMs must be between 50 and 60000");
   }
+  const optimizeDebounceMs =
+    options.optimizeDebounceMs ?? envNumber("OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS", 5_000);
+  if (
+    !Number.isFinite(optimizeDebounceMs) ||
+    optimizeDebounceMs < 50 ||
+    optimizeDebounceMs > 60_000
+  ) {
+    throw new Error("memory optimizeDebounceMs must be between 50 and 60000");
+  }
   return {
     warmup: options.warmup ?? envBoolean("OPENCODE_MEMORY_WARMUP", true),
     automaticRecall: options.automaticRecall ?? envBoolean("OPENCODE_MEMORY_AUTO_RECALL", true),
@@ -1144,6 +1222,9 @@ export function resolveMemoryPluginOptions(
     automaticDocumentIndex:
       options.automaticDocumentIndex ?? envBoolean("OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS", true),
     documentIndexDebounceMs,
+    automaticOptimize:
+      options.automaticOptimize ?? envBoolean("OPENCODE_MEMORY_AUTO_OPTIMIZE", true),
+    optimizeDebounceMs,
     sharedSync: options.sharedSync ?? envBoolean("OPENCODE_MEMORY_SHARED_SYNC", true),
     feedbackTracking:
       options.feedbackTracking ?? envBoolean("OPENCODE_MEMORY_FEEDBACK_TRACKING", true),

@@ -164,7 +164,7 @@ mod tests {
     use crate::EmbeddingConfig;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn concurrent_alias_acquires_reserve_one_actor_while_opening() {
+    async fn concurrent_alias_acquires_share_one_lazy_actor() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).expect("create project");
@@ -177,16 +177,6 @@ mod tests {
                 .with_embedding(embedding);
         let store_key = temp.path().join("canonical-store");
         let registry = Arc::new(ProjectRegistry::new());
-        let model_lock = Arc::clone(&registry.model_load_lock);
-        let (locked_sender, locked_receiver) = std::sync::mpsc::sync_channel(0);
-        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
-        let lock_thread = std::thread::spawn(move || {
-            let _opening_guard = model_lock.lock().expect("model load lock");
-            locked_sender.send(()).expect("announce model lock");
-            release_receiver.recv().expect("release model lock");
-        });
-        locked_receiver.recv().expect("wait for model lock");
-
         let first_registry = Arc::clone(&registry);
         let first_config = config.clone();
         let first_key = store_key.clone();
@@ -212,10 +202,11 @@ mod tests {
             assert_eq!(actors.len(), 1);
             assert_eq!(actors.values().next().expect("actor").lease_count(), 2);
         }
-        release_sender.send(()).expect("release model lock");
-        lock_thread.join().expect("join model lock thread");
-
-        assert!(first.await.expect("first task").is_err());
-        assert!(second.await.expect("second task").is_err());
+        let first = first.await.expect("first task").expect("first actor");
+        let second = second.await.expect("second task").expect("second actor");
+        assert!(Arc::ptr_eq(&first, &second));
+        first.release_lease();
+        second.release_lease();
+        first.stop().await;
     }
 }

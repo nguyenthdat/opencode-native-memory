@@ -3,12 +3,24 @@
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use serde_json::{Map, Number, Value as JsonValue, json};
 
 use crate::memory_proto::{Method, Request, Response, Value, ValueList, ValueObject, value};
+use crate::model::{self, ModelSwitchRequest};
+use crate::model_proto::{
+    EmbeddingMetric, EmbeddingModality,
+    ListModelProfilesResponse as ProtoListModelProfilesResponse, ModelPreflightDecision,
+    ModelProfile as ProtoModelProfile, ModelProfileCapability, ModelProfileReason,
+    ModelProfileRole, ModelProfileSupportLevel, ModelRequest, ModelResponse, ModelStatus,
+    ModelStatusCode, ModelSwitchAvailability, ModelSwitchBlocker as ProtoModelSwitchBlocker,
+    ModelSwitchExecutionMode, ModelSwitchPreflight as ProtoModelSwitchPreflight,
+    ModelSwitchRebuildPolicy, ModelSwitchState, StartModelSwitchResponse, model_request,
+    model_response,
+};
 use crate::{
     CaptureRequest, DeleteRequest, DoctorRequest, DocumentIndexRequest, ExportRequest,
     FeedbackRequest, ForgetRequest, GetRequest, ImportRequest, IngestRequest, ListRequest,
@@ -21,31 +33,81 @@ pub const RPC_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_VALUE_DEPTH: usize = 64;
+const MAX_MODEL_ID_BYTES: usize = 128;
+
+pub(crate) enum ProjectRequest {
+    Memory(Request),
+    Model(ModelRequest),
+}
+
+pub(crate) enum ProjectResponse {
+    Memory(Response),
+    Model(ModelResponse),
+}
 
 pub(crate) struct Service {
     config: MemoryConfig,
     engine: Option<MemoryEngine>,
+    model_load_lock: Arc<Mutex<()>>,
+    inference_lock: Arc<Mutex<()>>,
 }
 
 impl Service {
     pub(crate) fn new(config: MemoryConfig) -> Self {
+        Self::new_with_locks(config, Arc::new(Mutex::new(())), Arc::new(Mutex::new(())))
+    }
+
+    pub(crate) fn new_with_locks(
+        config: MemoryConfig,
+        model_load_lock: Arc<Mutex<()>>,
+        inference_lock: Arc<Mutex<()>>,
+    ) -> Self {
         Self {
             config,
             engine: None,
+            model_load_lock,
+            inference_lock,
         }
     }
 
     fn engine(&mut self) -> Result<&mut MemoryEngine> {
         if self.engine.is_none() {
-            self.engine = Some(MemoryEngine::open(self.config.clone())?);
+            let _model_load_guard = self
+                .model_load_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.engine = Some(MemoryEngine::open_with_inference_lock(
+                self.config.clone(),
+                Arc::clone(&self.inference_lock),
+            )?);
         }
         self.engine
             .as_mut()
             .ok_or_else(|| anyhow!("memory engine did not initialize"))
     }
 
-    pub(crate) fn initialize(&mut self) -> Result<()> {
-        self.engine().map(|_| ())
+    pub(crate) fn prepare_project_request(&mut self, request: &ProjectRequest) -> Result<()> {
+        if matches!(request, ProjectRequest::Memory(_)) {
+            self.engine()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn setup_failure_response(
+        request: &ProjectRequest,
+        error: &anyhow::Error,
+    ) -> ProjectResponse {
+        match request {
+            ProjectRequest::Memory(request) => ProjectResponse::Memory(failure(
+                request.id,
+                format!("memory engine initialization failed: {error:#}"),
+            )),
+            ProjectRequest::Model(request) => ProjectResponse::Model(model_error(
+                request.id,
+                ModelStatusCode::Internal,
+                format!("model service initialization failed: {error:#}"),
+            )),
+        }
     }
 
     pub(crate) fn handle(&mut self, request: Request) -> Result<(Response, bool)> {
@@ -140,6 +202,354 @@ impl Service {
             Method::Unspecified => return Err(anyhow!("memory method is unspecified")),
         };
         Ok((success(id, result)?, false))
+    }
+
+    pub(crate) fn handle_project(
+        &mut self,
+        request: ProjectRequest,
+    ) -> Result<(ProjectResponse, bool)> {
+        match request {
+            ProjectRequest::Memory(request) => self
+                .handle(request)
+                .map(|(response, shutdown)| (ProjectResponse::Memory(response), shutdown)),
+            ProjectRequest::Model(request) => {
+                Ok((ProjectResponse::Model(self.handle_model(request)), false))
+            }
+        }
+    }
+
+    fn handle_model(&mut self, request: ModelRequest) -> ModelResponse {
+        let id = request.id;
+        if let Err(error) = validate_model_request(&request) {
+            return model_error(id, ModelStatusCode::InvalidArgument, error.to_string());
+        }
+        let Some(operation) = request.operation else {
+            return model_error(
+                id,
+                ModelStatusCode::InvalidArgument,
+                "model request operation is required",
+            );
+        };
+
+        match operation {
+            model_request::Operation::ListProfiles(_) => {
+                match model_profiles_response(model::profiles(&self.config)) {
+                    Ok(response) => model_ok(id, model_response::Result::ListProfiles(response)),
+                    Err(error) => model_error(id, ModelStatusCode::Internal, error.to_string()),
+                }
+            }
+            model_request::Operation::StartSwitch(request) => self.handle_model_switch(id, request),
+            model_request::Operation::GetSwitchStatus(_) => model_error(
+                id,
+                ModelStatusCode::Unavailable,
+                "durable model switch status is not enabled in this phase",
+            ),
+            model_request::Operation::CancelSwitch(_) => model_error(
+                id,
+                ModelStatusCode::Unavailable,
+                "durable model switch cancellation is not enabled in this phase",
+            ),
+        }
+    }
+
+    fn handle_model_switch(
+        &self,
+        id: u64,
+        request: crate::model_proto::StartModelSwitchRequest,
+    ) -> ModelResponse {
+        let execution_mode = match ModelSwitchExecutionMode::try_from(request.execution_mode) {
+            Ok(value) => value,
+            Err(_) => {
+                return model_error(
+                    id,
+                    ModelStatusCode::InvalidArgument,
+                    "model switch execution_mode is unknown",
+                );
+            }
+        };
+        let switch_request = match model_switch_request(request) {
+            Ok(request) => request,
+            Err(error) => {
+                return model_error(id, ModelStatusCode::InvalidArgument, error.to_string());
+            }
+        };
+        if execution_mode == ModelSwitchExecutionMode::Apply {
+            return model_error(
+                id,
+                ModelStatusCode::Unavailable,
+                "durable model generation migration is not enabled; use dry-run preflight",
+            );
+        }
+
+        match model::preflight(&self.config, &switch_request) {
+            Ok(response) => match model_switch_response(response) {
+                Ok(response) => model_ok(id, model_response::Result::StartSwitch(response)),
+                Err(error) => model_error(id, ModelStatusCode::Internal, error.to_string()),
+            },
+            Err(error) => {
+                let code = if error.to_string().starts_with("PROFILE_NOT_FOUND:") {
+                    ModelStatusCode::NotFound
+                } else {
+                    ModelStatusCode::Internal
+                };
+                model_error(id, code, error.to_string())
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_project_request(request: &ProjectRequest) -> Result<()> {
+    match request {
+        ProjectRequest::Memory(request) => {
+            anyhow::ensure!(request.id != 0, "memory request id is required");
+            let method = Method::try_from(request.method)
+                .map_err(|_| anyhow!("unknown memory method value: {}", request.method))?;
+            anyhow::ensure!(
+                method != Method::Unspecified,
+                "memory method is unspecified"
+            );
+            Ok(())
+        }
+        ProjectRequest::Model(request) => validate_model_request(request),
+    }
+}
+
+fn validate_model_request(request: &ModelRequest) -> Result<()> {
+    anyhow::ensure!(request.id != 0, "model request id is required");
+    let Some(operation) = request.operation.as_ref() else {
+        anyhow::bail!("model request operation is required");
+    };
+    match operation {
+        model_request::Operation::ListProfiles(_) => Ok(()),
+        model_request::Operation::StartSwitch(request) => {
+            validate_model_id("target_profile_id", &request.target_profile_id)?;
+            if let Some(value) = request.switch_id.as_deref() {
+                validate_model_id("switch_id", value)?;
+            }
+            if let Some(value) = request.expected_active_profile_id.as_deref() {
+                validate_model_id("expected_active_profile_id", value)?;
+            }
+            let execution_mode = ModelSwitchExecutionMode::try_from(request.execution_mode)
+                .map_err(|_| anyhow!("model switch execution_mode is unknown"))?;
+            anyhow::ensure!(
+                execution_mode != ModelSwitchExecutionMode::Unspecified,
+                "model switch execution_mode is required"
+            );
+            ModelSwitchAvailability::try_from(request.availability)
+                .map_err(|_| anyhow!("model switch availability is unknown"))?;
+            ModelSwitchRebuildPolicy::try_from(request.rebuild_policy)
+                .map_err(|_| anyhow!("model switch rebuild_policy is unknown"))?;
+            Ok(())
+        }
+        model_request::Operation::GetSwitchStatus(request) => {
+            validate_model_id("switch_id", &request.switch_id)
+        }
+        model_request::Operation::CancelSwitch(request) => {
+            validate_model_id("switch_id", &request.switch_id)
+        }
+    }
+}
+
+fn validate_model_id(name: &str, value: &str) -> Result<()> {
+    anyhow::ensure!(!value.trim().is_empty(), "model {name} is required");
+    anyhow::ensure!(
+        value.len() <= MAX_MODEL_ID_BYTES,
+        "model {name} is too long"
+    );
+    anyhow::ensure!(
+        !value.chars().any(char::is_control),
+        "model {name} contains a control character"
+    );
+    Ok(())
+}
+
+fn model_switch_request(
+    request: crate::model_proto::StartModelSwitchRequest,
+) -> Result<ModelSwitchRequest> {
+    let availability = ModelSwitchAvailability::try_from(request.availability)
+        .map_err(|_| anyhow!("model switch availability is unknown"))?;
+    let rebuild_policy = ModelSwitchRebuildPolicy::try_from(request.rebuild_policy)
+        .map_err(|_| anyhow!("model switch rebuild_policy is unknown"))?;
+    let execution_mode = ModelSwitchExecutionMode::try_from(request.execution_mode)
+        .map_err(|_| anyhow!("model switch execution_mode is unknown"))?;
+    Ok(ModelSwitchRequest {
+        target_profile_id: request.target_profile_id,
+        switch_id: request.switch_id,
+        expected_active_profile_id: request.expected_active_profile_id,
+        allow_dense_downtime: matches!(availability, ModelSwitchAvailability::AllowDenseDowntime),
+        dry_run: matches!(execution_mode, ModelSwitchExecutionMode::DryRun),
+        force_rebuild: matches!(rebuild_policy, ModelSwitchRebuildPolicy::ForceRebuild),
+    })
+}
+
+fn model_profiles_response(
+    response: model::ModelProfilesResponse,
+) -> Result<ProtoListModelProfilesResponse> {
+    Ok(ProtoListModelProfilesResponse {
+        catalog_version: response.catalog_version,
+        catalog_digest: response.catalog_digest,
+        active_profile_id: response.active_profile_id,
+        active_generation_id: response.active_generation_id,
+        profiles: response
+            .profiles
+            .into_iter()
+            .map(model_profile)
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn model_profile(profile: model::ModelProfile) -> Result<ProtoModelProfile> {
+    let modalities = profile
+        .modalities
+        .iter()
+        .map(|value| match value.as_str() {
+            "text" => Ok(EmbeddingModality::Text as i32),
+            "image" => Ok(EmbeddingModality::Image as i32),
+            "mixed" => Ok(EmbeddingModality::Mixed as i32),
+            _ => Err(anyhow!("unknown embedding modality: {value}")),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let metric = match profile.metric.as_deref() {
+        None => EmbeddingMetric::Unspecified,
+        Some("cosine") => EmbeddingMetric::Cosine,
+        Some("dot_product") => EmbeddingMetric::DotProduct,
+        Some(value) => return Err(anyhow!("unknown embedding metric: {value}")),
+    };
+    let support_level = match profile.support_level.as_str() {
+        "stable" => ModelProfileSupportLevel::Stable,
+        "preview" => ModelProfileSupportLevel::Preview,
+        "unsupported" => ModelProfileSupportLevel::Unsupported,
+        value => return Err(anyhow!("unknown model support level: {value}")),
+    };
+    let mut roles = Vec::new();
+    if profile.default_for_new_projects {
+        roles.push(ModelProfileRole::DefaultForNewProjects as i32);
+    }
+    if profile.recommended {
+        roles.push(ModelProfileRole::Recommended as i32);
+    }
+    let mut capabilities = Vec::new();
+    for (enabled, capability) in [
+        (profile.selectable, ModelProfileCapability::Selectable),
+        (profile.installed, ModelProfileCapability::Installed),
+        (
+            profile.platform_supported,
+            ModelProfileCapability::PlatformSupported,
+        ),
+        (
+            profile.runtime_available,
+            ModelProfileCapability::RuntimeAvailable,
+        ),
+        (
+            profile.artifact_locked,
+            ModelProfileCapability::ArtifactLocked,
+        ),
+    ] {
+        if enabled {
+            capabilities.push(capability as i32);
+        }
+    }
+    Ok(ProtoModelProfile {
+        profile_id: profile.profile_id,
+        display_name: profile.display_name,
+        description: profile.description,
+        modalities,
+        repository: profile.repository,
+        filename: profile.filename,
+        revision: profile.revision,
+        artifact_sha256: profile.artifact_sha256,
+        runtime_family: profile.runtime_family,
+        dimension: profile
+            .dimension
+            .map(u32::try_from)
+            .transpose()
+            .context("model profile dimension exceeds uint32")?,
+        metric: metric as i32,
+        support_level: support_level as i32,
+        roles,
+        capabilities,
+        estimated_download_bytes: profile.estimated_download_bytes,
+        estimated_resident_bytes: profile.estimated_resident_bytes,
+        unavailable_reason: profile.unavailable_reason.map(|reason| ModelProfileReason {
+            code: reason.code,
+            message: reason.message,
+        }),
+    })
+}
+
+fn model_switch_response(response: model::ModelSwitchResponse) -> Result<StartModelSwitchResponse> {
+    let execution_mode = if response.dry_run {
+        ModelSwitchExecutionMode::DryRun
+    } else {
+        ModelSwitchExecutionMode::Apply
+    };
+    let state = match response.state.as_str() {
+        "preflight" => ModelSwitchState::Preflight,
+        value => return Err(anyhow!("unknown model switch state: {value}")),
+    };
+    Ok(StartModelSwitchResponse {
+        switch_id: response.switch_id,
+        execution_mode: execution_mode as i32,
+        state: state as i32,
+        active_profile_id: response.active_profile_id,
+        target_profile_id: response.target_profile_id,
+        active_generation_id: response.active_generation_id,
+        target_generation_id: response.target_generation_id,
+        dense_search_available: response.dense_search_available,
+        preflight: Some(model_switch_preflight(response.preflight)?),
+    })
+}
+
+fn model_switch_preflight(
+    preflight: model::ModelSwitchPreflight,
+) -> Result<ProtoModelSwitchPreflight> {
+    let availability = match preflight.availability.as_str() {
+        "keep_old_dense" => ModelSwitchAvailability::KeepOldDense,
+        "allow_dense_downtime" => ModelSwitchAvailability::AllowDenseDowntime,
+        value => return Err(anyhow!("unknown model switch availability: {value}")),
+    };
+    Ok(ProtoModelSwitchPreflight {
+        decision: if preflight.can_start {
+            ModelPreflightDecision::Ready as i32
+        } else {
+            ModelPreflightDecision::Blocked as i32
+        },
+        availability: availability as i32,
+        blockers: preflight
+            .blockers
+            .into_iter()
+            .map(|blocker| ProtoModelSwitchBlocker {
+                code: blocker.code,
+                message: blocker.message,
+            })
+            .collect(),
+        warnings: preflight.warnings,
+        estimated_download_bytes: preflight.estimated_download_bytes,
+        estimated_disk_bytes: preflight.estimated_disk_bytes,
+        estimated_resident_bytes: preflight.estimated_resident_bytes,
+        dense_search_available: preflight.dense_search_available,
+    })
+}
+
+fn model_ok(id: u64, result: model_response::Result) -> ModelResponse {
+    ModelResponse {
+        id,
+        status: Some(ModelStatus {
+            code: ModelStatusCode::Ok as i32,
+            message: String::new(),
+        }),
+        result: Some(result),
+    }
+}
+
+fn model_error(id: u64, code: ModelStatusCode, message: impl Into<String>) -> ModelResponse {
+    ModelResponse {
+        id,
+        status: Some(ModelStatus {
+            code: code as i32,
+            message: message.into(),
+        }),
+        result: None,
     }
 }
 
@@ -362,10 +772,17 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Method, RPC_PROTOCOL_VERSION, Request, Service, decode_value, encode_value, read_frame,
-        run_protocol_io,
+        Method, ProjectRequest, ProjectResponse, RPC_PROTOCOL_VERSION, Request, Service,
+        decode_value, encode_value, read_frame, run_protocol_io,
     };
-    use crate::{MemoryConfig, RetrievalMode, SearchRequest};
+    use crate::model_proto::{
+        CancelModelSwitchRequest, GetModelSwitchStatusRequest, ListModelProfilesRequest,
+        ModelPreflightDecision, ModelProfileCapability, ModelProfileRole, ModelRequest,
+        ModelStatusCode, ModelSwitchAvailability, ModelSwitchExecutionMode,
+        ModelSwitchRebuildPolicy, ModelSwitchState, StartModelSwitchRequest, model_request,
+        model_response,
+    };
+    use crate::{EmbeddingConfig, MemoryConfig, RetrievalMode, SearchRequest};
 
     fn config() -> (tempfile::TempDir, MemoryConfig) {
         let temp = tempfile::tempdir().expect("create temp dir");
@@ -398,17 +815,166 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_does_not_initialize_the_model() {
+    fn memory_project_dispatch_preserves_the_legacy_response() {
         let (_temp, config) = config();
         let mut service = Service::new(config);
-        let request = Request {
-            id: 7,
-            method: Method::Shutdown as i32,
-            params: Some(encode_value(&json!({}), 0).expect("encode params")),
-        };
-        let (response, shutdown) = service.handle(request).expect("handle shutdown");
+        let (response, shutdown) = service
+            .handle_project(ProjectRequest::Memory(Request {
+                id: 7,
+                method: Method::Shutdown as i32,
+                params: Some(encode_value(&json!({}), 0).expect("encode params")),
+            }))
+            .expect("handle shutdown");
         assert!(shutdown);
+        let ProjectResponse::Memory(response) = response else {
+            panic!("memory request returned a model response")
+        };
+        assert_eq!(response.id, 7);
         assert!(response.ok);
+        assert!(service.engine.is_none());
+    }
+
+    #[test]
+    fn typed_model_profiles_do_not_initialize_the_memory_engine() {
+        let (_temp, config) = config();
+        let mut service = Service::new(config);
+        let response = service.handle_model(ModelRequest {
+            id: 8,
+            operation: Some(model_request::Operation::ListProfiles(
+                ListModelProfilesRequest {},
+            )),
+        });
+        assert_eq!(response.id, 8);
+        assert_eq!(
+            response.status.as_ref().map(|status| status.code),
+            Some(ModelStatusCode::Ok as i32)
+        );
+        assert!(service.engine.is_none());
+        let Some(model_response::Result::ListProfiles(result)) = response.result else {
+            panic!("profile request returned the wrong result")
+        };
+        assert_eq!(result.active_profile_id, "qwen3-text-4b-q4");
+        assert_eq!(result.profiles.len(), 7);
+        assert!(
+            result.profiles[0]
+                .roles
+                .contains(&(ModelProfileRole::DefaultForNewProjects as i32))
+        );
+        assert!(
+            result.profiles[0]
+                .capabilities
+                .contains(&(ModelProfileCapability::Selectable as i32))
+        );
+    }
+
+    #[test]
+    fn engine_setup_failure_is_returned_as_a_domain_failure() {
+        let (temp, config) = config();
+        let config = config.with_embedding(EmbeddingConfig {
+            model_path: Some(temp.path().join("missing.gguf")),
+            ..EmbeddingConfig::default()
+        });
+        let mut service = Service::new(config);
+        let request = ProjectRequest::Memory(Request {
+            id: 19,
+            method: Method::Status as i32,
+            params: Some(encode_value(&json!({}), 0).expect("encode params")),
+        });
+
+        let error = service
+            .prepare_project_request(&request)
+            .expect_err("missing local model should fail setup");
+        let ProjectResponse::Memory(response) = Service::setup_failure_response(&request, &error)
+        else {
+            panic!("memory setup failure returned the wrong domain")
+        };
+        assert_eq!(response.id, 19);
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .contains("memory engine initialization failed")
+        );
+    }
+
+    #[test]
+    fn typed_model_preflight_does_not_initialize_the_memory_engine() {
+        let (_temp, config) = config();
+        let mut service = Service::new(config);
+        let response = service.handle_model(ModelRequest {
+            id: 9,
+            operation: Some(model_request::Operation::StartSwitch(
+                StartModelSwitchRequest {
+                    switch_id: None,
+                    target_profile_id: "qwen3-text-0.6b-q8".to_string(),
+                    expected_active_profile_id: None,
+                    availability: ModelSwitchAvailability::KeepOldDense as i32,
+                    execution_mode: ModelSwitchExecutionMode::DryRun as i32,
+                    rebuild_policy: ModelSwitchRebuildPolicy::RejectActiveProfile as i32,
+                },
+            )),
+        });
+        assert_eq!(
+            response.status.as_ref().map(|status| status.code),
+            Some(ModelStatusCode::Ok as i32)
+        );
+        assert!(service.engine.is_none());
+        let Some(model_response::Result::StartSwitch(result)) = response.result else {
+            panic!("preflight request returned the wrong result")
+        };
+        assert_eq!(result.state, ModelSwitchState::Preflight as i32);
+        assert_eq!(
+            result.preflight.as_ref().map(|value| value.decision),
+            Some(ModelPreflightDecision::Blocked as i32)
+        );
+    }
+
+    #[test]
+    fn unavailable_model_operations_return_typed_statuses() {
+        let (_temp, config) = config();
+        let mut service = Service::new(config);
+        let requests = [
+            ModelRequest {
+                id: 10,
+                operation: Some(model_request::Operation::StartSwitch(
+                    StartModelSwitchRequest {
+                        switch_id: Some("switch-a".to_string()),
+                        target_profile_id: "qwen3-text-0.6b-q8".to_string(),
+                        expected_active_profile_id: None,
+                        availability: ModelSwitchAvailability::KeepOldDense as i32,
+                        execution_mode: ModelSwitchExecutionMode::Apply as i32,
+                        rebuild_policy: ModelSwitchRebuildPolicy::RejectActiveProfile as i32,
+                    },
+                )),
+            },
+            ModelRequest {
+                id: 11,
+                operation: Some(model_request::Operation::GetSwitchStatus(
+                    GetModelSwitchStatusRequest {
+                        switch_id: "switch-a".to_string(),
+                    },
+                )),
+            },
+            ModelRequest {
+                id: 12,
+                operation: Some(model_request::Operation::CancelSwitch(
+                    CancelModelSwitchRequest {
+                        switch_id: "switch-a".to_string(),
+                    },
+                )),
+            },
+        ];
+
+        for request in requests {
+            let expected_id = request.id;
+            let response = service.handle_model(request);
+            assert_eq!(response.id, expected_id);
+            assert_eq!(
+                response.status.as_ref().map(|status| status.code),
+                Some(ModelStatusCode::Unavailable as i32)
+            );
+            assert!(response.result.is_none());
+        }
         assert!(service.engine.is_none());
     }
 

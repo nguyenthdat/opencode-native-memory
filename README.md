@@ -24,7 +24,7 @@ Add the plugin to `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@nguyenthdat/opencode-memory@0.6.0-beta.2"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.6.0"]
 }
 ```
 
@@ -33,7 +33,7 @@ The package also includes an OpenCode TUI companion. Enable it in `tui.json`:
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["@nguyenthdat/opencode-memory@0.6.0-beta.2"]
+  "plugin": ["@nguyenthdat/opencode-memory@0.6.0"]
 }
 ```
 
@@ -86,6 +86,29 @@ The plugin automatically registers its packaged `rules/native-memory.md` as an O
 | `memory_status`          | Health-check the plugin and inspect backend, model, and schema status     |
 | `memory_doctor`          | Run shallow or deep integrity checks                                      |
 | `memory_purge`           | Confirm and delete the complete project store                             |
+| `memory_model_profiles`  | List stable, preview, and unsupported embedding model profiles            |
+| `memory_model_switch`    | Run a non-mutating model switch preflight                                 |
+
+### Embedding Profiles
+
+The daemon owns an immutable profile catalog. The current selectable default is
+`qwen3-text-4b-q4`, which preserves the existing Qwen3 4B GGUF configuration.
+The catalog also describes popular presets such as `qwen3-text-0.6b-q8`,
+`qwen3-text-8b-q4`, `bge-m3`, and `nomic-embed-text-v1.5`, plus experimental
+Qwen3-VL 2B/8B entries. Preview and multimodal entries are visible but not
+selectable until their artifact, runtime, quality, and memory gates pass.
+
+Use the safe phase-1 commands:
+
+```text
+/memory model profiles
+/memory model switch qwen3-text-0.6b-q8 --dry-run
+/memory model switch qwen3-vl-embedding-8b --dry-run
+```
+
+The current release performs preflight only. It never changes an existing
+project's model or mixes incompatible vectors. Durable collection-generation
+migration, cancellation, resume, and rollback are a later phase.
 
 The 15 stable taxonomy values are `task_attempt`, `tool_call`, `session_summary`, `architecture_fact`, `codebase_fact`, `user_fact`, `fix_pattern`, `code_template`, `tool_heuristic`, `code_style`, `library_pref`, `workflow_pref`, `decision`, `team_convention`, and `project_standard`.
 
@@ -137,6 +160,8 @@ Changing model identity or vector-affecting preprocessing requires rebuilding th
 | `OPENCODE_MEMORY_AUTO_CAPTURE`               | Evaluate compaction candidates through the capture gate; default `true`      |
 | `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS`       | Incrementally index non-ignored project documents; default `true`            |
 | `OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS` | File-watcher re-index debounce; default `750`                                |
+| `OPENCODE_MEMORY_AUTO_OPTIMIZE`              | Coalesced zvec compaction after writes/index drift; default `true`           |
+| `OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS`       | Maintenance debounce; default `5000`                                         |
 | `OPENCODE_MEMORY_SHARED_SYNC`                | Synchronize `.opencode/memory/**/*.md`; default `true`                       |
 | `OPENCODE_MEMORY_FEEDBACK_TRACKING`          | Track retrieval feedback; default `true`                                     |
 | `OPENCODE_MEMORY_MIN_SCORE`                  | Default calibrated search threshold; default `0.42`                          |
@@ -169,6 +194,14 @@ Shared Markdown is treated as untrusted data: paths are contained under `.openco
 `memory_ingest` accepts only project-relative `.pdf`, `.md`, `.markdown`, `.html`, and `.htm` files. It queues ingestion and returns a job ID immediately; use `memory_ingest_status` to poll completion or failure. One background worker processes jobs in order so multiple documents do not start competing model or zvec writers. Rust-side `xberg` extracts Markdown, chunks it below the 6,000-character memory limit, and stores the chunks with source hashes and document provenance. Re-ingesting unchanged project/agent documents with matching metadata reuses their existing chunks instead of running embedding again. Extracted document content is untrusted evidence and is never treated as an instruction.
 
 Automatic document indexing scans the project at startup and after debounced document watcher events. It respects `.gitignore`, `.ignore`, `.git/info/exclude`, global Git ignores, hidden directories, and the 32 MiB per-file limit; `.opencode/memory/` remains managed exclusively by repository-memory sync. A private derived manifest at `document-index.json` tracks source hashes and chunk ownership, so unchanged files skip extraction/embedding, changed files replace their previous chunks, deleted files are removed without tombstones, and a malformed file retains its last valid index. Set `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS=false` to disable automatic synchronization, or call `memory_index_documents` for an explicit/forced run.
+
+Automatic maintenance coalesces index/shared-memory/capture writes and runs
+`optimize` after a short debounce when zvec index completeness drops below
+98% or pending journals are observed. `index_documents`, `sync_shared`, and
+`optimize` are deterministic maintenance operations; if their response is
+lost after dispatch, the plugin retries the same operation once and never
+replays arbitrary mutations. Disable this behavior with
+`OPENCODE_MEMORY_AUTO_OPTIMIZE=false`.
 
 ## Architecture
 

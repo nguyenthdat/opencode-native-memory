@@ -39,6 +39,14 @@ export type {
   MemoryPluginHealthIssue,
   MemoryPluginHealth,
   MemoryStatusResponse,
+  MemoryModelProfile,
+  MemoryModelProfilesResponse,
+  ModelProfileReason,
+  ModelSwitchBlocker,
+  ModelSwitchPreflight,
+  ModelSwitchResponse,
+  ModelSwitchStatusResponse,
+  ModelSwitchCancelResponse,
 } from "./contracts.js";
 
 // Shared daemon client
@@ -63,14 +71,39 @@ export type {
 } from "./daemon-client.js";
 
 export {
+  createModelRequest,
   createMemoryRequest,
+  createProjectRequest,
   decodeMemoryResponse,
+  decodeModelResponse,
   decodeResponse,
   DelimitedFrameDecoder,
   encodeDelimited,
   encodeRequest,
+  isModelMethod,
 } from "./protocol.js";
-export type { MemoryMethod } from "./protocol.js";
+export type { MemoryMethod, ModelMethod, ProjectRequest } from "./protocol.js";
+
+export {
+  listModelProfiles,
+  preflightModelSwitch,
+  type ModelSwitchPreflightOptions,
+} from "./model-control.js";
+export {
+  captureWithOutcomeReconciliation,
+  type ReconciledCaptureResponse,
+} from "./capture-reconciliation.js";
+export {
+  MemoryMaintenanceScheduler,
+  DEFAULT_OPTIMIZE_DEBOUNCE_MS,
+  DEFAULT_OPTIMIZE_INDEX_THRESHOLD,
+  type MemoryMaintenanceOptions,
+} from "./maintenance.js";
+export {
+  requestIdempotently,
+  isOutcomeUnknown,
+  type IdempotentMaintenanceMethod,
+} from "./outcome-reconciliation.js";
 
 // Plugin factory
 export { createMemoryPlugin, resolveMemoryPluginOptions } from "./plugin.js";

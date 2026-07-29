@@ -8,11 +8,47 @@ import {
   ValueSchema,
 } from "./generated/opencode/memory/v1/memory_pb.js";
 import type { Request, Response, Value } from "./generated/opencode/memory/v1/memory_pb.js";
-import type { RpcResponse } from "./contracts.js";
+import {
+  CancelModelSwitchRequestSchema,
+  EmbeddingMetric,
+  EmbeddingModality,
+  GetModelSwitchStatusRequestSchema,
+  ListModelProfilesRequestSchema,
+  ModelCancelOutcome,
+  ModelPreflightDecision,
+  ModelProfileCapability,
+  ModelProfileRole,
+  ModelProfileSupportLevel,
+  ModelRequestSchema,
+  ModelStatusCode,
+  ModelSwitchAvailability,
+  ModelSwitchExecutionMode,
+  ModelSwitchRebuildPolicy,
+  ModelSwitchState,
+  StartModelSwitchRequestSchema,
+} from "./generated/opencode/memory/model/v1/model_pb.js";
+import type {
+  ListModelProfilesResponse,
+  ModelProfile,
+  ModelRequest,
+  ModelResponse,
+  ModelSwitchPreflight as ProtobufModelSwitchPreflight,
+  StartModelSwitchResponse,
+} from "./generated/opencode/memory/model/v1/model_pb.js";
+import type {
+  MemoryModelProfile,
+  MemoryModelProfilesResponse,
+  ModelProfileSupportLevel as ModelProfileSupportLevelContract,
+  ModelSwitchCancelResponse,
+  ModelSwitchPreflight,
+  ModelSwitchResponse,
+  ModelSwitchStatusResponse,
+  RpcResponse,
+} from "./contracts.js";
 
 const MAX_VALUE_DEPTH = 64;
 
-const METHODS = {
+const MEMORY_METHODS = {
   search: Method.SEARCH,
   store: Method.STORE,
   capture: Method.CAPTURE,
@@ -36,17 +72,21 @@ const METHODS = {
   shutdown: Method.SHUTDOWN,
 } as const;
 
-export type MemoryMethod = keyof typeof METHODS;
+export type ModelMethod =
+  "model_profiles" | "model_switch" | "model_switch_status" | "model_switch_cancel";
+export type MemoryMethod = keyof typeof MEMORY_METHODS | ModelMethod;
+
+export type ProjectRequest =
+  | { kind: "memory"; request: Request }
+  | { kind: "model"; method: ModelMethod; modelRequest: ModelRequest };
 
 export function encodeRequest(id: number, method: string, params: unknown): Uint8Array {
   return encodeDelimited(toBinary(RequestSchema, createMemoryRequest(id, method, params)));
 }
 
 export function createMemoryRequest(id: number, method: string, params: unknown): Request {
-  if (!Number.isSafeInteger(id) || id <= 0) {
-    throw new Error(`Invalid memory request ID: ${id}`);
-  }
-  const methodValue = METHODS[method as MemoryMethod];
+  validateRequestId(id);
+  const methodValue = MEMORY_METHODS[method as keyof typeof MEMORY_METHODS];
   if (methodValue === undefined) {
     throw new Error(`Unknown memory method: ${method}`);
   }
@@ -55,6 +95,79 @@ export function createMemoryRequest(id: number, method: string, params: unknown)
     method: methodValue,
     params: encodeValue(params, 0),
   });
+}
+
+export function createModelRequest(id: number, method: ModelMethod, params: unknown): ModelRequest {
+  validateRequestId(id);
+  const values = requestParams(params, method);
+  let operation: ModelRequest["operation"];
+  switch (method) {
+    case "model_profiles":
+      operation = {
+        case: "listProfiles",
+        value: create(ListModelProfilesRequestSchema),
+      };
+      break;
+    case "model_switch": {
+      const switchId = optionalStringParam(values, "switch_id", method);
+      const expectedActiveProfileId = optionalStringParam(
+        values,
+        "expected_active_profile_id",
+        method,
+      );
+      operation = {
+        case: "startSwitch",
+        value: create(StartModelSwitchRequestSchema, {
+          ...(switchId === undefined ? {} : { switchId }),
+          targetProfileId: requiredStringParam(values, "target_profile_id", method),
+          ...(expectedActiveProfileId === undefined ? {} : { expectedActiveProfileId }),
+          availability: booleanParam(values, "allow_dense_downtime", method)
+            ? ModelSwitchAvailability.ALLOW_DENSE_DOWNTIME
+            : ModelSwitchAvailability.KEEP_OLD_DENSE,
+          executionMode: booleanParam(values, "dry_run", method)
+            ? ModelSwitchExecutionMode.DRY_RUN
+            : ModelSwitchExecutionMode.APPLY,
+          rebuildPolicy: booleanParam(values, "force_rebuild", method)
+            ? ModelSwitchRebuildPolicy.FORCE_REBUILD
+            : ModelSwitchRebuildPolicy.REJECT_ACTIVE_PROFILE,
+        }),
+      };
+      break;
+    }
+    case "model_switch_status":
+      operation = {
+        case: "getSwitchStatus",
+        value: create(GetModelSwitchStatusRequestSchema, {
+          switchId: requiredStringParam(values, "switch_id", method),
+        }),
+      };
+      break;
+    case "model_switch_cancel":
+      operation = {
+        case: "cancelSwitch",
+        value: create(CancelModelSwitchRequestSchema, {
+          switchId: requiredStringParam(values, "switch_id", method),
+        }),
+      };
+      break;
+  }
+  return create(ModelRequestSchema, { id: BigInt(id), operation });
+}
+
+export function createProjectRequest(id: number, method: string, params: unknown): ProjectRequest {
+  if (isModelMethod(method)) {
+    return { kind: "model", method, modelRequest: createModelRequest(id, method, params) };
+  }
+  return { kind: "memory", request: createMemoryRequest(id, method, params) };
+}
+
+export function isModelMethod(method: string): method is ModelMethod {
+  return (
+    method === "model_profiles" ||
+    method === "model_switch" ||
+    method === "model_switch_status" ||
+    method === "model_switch_cancel"
+  );
 }
 
 export function decodeResponse(payload: Uint8Array): RpcResponse {
@@ -69,6 +182,69 @@ export function decodeMemoryResponse(response: Response): RpcResponse {
     result: response.result ? decodeValue(response.result, 0) : undefined,
     error: response.error || undefined,
   };
+}
+
+export function decodeModelResponse(response: ModelResponse, method: ModelMethod): RpcResponse {
+  const id = safeNumber(response.id, "model response ID");
+  const status = response.status;
+  if (!status) throw new Error("Native memory daemon omitted the model response status");
+  if (status.code !== ModelStatusCode.OK) {
+    return {
+      id,
+      ok: false,
+      error: status.message || `Native memory model operation failed (${status.code})`,
+    };
+  }
+
+  const expectedCase = modelResultCase(method);
+  if (response.result.case !== expectedCase) {
+    throw new Error(
+      `Native memory daemon returned ${response.result.case ?? "no"} result for ${method}`,
+    );
+  }
+
+  let result: unknown;
+  switch (response.result.case) {
+    case "listProfiles":
+      result = mapModelProfilesResponse(response.result.value);
+      break;
+    case "startSwitch":
+      result = mapModelSwitchResponse(response.result.value);
+      break;
+    case "getSwitchStatus":
+      result = {
+        switch_id: response.result.value.switchId,
+        state: modelSwitchState(response.result.value.state),
+        active_profile_id: response.result.value.activeProfileId,
+        target_profile_id: response.result.value.targetProfileId,
+        active_generation_id: response.result.value.activeGenerationId,
+        target_generation_id: response.result.value.targetGenerationId ?? null,
+        completed_records: safeNumber(
+          response.result.value.completedRecords,
+          "model switch completed record count",
+        ),
+        total_records: safeNumber(
+          response.result.value.totalRecords,
+          "model switch total record count",
+        ),
+        error: response.result.value.error
+          ? {
+              code: response.result.value.error.code,
+              message: response.result.value.error.message,
+            }
+          : null,
+      } satisfies ModelSwitchStatusResponse;
+      break;
+    case "cancelSwitch":
+      result = {
+        switch_id: response.result.value.switchId,
+        outcome: modelCancelOutcome(response.result.value.outcome),
+      } satisfies ModelSwitchCancelResponse;
+      break;
+    case undefined:
+      throw new Error(`Native memory daemon omitted the model result for ${method}`);
+  }
+  return { id, ok: true, result, error: undefined };
 }
 
 export class DelimitedFrameDecoder {
@@ -205,6 +381,300 @@ function decodeValue(input: Value, depth: number): unknown {
     case undefined:
       return null;
   }
+}
+
+function mapModelProfilesResponse(
+  response: ListModelProfilesResponse,
+): MemoryModelProfilesResponse {
+  return {
+    catalog_version: response.catalogVersion,
+    catalog_digest: response.catalogDigest,
+    active_profile_id: response.activeProfileId,
+    active_generation_id: response.activeGenerationId,
+    profiles: response.profiles.map(mapModelProfile),
+  };
+}
+
+function mapModelProfile(profile: ModelProfile): MemoryModelProfile {
+  return {
+    profile_id: profile.profileId,
+    display_name: profile.displayName,
+    description: profile.description,
+    modalities: profile.modalities.map(modelModality),
+    repository: profile.repository ?? null,
+    filename: profile.filename ?? null,
+    revision: profile.revision ?? null,
+    artifact_sha256: profile.artifactSha256 ?? null,
+    runtime_family: profile.runtimeFamily,
+    dimension: profile.dimension ?? null,
+    metric: modelMetric(profile.metric),
+    support_level: modelSupportLevel(profile.supportLevel),
+    selectable: profile.capabilities.includes(ModelProfileCapability.SELECTABLE),
+    default_for_new_projects: profile.roles.includes(ModelProfileRole.DEFAULT_FOR_NEW_PROJECTS),
+    recommended: profile.roles.includes(ModelProfileRole.RECOMMENDED),
+    installed: profile.capabilities.includes(ModelProfileCapability.INSTALLED),
+    platform_supported: profile.capabilities.includes(ModelProfileCapability.PLATFORM_SUPPORTED),
+    runtime_available: profile.capabilities.includes(ModelProfileCapability.RUNTIME_AVAILABLE),
+    artifact_locked: profile.capabilities.includes(ModelProfileCapability.ARTIFACT_LOCKED),
+    estimated_download_bytes: optionalSafeNumber(
+      profile.estimatedDownloadBytes,
+      "model profile estimated download bytes",
+    ),
+    estimated_resident_bytes: optionalSafeNumber(
+      profile.estimatedResidentBytes,
+      "model profile estimated resident bytes",
+    ),
+    unavailable_reason: profile.unavailableReason
+      ? { code: profile.unavailableReason.code, message: profile.unavailableReason.message }
+      : null,
+  };
+}
+
+function mapModelSwitchResponse(response: StartModelSwitchResponse): ModelSwitchResponse {
+  if (!response.preflight) {
+    throw new Error("Native memory daemon omitted the model switch preflight");
+  }
+  const preflight = mapModelSwitchPreflight(response.preflight);
+  return {
+    switch_id: response.switchId ?? null,
+    dry_run: modelSwitchDryRun(response.executionMode),
+    state: modelSwitchState(response.state),
+    active_profile_id: response.activeProfileId,
+    target_profile_id: response.targetProfileId,
+    active_generation_id: response.activeGenerationId,
+    target_generation_id: response.targetGenerationId ?? null,
+    dense_search_available: response.denseSearchAvailable,
+    preflight,
+  };
+}
+
+function mapModelSwitchPreflight(preflight: ProtobufModelSwitchPreflight): ModelSwitchPreflight {
+  const availability = modelSwitchAvailability(preflight.availability);
+  return {
+    can_start: modelPreflightCanStart(preflight.decision),
+    availability,
+    dense_search_available: preflight.denseSearchAvailable,
+    estimated_download_bytes: optionalSafeNumber(
+      preflight.estimatedDownloadBytes,
+      "model switch estimated download bytes",
+    ),
+    estimated_disk_bytes: optionalSafeNumber(
+      preflight.estimatedDiskBytes,
+      "model switch estimated disk bytes",
+    ),
+    estimated_resident_bytes: optionalSafeNumber(
+      preflight.estimatedResidentBytes,
+      "model switch estimated resident bytes",
+    ),
+    warnings: [...preflight.warnings],
+    blockers: preflight.blockers.map((blocker) => ({
+      code: blocker.code,
+      message: blocker.message,
+    })),
+  };
+}
+
+function modelResultCase(method: ModelMethod): Exclude<ModelResponse["result"]["case"], undefined> {
+  switch (method) {
+    case "model_profiles":
+      return "listProfiles";
+    case "model_switch":
+      return "startSwitch";
+    case "model_switch_status":
+      return "getSwitchStatus";
+    case "model_switch_cancel":
+      return "cancelSwitch";
+  }
+}
+
+function modelModality(value: EmbeddingModality): string {
+  switch (value) {
+    case EmbeddingModality.TEXT:
+      return "text";
+    case EmbeddingModality.IMAGE:
+      return "image";
+    case EmbeddingModality.MIXED:
+      return "mixed";
+    case EmbeddingModality.UNSPECIFIED:
+      throw new Error("Native memory daemon returned an unspecified model modality");
+    default:
+      throw new Error(`Native memory daemon returned unknown model modality ${value}`);
+  }
+}
+
+function modelMetric(value: EmbeddingMetric): MemoryModelProfile["metric"] {
+  switch (value) {
+    case EmbeddingMetric.UNSPECIFIED:
+      return null;
+    case EmbeddingMetric.COSINE:
+      return "cosine";
+    case EmbeddingMetric.DOT_PRODUCT:
+      return "dot_product";
+    default:
+      throw new Error(`Native memory daemon returned unknown model metric ${value}`);
+  }
+}
+
+function modelSupportLevel(value: ModelProfileSupportLevel): ModelProfileSupportLevelContract {
+  switch (value) {
+    case ModelProfileSupportLevel.STABLE:
+      return "stable";
+    case ModelProfileSupportLevel.PREVIEW:
+      return "preview";
+    case ModelProfileSupportLevel.UNSUPPORTED:
+      return "unsupported";
+    case ModelProfileSupportLevel.UNSPECIFIED:
+      throw new Error("Native memory daemon returned an unspecified model support level");
+    default:
+      throw new Error(`Native memory daemon returned unknown model support level ${value}`);
+  }
+}
+
+function modelSwitchAvailability(
+  value: ModelSwitchAvailability,
+): ModelSwitchPreflight["availability"] {
+  switch (value) {
+    case ModelSwitchAvailability.KEEP_OLD_DENSE:
+      return "keep_old_dense";
+    case ModelSwitchAvailability.ALLOW_DENSE_DOWNTIME:
+      return "allow_dense_downtime";
+    case ModelSwitchAvailability.UNSPECIFIED:
+      throw new Error("Native memory daemon returned an unspecified model switch availability");
+    default:
+      throw new Error(`Native memory daemon returned unknown model switch availability ${value}`);
+  }
+}
+
+function modelSwitchDryRun(value: ModelSwitchExecutionMode): boolean {
+  switch (value) {
+    case ModelSwitchExecutionMode.APPLY:
+      return false;
+    case ModelSwitchExecutionMode.DRY_RUN:
+      return true;
+    case ModelSwitchExecutionMode.UNSPECIFIED:
+      throw new Error("Native memory daemon returned an unspecified model switch execution mode");
+    default:
+      throw new Error(`Native memory daemon returned unknown model switch execution mode ${value}`);
+  }
+}
+
+function modelPreflightCanStart(value: ModelPreflightDecision): boolean {
+  switch (value) {
+    case ModelPreflightDecision.READY:
+      return true;
+    case ModelPreflightDecision.BLOCKED:
+      return false;
+    case ModelPreflightDecision.UNSPECIFIED:
+      throw new Error("Native memory daemon returned an unspecified model preflight decision");
+    default:
+      throw new Error(`Native memory daemon returned unknown model preflight decision ${value}`);
+  }
+}
+
+function modelSwitchState(value: ModelSwitchState): ModelSwitchResponse["state"] {
+  switch (value) {
+    case ModelSwitchState.PREFLIGHT:
+      return "preflight";
+    case ModelSwitchState.QUEUED:
+      return "queued";
+    case ModelSwitchState.VALIDATING:
+      return "validating";
+    case ModelSwitchState.DOWNLOADING:
+      return "downloading";
+    case ModelSwitchState.PREPARING:
+      return "preparing";
+    case ModelSwitchState.REINDEXING:
+      return "reindexing";
+    case ModelSwitchState.VERIFYING:
+      return "verifying";
+    case ModelSwitchState.COMMITTING:
+      return "committing";
+    case ModelSwitchState.SUCCEEDED:
+      return "succeeded";
+    case ModelSwitchState.CANCEL_REQUESTED:
+      return "cancel_requested";
+    case ModelSwitchState.CANCELLED:
+      return "cancelled";
+    case ModelSwitchState.FAILED:
+      return "failed";
+    case ModelSwitchState.UNSPECIFIED:
+      throw new Error("Native memory daemon returned an unspecified model switch state");
+    default:
+      throw new Error(`Native memory daemon returned unknown model switch state ${value}`);
+  }
+}
+
+function modelCancelOutcome(value: ModelCancelOutcome): ModelSwitchCancelResponse["outcome"] {
+  switch (value) {
+    case ModelCancelOutcome.CANCEL_REQUESTED:
+      return "cancel_requested";
+    case ModelCancelOutcome.CANCELLED_BEFORE_COMMIT:
+      return "cancelled_before_commit";
+    case ModelCancelOutcome.ALREADY_COMMITTING:
+      return "already_committing";
+    case ModelCancelOutcome.ALREADY_COMMITTED:
+      return "already_committed";
+    case ModelCancelOutcome.ALREADY_TERMINAL:
+      return "already_terminal";
+    case ModelCancelOutcome.NOT_FOUND:
+      return "not_found";
+    case ModelCancelOutcome.UNSPECIFIED:
+      throw new Error("Native memory daemon returned an unspecified model cancel outcome");
+    default:
+      throw new Error(`Native memory daemon returned unknown model cancel outcome ${value}`);
+  }
+}
+
+function validateRequestId(id: number): void {
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new Error(`Invalid memory request ID: ${id}`);
+  }
+}
+
+function requestParams(params: unknown, method: ModelMethod): Record<string, unknown> {
+  if (params === undefined || params === null) return {};
+  if (typeof params !== "object" || Array.isArray(params)) {
+    throw new Error(`Memory ${method} parameters must be an object`);
+  }
+  return params as Record<string, unknown>;
+}
+
+function requiredStringParam(
+  params: Record<string, unknown>,
+  key: string,
+  method: ModelMethod,
+): string {
+  const value = params[key];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Memory ${method} requires a non-empty ${key}`);
+  }
+  return value;
+}
+
+function optionalStringParam(
+  params: Record<string, unknown>,
+  key: string,
+  method: ModelMethod,
+): string | undefined {
+  const value = params[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Memory ${method} requires ${key} to be a non-empty string when provided`);
+  }
+  return value;
+}
+
+function booleanParam(params: Record<string, unknown>, key: string, method: ModelMethod): boolean {
+  const value = params[key];
+  if (value === undefined || value === null) return false;
+  if (typeof value !== "boolean") {
+    throw new Error(`Memory ${method} requires ${key} to be a boolean when provided`);
+  }
+  return value;
+}
+
+function optionalSafeNumber(value: bigint | undefined, label: string): number | null {
+  return value === undefined ? null : safeNumber(value, label);
 }
 
 function safeNumber(value: bigint, label: string): number {

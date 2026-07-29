@@ -13,13 +13,38 @@ import {
   DaemonStatusCode,
   CancelCallRequestSchema,
   GetDaemonInfoRequestSchema,
+  ProjectCallRequestSchema,
 } from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
 import {
+  EmbeddingMetric,
+  EmbeddingModality,
+  ListModelProfilesResponseSchema,
+  ModelPreflightDecision,
+  ModelProfileCapability,
+  ModelProfileRole,
+  ModelProfileSchema,
+  ModelProfileSupportLevel,
+  ModelRequestSchema,
+  ModelResponseSchema,
+  ModelStatusCode,
+  ModelStatusSchema,
+  ModelSwitchAvailability,
+  ModelSwitchExecutionMode,
+  ModelSwitchPreflightSchema,
+  ModelSwitchRebuildPolicy,
+  ModelSwitchState,
+  StartModelSwitchResponseSchema,
+} from "./generated/opencode/memory/model/v1/model_pb.js";
+import {
+  createModelRequest,
+  createProjectRequest,
+  decodeModelResponse,
   decodeResponse,
   DelimitedFrameDecoder,
   encodeDelimited,
   encodeRequest,
 } from "./protocol.js";
+import type { ModelMethod } from "./protocol.js";
 
 describe("Protobuf memory protocol", () => {
   test("encodes a typed request with length-delimited framing", () => {
@@ -92,6 +117,208 @@ describe("Protobuf memory protocol", () => {
     const [payload] = new DelimitedFrameDecoder(1024).push(frame);
     const request = fromBinary(RequestSchema, payload!);
     expect(request.method).toBe(Method.INDEX_DOCUMENTS);
+  });
+
+  test("routes all model controls through typed operations", () => {
+    type ModelOperation = "listProfiles" | "startSwitch" | "getSwitchStatus" | "cancelSwitch";
+    const operations: Array<[ModelMethod, unknown, ModelOperation]> = [
+      ["model_profiles", {}, "listProfiles"],
+      [
+        "model_switch",
+        {
+          switch_id: "switch-1",
+          target_profile_id: "qwen3-text-0.6b-q8",
+          expected_active_profile_id: "qwen3-text-4b-q4",
+          allow_dense_downtime: true,
+          dry_run: true,
+          force_rebuild: true,
+        },
+        "startSwitch",
+      ],
+      ["model_switch_status", { switch_id: "switch-1" }, "getSwitchStatus"],
+      ["model_switch_cancel", { switch_id: "switch-1" }, "cancelSwitch"],
+    ];
+    for (const [method, params, operation] of operations) {
+      const request = createModelRequest(5, method, params);
+      const decoded = fromBinary(ModelRequestSchema, toBinary(ModelRequestSchema, request));
+      expect(decoded.id).toBe(5n);
+      expect(decoded.operation.case).toBe(operation);
+    }
+
+    const start = createModelRequest(6, "model_switch", operations[1]![1]);
+    expect(start.operation.case).toBe("startSwitch");
+    if (start.operation.case !== "startSwitch") throw new Error("expected start switch");
+    expect(start.operation.value).toMatchObject({
+      switchId: "switch-1",
+      targetProfileId: "qwen3-text-0.6b-q8",
+      expectedActiveProfileId: "qwen3-text-4b-q4",
+      availability: ModelSwitchAvailability.ALLOW_DENSE_DOWNTIME,
+      executionMode: ModelSwitchExecutionMode.DRY_RUN,
+      rebuildPolicy: ModelSwitchRebuildPolicy.FORCE_REBUILD,
+    });
+  });
+
+  test("puts exactly one domain request branch on a project call", () => {
+    const domain = createProjectRequest(7, "model_profiles", {});
+    expect(domain.kind).toBe("model");
+    if (domain.kind !== "model") throw new Error("expected model request");
+    const projectCall = create(ProjectCallRequestSchema, {
+      callId: "call-7",
+      modelRequest: domain.modelRequest,
+    });
+    const decoded = fromBinary(
+      ProjectCallRequestSchema,
+      toBinary(ProjectCallRequestSchema, projectCall),
+    );
+    expect(decoded.request).toBeUndefined();
+    expect(decoded.modelRequest?.operation.case).toBe("listProfiles");
+
+    const memory = createProjectRequest(8, "status", {});
+    expect(memory.kind).toBe("memory");
+    if (memory.kind !== "memory") throw new Error("expected memory request");
+    expect(memory.request.method).toBe(Method.STATUS);
+  });
+
+  test("maps typed model profiles to the existing snake_case contract", () => {
+    const profile = create(ModelProfileSchema, {
+      profileId: "qwen3-text-4b-q4",
+      displayName: "Qwen3 4B",
+      description: "Default profile",
+      modalities: [EmbeddingModality.TEXT],
+      repository: "Qwen/Qwen3-Embedding-4B-GGUF",
+      runtimeFamily: "llama.cpp-gguf-text",
+      dimension: 2560,
+      metric: EmbeddingMetric.COSINE,
+      supportLevel: ModelProfileSupportLevel.STABLE,
+      roles: [ModelProfileRole.DEFAULT_FOR_NEW_PROJECTS, ModelProfileRole.RECOMMENDED],
+      capabilities: [
+        ModelProfileCapability.SELECTABLE,
+        ModelProfileCapability.INSTALLED,
+        ModelProfileCapability.PLATFORM_SUPPORTED,
+        ModelProfileCapability.RUNTIME_AVAILABLE,
+        ModelProfileCapability.ARTIFACT_LOCKED,
+      ],
+      estimatedDownloadBytes: 2_496_703_776n,
+      estimatedResidentBytes: 8_000_000_000n,
+    });
+    const response = create(ModelResponseSchema, {
+      id: 9n,
+      status: create(ModelStatusSchema, { code: ModelStatusCode.OK }),
+      result: {
+        case: "listProfiles",
+        value: create(ListModelProfilesResponseSchema, {
+          catalogVersion: 1,
+          catalogDigest: "digest",
+          activeProfileId: profile.profileId,
+          activeGenerationId: "legacy",
+          profiles: [profile],
+        }),
+      },
+    });
+
+    expect(decodeModelResponse(response, "model_profiles")).toEqual({
+      id: 9,
+      ok: true,
+      result: {
+        catalog_version: 1,
+        catalog_digest: "digest",
+        active_profile_id: "qwen3-text-4b-q4",
+        active_generation_id: "legacy",
+        profiles: [
+          {
+            profile_id: "qwen3-text-4b-q4",
+            display_name: "Qwen3 4B",
+            description: "Default profile",
+            modalities: ["text"],
+            repository: "Qwen/Qwen3-Embedding-4B-GGUF",
+            filename: null,
+            revision: null,
+            artifact_sha256: null,
+            runtime_family: "llama.cpp-gguf-text",
+            dimension: 2560,
+            metric: "cosine",
+            support_level: "stable",
+            selectable: true,
+            default_for_new_projects: true,
+            recommended: true,
+            installed: true,
+            platform_supported: true,
+            runtime_available: true,
+            artifact_locked: true,
+            estimated_download_bytes: 2_496_703_776,
+            estimated_resident_bytes: 8_000_000_000,
+            unavailable_reason: null,
+          },
+        ],
+      },
+      error: undefined,
+    });
+  });
+
+  test("maps typed model switch preflight and safely rejects oversized uint64 values", () => {
+    const preflight = create(ModelSwitchPreflightSchema, {
+      decision: ModelPreflightDecision.BLOCKED,
+      availability: ModelSwitchAvailability.ALLOW_DENSE_DOWNTIME,
+      blockers: [{ code: "NOT_READY", message: "migration is disabled" }],
+      warnings: ["dry run only"],
+      estimatedDownloadBytes: 10n,
+      estimatedDiskBytes: 20n,
+      estimatedResidentBytes: 30n,
+      denseSearchAvailable: true,
+    });
+    const response = create(ModelResponseSchema, {
+      id: 10n,
+      status: create(ModelStatusSchema, { code: ModelStatusCode.OK }),
+      result: {
+        case: "startSwitch",
+        value: create(StartModelSwitchResponseSchema, {
+          executionMode: ModelSwitchExecutionMode.DRY_RUN,
+          state: ModelSwitchState.PREFLIGHT,
+          activeProfileId: "qwen3-text-4b-q4",
+          targetProfileId: "qwen3-text-0.6b-q8",
+          activeGenerationId: "legacy",
+          preflight,
+          denseSearchAvailable: true,
+        }),
+      },
+    });
+    expect(decodeModelResponse(response, "model_switch").result).toEqual({
+      switch_id: null,
+      dry_run: true,
+      state: "preflight",
+      active_profile_id: "qwen3-text-4b-q4",
+      target_profile_id: "qwen3-text-0.6b-q8",
+      active_generation_id: "legacy",
+      target_generation_id: null,
+      dense_search_available: true,
+      preflight: {
+        can_start: false,
+        availability: "allow_dense_downtime",
+        dense_search_available: true,
+        estimated_download_bytes: 10,
+        estimated_disk_bytes: 20,
+        estimated_resident_bytes: 30,
+        warnings: ["dry run only"],
+        blockers: [{ code: "NOT_READY", message: "migration is disabled" }],
+      },
+    });
+
+    preflight.estimatedDownloadBytes = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    expect(() => decodeModelResponse(response, "model_switch")).toThrow("safe integer range");
+  });
+
+  test("rejects a typed model result that does not match the requested operation", () => {
+    const response = create(ModelResponseSchema, {
+      id: 11n,
+      status: create(ModelStatusSchema, { code: ModelStatusCode.OK }),
+      result: {
+        case: "listProfiles",
+        value: create(ListModelProfilesResponseSchema),
+      },
+    });
+    expect(() => decodeModelResponse(response, "model_switch")).toThrow(
+      "returned listProfiles result for model_switch",
+    );
   });
 
   test("encodes a versioned daemon envelope with opaque request IDs", () => {

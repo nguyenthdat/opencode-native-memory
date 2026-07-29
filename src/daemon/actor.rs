@@ -10,7 +10,7 @@ use prost::Message;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::MemoryConfig;
-use crate::memory_proto::{Method, Request, Response};
+use crate::rpc::{ProjectRequest, ProjectResponse};
 
 const PROJECT_QUEUE_CAPACITY: usize = 64;
 const PROJECT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
@@ -86,11 +86,11 @@ enum ActorState {
 
 enum ActorCommand {
     Call {
-        request: Request,
+        request: ProjectRequest,
         deadline: Instant,
         command_permit: CommandPermit,
         call_state: Arc<AtomicU8>,
-        reply: oneshot::Sender<Result<Response, String>>,
+        reply: oneshot::Sender<Result<ProjectResponse, String>>,
     },
     Stop,
 }
@@ -159,25 +159,9 @@ impl ProjectActor {
             ))
             .spawn(move || {
                 let _close_guard = ActorCloseGuard(state_sender.clone());
-                let service = {
-                    let _model_load_guard = model_load_lock
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let mut service = crate::rpc::Service::new(config);
-                    service.initialize().map(|()| service)
-                };
-                let mut service = match service {
-                    Ok(service) => {
-                        let _ = state_sender.send(ActorState::Ready);
-                        service
-                    }
-                    Err(error) => {
-                        let message = format!("{error:#}");
-                        actor_for_thread.record_failure(message.clone());
-                        let _ = state_sender.send(ActorState::Failed(message));
-                        return;
-                    }
-                };
+                let mut service =
+                    crate::rpc::Service::new_with_locks(config, model_load_lock, inference_lock);
+                let _ = state_sender.send(ActorState::Ready);
 
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
@@ -188,18 +172,13 @@ impl ProjectActor {
                             call_state,
                             reply,
                         } => {
+                            let is_memory_request =
+                                matches!(&request, ProjectRequest::Memory(_));
                             actor_for_thread
                                 .active_commands
                                 .fetch_add(1, Ordering::AcqRel);
                             drop(command_permit);
                             actor_for_thread.touch();
-                            let method = Method::try_from(request.method).ok();
-                            let _inference_guard =
-                                method.filter(|method| uses_embedding(*method)).map(|_| {
-                                    inference_lock
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                });
                             if call_state.load(Ordering::Acquire) != CALL_QUEUED {
                                 let _ = reply.send(Err(
                                     "project call was cancelled before transaction start"
@@ -212,7 +191,41 @@ impl ProjectActor {
                                 continue;
                             }
                             if Instant::now() >= deadline {
-                                call_state.store(CALL_COMPLETED, Ordering::Release);
+                                call_state.store(CALL_CANCELLED, Ordering::Release);
+                                let _ =
+                                    reply.send(Err("project call deadline exceeded".to_string()));
+                                actor_for_thread.touch();
+                                actor_for_thread
+                                    .active_commands
+                                    .fetch_sub(1, Ordering::AcqRel);
+                                continue;
+                            }
+                            if let Err(error) = service.prepare_project_request(&request) {
+                                let result = if call_state
+                                    .compare_exchange(
+                                        CALL_QUEUED,
+                                        CALL_COMPLETED,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                                {
+                                    Ok(crate::rpc::Service::setup_failure_response(
+                                        &request, &error,
+                                    ))
+                                } else {
+                                    Err("project call was cancelled before transaction start"
+                                        .to_string())
+                                };
+                                let _ = reply.send(result);
+                                actor_for_thread.touch();
+                                actor_for_thread
+                                    .active_commands
+                                    .fetch_sub(1, Ordering::AcqRel);
+                                continue;
+                            }
+                            if Instant::now() >= deadline {
+                                call_state.store(CALL_CANCELLED, Ordering::Release);
                                 let _ =
                                     reply.send(Err("project call deadline exceeded".to_string()));
                                 actor_for_thread.touch();
@@ -240,8 +253,9 @@ impl ProjectActor {
                                     .fetch_sub(1, Ordering::AcqRel);
                                 continue;
                             }
-                            let handled =
-                                catch_unwind(AssertUnwindSafe(|| service.handle(request)));
+                            let handled = catch_unwind(AssertUnwindSafe(|| {
+                                service.handle_project(request)
+                            }));
                             actor_for_thread.touch();
                             actor_for_thread
                                 .active_commands
@@ -249,21 +263,25 @@ impl ProjectActor {
                             call_state.store(CALL_COMPLETED, Ordering::Release);
                             match handled {
                                 Ok(result) => {
-                                    let _ = reply.send(
-                                        result
-                                            .and_then(|(response, shutdown)| {
+                                    let result = result
+                                        .and_then(|(response, shutdown)| {
+                                            if shutdown {
                                                 anyhow::ensure!(
-                                                    !shutdown,
+                                                    is_memory_request,
+                                                    "only memory requests can request shutdown"
+                                                );
+                                                anyhow::bail!(
                                                     "project actor cannot shut down the daemon"
                                                 );
-                                                Ok(response)
-                                            })
-                                            .map_err(|error| format!("{error:#}")),
-                                    );
+                                            }
+                                            Ok(response)
+                                        })
+                                        .map_err(|error| format!("{error:#}"));
+                                    let _ = reply.send(result);
                                 }
                                 Err(_) => {
                                     let message =
-                                        "project actor panicked while executing a memory operation";
+                                        "project actor panicked while executing a project operation";
                                     let _ = reply.send(Err(message.to_string()));
                                     actor_for_thread.record_failure(message.to_string());
                                     let _ =
@@ -378,10 +396,10 @@ impl ProjectActor {
 
     pub(crate) async fn call(
         &self,
-        request: Request,
+        request: ProjectRequest,
         deadline: Instant,
         call_state: Arc<AtomicU8>,
-    ) -> Result<Response> {
+    ) -> Result<ProjectResponse> {
         if let Err(error) = self.wait_ready().await {
             call_state.store(CALL_COMPLETED, Ordering::Release);
             return Err(error);
@@ -391,10 +409,14 @@ impl ProjectActor {
             return Err(anyhow!("project call deadline exceeded"));
         }
         let (reply, response) = oneshot::channel();
+        let encoded_len = match &request {
+            ProjectRequest::Memory(request) => request.encoded_len(),
+            ProjectRequest::Model(request) => request.encoded_len(),
+        };
         let queue_permit = match QueuePermit::reserve(
             Arc::clone(&self.queued_bytes),
             Arc::clone(&self.global_queued_bytes),
-            request.encoded_len(),
+            encoded_len,
             self.global_queue_limit,
         ) {
             Ok(permit) => permit,
@@ -478,18 +500,4 @@ impl ProjectActor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
     }
-}
-
-fn uses_embedding(method: Method) -> bool {
-    matches!(
-        method,
-        Method::Search
-            | Method::Store
-            | Method::Capture
-            | Method::Import
-            | Method::Ingest
-            | Method::IndexDocuments
-            | Method::Update
-            | Method::SyncShared
-    )
 }

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   assertDaemonVersionCompatible,
+  isRetrySafeMemoryMethod,
   NativeMemoryClient,
   NativeMemoryClientPool,
   resolveDaemonEndpoint,
@@ -38,11 +39,18 @@ describe("shared daemon client", () => {
   });
 
   test("rejects a stale daemon version but permits development clients", () => {
-    expect(() => assertDaemonVersionCompatible("0.6.0-beta.2", "0.6.0-beta.0", 64346)).toThrow(
+    expect(() => assertDaemonVersionCompatible("0.6.0", "0.6.0-beta.2", 64346)).toThrow(
       "Close all OpenCode processes using memory and restart OpenCode",
     );
-    expect(() => assertDaemonVersionCompatible("0.6.0-beta.2", "0.6.0-beta.2")).not.toThrow();
+    expect(() => assertDaemonVersionCompatible("0.6.0", "0.6.0")).not.toThrow();
     expect(() => assertDaemonVersionCompatible("development", "0.6.0-beta.0")).not.toThrow();
+  });
+
+  test("preserves model retry classifications", () => {
+    expect(isRetrySafeMemoryMethod("model_profiles")).toBe(true);
+    expect(isRetrySafeMemoryMethod("model_switch_status")).toBe(true);
+    expect(isRetrySafeMemoryMethod("model_switch")).toBe(false);
+    expect(isRetrySafeMemoryMethod("model_switch_cancel")).toBe(false);
   });
 
   test("releases the shared project client only after the final local lease", async () => {

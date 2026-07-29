@@ -26,11 +26,14 @@ use crate::daemon_proto::{
     ProjectCallResponse, ReleaseProjectResponse, RequestDrainResponse, SessionHeartbeatResponse,
 };
 use crate::memory_proto::Method;
-use crate::rpc::{MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES};
+use crate::rpc::{
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, ProjectRequest, ProjectResponse,
+    validate_project_request,
+};
 use crate::{EmbeddingConfig, MemoryConfig};
 
 pub const DAEMON_PROTOCOL_GENERATION: u32 = 1;
-pub const DOMAIN_SCHEMA_GENERATION: u32 = 1;
+pub const DOMAIN_SCHEMA_GENERATION: u32 = 2;
 const MAX_SESSIONS: usize = 64;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_OUTSTANDING_CALLS_PER_CONNECTION: usize = 32;
@@ -764,7 +767,7 @@ async fn acquire_project(
 
 struct AdmittedProjectCall {
     actor: Arc<ProjectActor>,
-    domain_request: crate::memory_proto::Request,
+    domain_request: ProjectRequest,
     deadline: Instant,
     call_id: String,
     call_state: Arc<AtomicU8>,
@@ -794,13 +797,28 @@ fn admit_project_call(
             "project timeout_ms is outside the supported range",
         ));
     }
-    let domain_request = request.request.ok_or_else(|| {
-        DaemonFailure::new(
-            DaemonStatusCode::InvalidArgument,
-            "memory request is required",
-        )
+    let domain_request = match (request.request, request.model_request) {
+        (Some(request), None) => ProjectRequest::Memory(request),
+        (None, Some(request)) => ProjectRequest::Model(request),
+        (Some(_), Some(_)) => {
+            return Err(DaemonFailure::new(
+                DaemonStatusCode::InvalidArgument,
+                "project call must contain exactly one memory or model request",
+            ));
+        }
+        (None, None) => {
+            return Err(DaemonFailure::new(
+                DaemonStatusCode::InvalidArgument,
+                "project call must contain exactly one memory or model request",
+            ));
+        }
+    };
+    validate_project_request(&domain_request).map_err(|error| {
+        DaemonFailure::new(DaemonStatusCode::InvalidArgument, format!("{error:#}"))
     })?;
-    if Method::try_from(domain_request.method).ok() == Some(Method::Shutdown) {
+    if let ProjectRequest::Memory(request) = &domain_request
+        && Method::try_from(request.method).ok() == Some(Method::Shutdown)
+    {
         return Err(DaemonFailure::new(
             DaemonStatusCode::FailedPrecondition,
             "shared daemon project calls cannot request global shutdown",
@@ -869,6 +887,10 @@ async fn execute_project_call(
     state: &DaemonState,
     admitted: AdmittedProjectCall,
 ) -> DaemonResult<ProjectCallResponse> {
+    let (request_id, expects_memory_response) = match &admitted.domain_request {
+        ProjectRequest::Memory(request) => (request.id, true),
+        ProjectRequest::Model(request) => (request.id, false),
+    };
     let response = admitted
         .actor
         .call(
@@ -889,10 +911,38 @@ async fn execute_project_call(
         };
         DaemonFailure::new(code, message)
     })?;
-    Ok(ProjectCallResponse {
-        call_id: admitted.call_id,
-        response: Some(response),
-    })
+    match response {
+        ProjectResponse::Memory(response) if expects_memory_response => {
+            if response.id != request_id {
+                return Err(DaemonFailure::new(
+                    DaemonStatusCode::Internal,
+                    "memory response id does not match the admitted request",
+                ));
+            }
+            Ok(ProjectCallResponse {
+                call_id: admitted.call_id,
+                response: Some(response),
+                model_response: None,
+            })
+        }
+        ProjectResponse::Model(response) if !expects_memory_response => {
+            if response.id != request_id {
+                return Err(DaemonFailure::new(
+                    DaemonStatusCode::Internal,
+                    "model response id does not match the admitted request",
+                ));
+            }
+            Ok(ProjectCallResponse {
+                call_id: admitted.call_id,
+                response: None,
+                model_response: Some(response),
+            })
+        }
+        _ => Err(DaemonFailure::new(
+            DaemonStatusCode::Internal,
+            "project actor returned a response for the wrong request domain",
+        )),
+    }
 }
 
 async fn project_call(
@@ -1133,6 +1183,8 @@ fn capabilities() -> Vec<String> {
         "unary-deadlines".to_string(),
         "call-cancellation".to_string(),
         "no-mutation-replay".to_string(),
+        "model-profile-catalog-v1".to_string(),
+        "model-switch-preflight-v1".to_string(),
     ]
 }
 
@@ -1282,6 +1334,7 @@ fn configured_duration(name: &str, default_seconds: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_proto::{ListModelProfilesRequest, ModelRequest, model_request};
 
     fn hello() -> OpenSessionRequest {
         OpenSessionRequest {
@@ -1290,6 +1343,23 @@ mod tests {
             maximum_protocol_generation: DAEMON_PROTOCOL_GENERATION,
             domain_schema_generation: DOMAIN_SCHEMA_GENERATION,
             plugin_version: "test".to_string(),
+        }
+    }
+
+    fn project_call_request(
+        state: &DaemonState,
+        request: Option<crate::memory_proto::Request>,
+        model_request: Option<ModelRequest>,
+    ) -> ProjectCallRequest {
+        ProjectCallRequest {
+            daemon_instance_id: state.instance_id.clone(),
+            session_id: "session-a".to_string(),
+            project_handle: "project-a".to_string(),
+            lease_id: "lease-a".to_string(),
+            call_id: "call-a".to_string(),
+            timeout_ms: 1_000,
+            request,
+            model_request,
         }
     }
 
@@ -1346,6 +1416,83 @@ mod tests {
         .expect("cancel call");
         assert_eq!(response.outcome, CancelOutcome::CancelledBeforeStart as i32);
         assert_eq!(call_state.load(Ordering::Acquire), CALL_CANCELLED);
+    }
+
+    #[test]
+    fn project_call_requires_exactly_one_domain_request() {
+        let state = DaemonState::new();
+        let memory_request = crate::memory_proto::Request {
+            id: 1,
+            method: Method::Status as i32,
+            params: None,
+        };
+        let model_request = ModelRequest {
+            id: 2,
+            operation: Some(model_request::Operation::ListProfiles(
+                ListModelProfilesRequest {},
+            )),
+        };
+
+        let neither = match admit_project_call(
+            &state,
+            "connection-a",
+            project_call_request(&state, None, None),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted missing domain request"),
+        };
+        assert_eq!(neither.code, DaemonStatusCode::InvalidArgument);
+
+        let both = match admit_project_call(
+            &state,
+            "connection-a",
+            project_call_request(&state, Some(memory_request), Some(model_request)),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted ambiguous domain request"),
+        };
+        assert_eq!(both.code, DaemonStatusCode::InvalidArgument);
+    }
+
+    #[test]
+    fn shutdown_detection_only_applies_to_memory_requests() {
+        let state = DaemonState::new();
+        let shutdown = match admit_project_call(
+            &state,
+            "connection-a",
+            project_call_request(
+                &state,
+                Some(crate::memory_proto::Request {
+                    id: 1,
+                    method: Method::Shutdown as i32,
+                    params: None,
+                }),
+                None,
+            ),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted shared-daemon shutdown"),
+        };
+        assert_eq!(shutdown.code, DaemonStatusCode::FailedPrecondition);
+
+        let model = match admit_project_call(
+            &state,
+            "connection-a",
+            project_call_request(
+                &state,
+                None,
+                Some(ModelRequest {
+                    id: 2,
+                    operation: Some(model_request::Operation::ListProfiles(
+                        ListModelProfilesRequest {},
+                    )),
+                }),
+            ),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted model request without a session"),
+        };
+        assert_eq!(model.code, DaemonStatusCode::NotFound);
     }
 
     #[test]

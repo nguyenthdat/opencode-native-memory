@@ -3,6 +3,7 @@ syntax = "proto3";
 package opencode.memory.daemon.v1;
 
 import "opencode/memory/v1/memory.proto";
+import "opencode/memory/model/v1/model.proto";
 
 enum DaemonStatusCode {
   DAEMON_STATUS_CODE_UNSPECIFIED = 0;
@@ -151,11 +152,13 @@ message ProjectCallRequest {
   string call_id = 5;
   uint32 timeout_ms = 6;
   opencode.memory.v1.Request request = 7;
+  opencode.memory.model.v1.ModelRequest model_request = 8;
 }
 
 message ProjectCallResponse {
   string call_id = 1;
   opencode.memory.v1.Response response = 2;
+  opencode.memory.model.v1.ModelResponse model_response = 3;
 }
 
 message ReleaseProjectRequest {

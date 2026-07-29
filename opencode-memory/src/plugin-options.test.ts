@@ -7,6 +7,8 @@ const ENVIRONMENT_KEYS = [
   "OPENCODE_MEMORY_AUTO_CAPTURE",
   "OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS",
   "OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS",
+  "OPENCODE_MEMORY_AUTO_OPTIMIZE",
+  "OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS",
   "OPENCODE_MEMORY_SHARED_SYNC",
   "OPENCODE_MEMORY_FEEDBACK_TRACKING",
   "OPENCODE_MEMORY_MIN_SCORE",
@@ -30,6 +32,8 @@ describe("memory plugin options", () => {
       automaticCapture: true,
       automaticDocumentIndex: true,
       documentIndexDebounceMs: 750,
+      automaticOptimize: true,
+      optimizeDebounceMs: 5_000,
       sharedSync: true,
       feedbackTracking: true,
       minScore: 0.42,
@@ -41,6 +45,8 @@ describe("memory plugin options", () => {
     process.env.OPENCODE_MEMORY_AUTO_CAPTURE = "0";
     process.env.OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS = "off";
     process.env.OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS = "1500";
+    process.env.OPENCODE_MEMORY_AUTO_OPTIMIZE = "off";
+    process.env.OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS = "2500";
     process.env.OPENCODE_MEMORY_MIN_SCORE = "0.55";
     const resolved = resolveMemoryPluginOptions({
       root: "/tmp/plugin",
@@ -50,6 +56,8 @@ describe("memory plugin options", () => {
     expect(resolved.automaticCapture).toBe(false);
     expect(resolved.automaticDocumentIndex).toBe(false);
     expect(resolved.documentIndexDebounceMs).toBe(1500);
+    expect(resolved.automaticOptimize).toBe(false);
+    expect(resolved.optimizeDebounceMs).toBe(2500);
     expect(resolved.minScore).toBe(0.55);
   });
 
@@ -70,6 +78,13 @@ describe("memory plugin options", () => {
     process.env.OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS = "10";
     expect(() => resolveMemoryPluginOptions({ root: "/tmp/plugin" })).toThrow(
       "memory documentIndexDebounceMs must be between 50 and 60000",
+    );
+  });
+
+  test("rejects unsafe optimize debounce values", () => {
+    process.env.OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS = "10";
+    expect(() => resolveMemoryPluginOptions({ root: "/tmp/plugin" })).toThrow(
+      "memory optimizeDebounceMs must be between 50 and 60000",
     );
   });
 });

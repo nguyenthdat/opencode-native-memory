@@ -1,0 +1,222 @@
+syntax = "proto3";
+
+package opencode.memory.model.v1;
+
+enum ModelStatusCode {
+  MODEL_STATUS_CODE_UNSPECIFIED = 0;
+  MODEL_STATUS_CODE_OK = 1;
+  MODEL_STATUS_CODE_INVALID_ARGUMENT = 2;
+  MODEL_STATUS_CODE_FAILED_PRECONDITION = 3;
+  MODEL_STATUS_CODE_NOT_FOUND = 4;
+  MODEL_STATUS_CODE_RESOURCE_EXHAUSTED = 5;
+  MODEL_STATUS_CODE_UNAVAILABLE = 6;
+  MODEL_STATUS_CODE_INTERNAL = 7;
+}
+
+enum EmbeddingModality {
+  EMBEDDING_MODALITY_UNSPECIFIED = 0;
+  EMBEDDING_MODALITY_TEXT = 1;
+  EMBEDDING_MODALITY_IMAGE = 2;
+  EMBEDDING_MODALITY_MIXED = 3;
+}
+
+enum EmbeddingMetric {
+  EMBEDDING_METRIC_UNSPECIFIED = 0;
+  EMBEDDING_METRIC_COSINE = 1;
+  EMBEDDING_METRIC_DOT_PRODUCT = 2;
+}
+
+enum ModelProfileSupportLevel {
+  MODEL_PROFILE_SUPPORT_LEVEL_UNSPECIFIED = 0;
+  MODEL_PROFILE_SUPPORT_LEVEL_STABLE = 1;
+  MODEL_PROFILE_SUPPORT_LEVEL_PREVIEW = 2;
+  MODEL_PROFILE_SUPPORT_LEVEL_UNSUPPORTED = 3;
+}
+
+enum ModelProfileRole {
+  MODEL_PROFILE_ROLE_UNSPECIFIED = 0;
+  MODEL_PROFILE_ROLE_DEFAULT_FOR_NEW_PROJECTS = 1;
+  MODEL_PROFILE_ROLE_RECOMMENDED = 2;
+}
+
+enum ModelProfileCapability {
+  MODEL_PROFILE_CAPABILITY_UNSPECIFIED = 0;
+  MODEL_PROFILE_CAPABILITY_SELECTABLE = 1;
+  MODEL_PROFILE_CAPABILITY_INSTALLED = 2;
+  MODEL_PROFILE_CAPABILITY_PLATFORM_SUPPORTED = 3;
+  MODEL_PROFILE_CAPABILITY_RUNTIME_AVAILABLE = 4;
+  MODEL_PROFILE_CAPABILITY_ARTIFACT_LOCKED = 5;
+}
+
+enum ModelSwitchAvailability {
+  MODEL_SWITCH_AVAILABILITY_UNSPECIFIED = 0;
+  MODEL_SWITCH_AVAILABILITY_KEEP_OLD_DENSE = 1;
+  MODEL_SWITCH_AVAILABILITY_ALLOW_DENSE_DOWNTIME = 2;
+}
+
+enum ModelSwitchExecutionMode {
+  MODEL_SWITCH_EXECUTION_MODE_UNSPECIFIED = 0;
+  MODEL_SWITCH_EXECUTION_MODE_APPLY = 1;
+  MODEL_SWITCH_EXECUTION_MODE_DRY_RUN = 2;
+}
+
+enum ModelSwitchRebuildPolicy {
+  MODEL_SWITCH_REBUILD_POLICY_UNSPECIFIED = 0;
+  MODEL_SWITCH_REBUILD_POLICY_REJECT_ACTIVE_PROFILE = 1;
+  MODEL_SWITCH_REBUILD_POLICY_FORCE_REBUILD = 2;
+}
+
+enum ModelPreflightDecision {
+  MODEL_PREFLIGHT_DECISION_UNSPECIFIED = 0;
+  MODEL_PREFLIGHT_DECISION_READY = 1;
+  MODEL_PREFLIGHT_DECISION_BLOCKED = 2;
+}
+
+enum ModelSwitchState {
+  MODEL_SWITCH_STATE_UNSPECIFIED = 0;
+  MODEL_SWITCH_STATE_PREFLIGHT = 1;
+  MODEL_SWITCH_STATE_QUEUED = 2;
+  MODEL_SWITCH_STATE_VALIDATING = 3;
+  MODEL_SWITCH_STATE_DOWNLOADING = 4;
+  MODEL_SWITCH_STATE_PREPARING = 5;
+  MODEL_SWITCH_STATE_REINDEXING = 6;
+  MODEL_SWITCH_STATE_VERIFYING = 7;
+  MODEL_SWITCH_STATE_COMMITTING = 8;
+  MODEL_SWITCH_STATE_SUCCEEDED = 9;
+  MODEL_SWITCH_STATE_CANCEL_REQUESTED = 10;
+  MODEL_SWITCH_STATE_CANCELLED = 11;
+  MODEL_SWITCH_STATE_FAILED = 12;
+}
+
+enum ModelCancelOutcome {
+  MODEL_CANCEL_OUTCOME_UNSPECIFIED = 0;
+  MODEL_CANCEL_OUTCOME_CANCEL_REQUESTED = 1;
+  MODEL_CANCEL_OUTCOME_CANCELLED_BEFORE_COMMIT = 2;
+  MODEL_CANCEL_OUTCOME_ALREADY_COMMITTING = 3;
+  MODEL_CANCEL_OUTCOME_ALREADY_COMMITTED = 4;
+  MODEL_CANCEL_OUTCOME_ALREADY_TERMINAL = 5;
+  MODEL_CANCEL_OUTCOME_NOT_FOUND = 6;
+}
+
+message ModelStatus {
+  ModelStatusCode code = 1;
+  string message = 2;
+}
+
+message ModelProfileReason {
+  string code = 1;
+  string message = 2;
+}
+
+message ModelProfile {
+  string profile_id = 1; // required
+  string display_name = 2; // required
+  string description = 3;
+  repeated EmbeddingModality modalities = 4;
+  optional string repository = 5;
+  optional string filename = 6;
+  optional string revision = 7;
+  optional string artifact_sha256 = 8;
+  string runtime_family = 9; // required
+  optional uint32 dimension = 10;
+  EmbeddingMetric metric = 11;
+  ModelProfileSupportLevel support_level = 12;
+  repeated ModelProfileRole roles = 13;
+  repeated ModelProfileCapability capabilities = 14;
+  optional uint64 estimated_download_bytes = 15;
+  optional uint64 estimated_resident_bytes = 16;
+  optional ModelProfileReason unavailable_reason = 17;
+}
+
+message ListModelProfilesRequest {}
+
+message ListModelProfilesResponse {
+  uint32 catalog_version = 1;
+  string catalog_digest = 2;
+  string active_profile_id = 3;
+  string active_generation_id = 4;
+  repeated ModelProfile profiles = 5;
+}
+
+message StartModelSwitchRequest {
+  optional string switch_id = 1;
+  string target_profile_id = 2; // required
+  optional string expected_active_profile_id = 3;
+  ModelSwitchAvailability availability = 4;
+  ModelSwitchExecutionMode execution_mode = 5;
+  ModelSwitchRebuildPolicy rebuild_policy = 6;
+}
+
+message ModelSwitchBlocker {
+  string code = 1;
+  string message = 2;
+}
+
+message ModelSwitchPreflight {
+  ModelPreflightDecision decision = 1;
+  ModelSwitchAvailability availability = 2;
+  repeated ModelSwitchBlocker blockers = 3;
+  repeated string warnings = 4;
+  optional uint64 estimated_download_bytes = 5;
+  optional uint64 estimated_disk_bytes = 6;
+  optional uint64 estimated_resident_bytes = 7;
+  bool dense_search_available = 8;
+}
+
+message StartModelSwitchResponse {
+  optional string switch_id = 1;
+  ModelSwitchExecutionMode execution_mode = 2;
+  ModelSwitchState state = 3;
+  string active_profile_id = 4;
+  string target_profile_id = 5;
+  string active_generation_id = 6;
+  optional string target_generation_id = 7;
+  ModelSwitchPreflight preflight = 8;
+  bool dense_search_available = 9;
+}
+
+message GetModelSwitchStatusRequest {
+  string switch_id = 1; // required
+}
+
+message GetModelSwitchStatusResponse {
+  string switch_id = 1;
+  ModelSwitchState state = 2;
+  string active_profile_id = 3;
+  string target_profile_id = 4;
+  string active_generation_id = 5;
+  optional string target_generation_id = 6;
+  uint64 completed_records = 7;
+  uint64 total_records = 8;
+  optional ModelProfileReason error = 9;
+}
+
+message CancelModelSwitchRequest {
+  string switch_id = 1; // required
+}
+
+message CancelModelSwitchResponse {
+  string switch_id = 1;
+  ModelCancelOutcome outcome = 2;
+}
+
+message ModelRequest {
+  uint64 id = 1;
+  oneof operation {
+    ListModelProfilesRequest list_profiles = 10;
+    StartModelSwitchRequest start_switch = 11;
+    GetModelSwitchStatusRequest get_switch_status = 12;
+    CancelModelSwitchRequest cancel_switch = 13;
+  }
+}
+
+message ModelResponse {
+  uint64 id = 1;
+  ModelStatus status = 2;
+  oneof result {
+    ListModelProfilesResponse list_profiles = 10;
+    StartModelSwitchResponse start_switch = 11;
+    GetModelSwitchStatusResponse get_switch_status = 12;
+    CancelModelSwitchResponse cancel_switch = 13;
+  }
+}

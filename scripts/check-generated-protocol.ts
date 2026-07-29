@@ -6,6 +6,7 @@ const root = resolve(import.meta.dir, "..");
 const output = await mkdtemp(join(tmpdir(), "opencode-memory-proto-"));
 const generatedFiles = [
   "opencode/memory/v1/memory_pb.ts",
+  "opencode/memory/model/v1/model_pb.ts",
   "opencode/memory/daemon/v1/daemon_pb.ts",
 ] as const;
 
@@ -19,6 +20,7 @@ try {
       "-I",
       join(root, "schema"),
       join(root, "schema/opencode/memory/v1/memory.proto"),
+      join(root, "schema/opencode/memory/model/v1/model.proto"),
       join(root, "schema/opencode/memory/daemon/v1/daemon.proto"),
     ],
     { cwd: root, stdout: "inherit", stderr: "inherit" },

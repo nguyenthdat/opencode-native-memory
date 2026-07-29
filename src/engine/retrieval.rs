@@ -11,7 +11,6 @@ use crate::contract::{
     MemoryKind, MemoryRecord, MemoryScope, RetrievalMode, ScoreBreakdown, SearchRequest,
     SearchResponse,
 };
-use crate::embedding::Embedder;
 use crate::lifecycle::{is_expired, retention_factor};
 use crate::storage::state::{MemoryMetadata, RetrievalRecord};
 use crate::storage::zvec::RESULT_FIELDS;
@@ -61,7 +60,7 @@ impl MemoryEngine {
                 Vec::new(),
             ),
             RetrievalMode::Dense => {
-                let query_embedding = self.embedder.embed_query(&query_text)?;
+                let query_embedding = self.embed_query(&query_text)?;
                 (
                     self.dense_query(&query_embedding, candidate_count, filter.as_deref())?,
                     Vec::new(),
@@ -69,7 +68,7 @@ impl MemoryEngine {
                 )
             }
             RetrievalMode::Hybrid => {
-                let query_embedding = self.embedder.embed_query(&query_text)?;
+                let query_embedding = self.embed_query(&query_text)?;
                 let dense =
                     self.dense_query(&query_embedding, candidate_count, filter.as_deref())?;
                 let (lexical, warnings) =

@@ -207,6 +207,110 @@ export type MemoryStatusResponse = Record<string, unknown> &
     | { plugin_health: MemoryPluginHealth }
   );
 
+export const MODEL_PROFILE_SUPPORT_LEVELS = ["stable", "preview", "unsupported"] as const;
+export type ModelProfileSupportLevel = (typeof MODEL_PROFILE_SUPPORT_LEVELS)[number];
+
+export interface ModelProfileReason {
+  code: string;
+  message: string;
+}
+
+export interface MemoryModelProfile {
+  profile_id: string;
+  display_name: string;
+  description: string;
+  modalities: string[];
+  repository: string | null;
+  filename: string | null;
+  revision: string | null;
+  artifact_sha256: string | null;
+  runtime_family: string;
+  dimension: number | null;
+  metric: "cosine" | "dot_product" | null;
+  support_level: ModelProfileSupportLevel;
+  selectable: boolean;
+  default_for_new_projects: boolean;
+  recommended: boolean;
+  installed: boolean;
+  platform_supported: boolean;
+  runtime_available: boolean;
+  artifact_locked: boolean;
+  estimated_download_bytes: number | null;
+  estimated_resident_bytes: number | null;
+  unavailable_reason: ModelProfileReason | null;
+}
+
+export interface MemoryModelProfilesResponse {
+  catalog_version: number;
+  catalog_digest: string;
+  active_profile_id: string;
+  active_generation_id: string;
+  profiles: MemoryModelProfile[];
+}
+
+export interface ModelSwitchBlocker {
+  code: string;
+  message: string;
+}
+
+export interface ModelSwitchPreflight {
+  can_start: boolean;
+  availability: "keep_old_dense" | "allow_dense_downtime";
+  dense_search_available: boolean;
+  estimated_download_bytes: number | null;
+  estimated_disk_bytes: number | null;
+  estimated_resident_bytes: number | null;
+  warnings: string[];
+  blockers: ModelSwitchBlocker[];
+}
+
+export interface ModelSwitchResponse {
+  switch_id: string | null;
+  dry_run: boolean;
+  state:
+    | "preflight"
+    | "queued"
+    | "validating"
+    | "downloading"
+    | "preparing"
+    | "reindexing"
+    | "verifying"
+    | "committing"
+    | "succeeded"
+    | "cancel_requested"
+    | "cancelled"
+    | "failed";
+  active_profile_id: string;
+  target_profile_id: string;
+  active_generation_id: string;
+  target_generation_id: string | null;
+  dense_search_available: boolean;
+  preflight: ModelSwitchPreflight;
+}
+
+export interface ModelSwitchStatusResponse {
+  switch_id: string;
+  state: ModelSwitchResponse["state"];
+  active_profile_id: string;
+  target_profile_id: string;
+  active_generation_id: string;
+  target_generation_id: string | null;
+  completed_records: number;
+  total_records: number;
+  error: ModelProfileReason | null;
+}
+
+export interface ModelSwitchCancelResponse {
+  switch_id: string;
+  outcome:
+    | "cancel_requested"
+    | "cancelled_before_commit"
+    | "already_committing"
+    | "already_committed"
+    | "already_terminal"
+    | "not_found";
+}
+
 export interface SharedMemoryRecord extends CuratedCandidate {
   source: string;
 }
