@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   assertDaemonVersionCompatible,
+  assertDaemonSchemaCompatible,
   isRetrySafeMemoryMethod,
   NativeMemoryClient,
   NativeMemoryClientPool,
@@ -44,6 +45,25 @@ describe("shared daemon client", () => {
     );
     expect(() => assertDaemonVersionCompatible("0.6.0", "0.6.0")).not.toThrow();
     expect(() => assertDaemonVersionCompatible("development", "0.6.0-beta.0")).not.toThrow();
+  });
+
+  test("reports both domain schema generations for a stale daemon", () => {
+    expect(() =>
+      assertDaemonSchemaCompatible(
+        "0.6.0",
+        { daemonVersion: "0.6.0", domainSchemaGeneration: 2, pid: 64346 },
+        "/tmp/opencode-memory/daemon.sock",
+      ),
+    ).toThrow(
+      "Native memory daemon domain schema mismatch at /tmp/opencode-memory/daemon.sock: client 4, daemon 2 (plugin 0.6.0, daemon 0.6.0, pid 64346)",
+    );
+    expect(() =>
+      assertDaemonSchemaCompatible(
+        "0.6.0",
+        { daemonVersion: "0.6.0", domainSchemaGeneration: 4, pid: 64346 },
+        "/tmp/opencode-memory/daemon.sock",
+      ),
+    ).not.toThrow();
   });
 
   test("preserves model retry classifications", () => {

@@ -372,6 +372,7 @@ class DaemonProjectClient implements NativeMemoryRequester {
       if (response.body.case !== "getDaemonInfo") {
         throw new Error("Native memory daemon omitted GetDaemonInfo");
       }
+      assertDaemonSchemaCompatible(this.pluginVersion, response.body.value, this.endpoint);
       const hello = create(OpenSessionRequestSchema, {
         clientInstanceId: randomUUID(),
         minimumProtocolGeneration: DAEMON_PROTOCOL_GENERATION,
@@ -473,10 +474,11 @@ class DaemonProjectClient implements NativeMemoryRequester {
       throw new Error(
         `Native memory daemon protocol mismatch at ${this.endpoint}: ` +
           `client supports ${DAEMON_PROTOCOL_GENERATION}, daemon ${daemon.daemonVersion} supports ` +
-          `${daemon.minimumProtocolGeneration}-${daemon.maximumProtocolGeneration}. ` +
-          "Close active OpenCode processes and restart the native memory daemon.",
+          `${daemon.minimumProtocolGeneration}-${daemon.maximumProtocolGeneration} (pid ${daemon.pid}). ` +
+          "Close all OpenCode processes using memory and restart the native memory daemon.",
       );
     }
+    assertDaemonSchemaCompatible(this.pluginVersion, daemon, this.endpoint);
     assertDaemonVersionCompatible(this.pluginVersion, daemon.daemonVersion, daemon.pid);
     const hello = create(OpenSessionRequestSchema, {
       clientInstanceId: randomUUID(),
@@ -906,6 +908,20 @@ export function assertDaemonVersionCompatible(
   throw new Error(
     `Native memory daemon version mismatch${pid}: plugin ${pluginVersion}, daemon ${daemonVersion}. ` +
       "Close all OpenCode processes using memory and restart OpenCode to replace the daemon.",
+  );
+}
+
+export function assertDaemonSchemaCompatible(
+  pluginVersion: string,
+  daemon: Pick<GetDaemonInfoResponse, "daemonVersion" | "domainSchemaGeneration" | "pid">,
+  endpoint: string,
+): void {
+  if (daemon.domainSchemaGeneration === DOMAIN_SCHEMA_GENERATION) return;
+  throw new Error(
+    `Native memory daemon domain schema mismatch at ${endpoint}: ` +
+      `client ${DOMAIN_SCHEMA_GENERATION}, daemon ${daemon.domainSchemaGeneration} ` +
+      `(plugin ${pluginVersion}, daemon ${daemon.daemonVersion}, pid ${daemon.pid}). ` +
+      "Close all OpenCode processes using memory and restart the native memory daemon.",
   );
 }
 
