@@ -104,12 +104,12 @@ guide search, lifecycle operations, diagnostics, promotion, and model-profile
 preflight.
 
 The TUI companion registers `/memory-health`, refreshes the native status, and
-shows one of these states in the bottom bar:
+shows a `Memory` section with one of these states in the sidebar:
 
-- `Memory: checking`
-- `Memory: healthy`
-- `Memory: degraded`
-- `Memory: unavailable`
+- `• Checking`
+- `• Healthy`
+- `• Degraded`
+- `• Unavailable`
 
 ## Tools
 

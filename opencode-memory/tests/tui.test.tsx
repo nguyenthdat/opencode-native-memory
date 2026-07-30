@@ -14,6 +14,8 @@ interface TestCommand {
   run?: () => void;
 }
 
+type SidebarContentRenderer = (context: unknown, props: { session_id: string }) => unknown;
+
 const nativeStatus: NativeMemoryStatus = {
   ready: true,
   rpc_protocol_version: 2,
@@ -52,7 +54,7 @@ const usesSharedSolidRuntime = pluginCreateSignal === rendererCreateSignal;
 describe("memory TUI plugin", () => {
   test("registers a persistent health slot and refresh command", async () => {
     const layers: Array<{ commands?: TestCommand[] }> = [];
-    const slots: Array<{ slots?: { app_bottom?: () => unknown } }> = [];
+    const slots: Array<{ slots?: { sidebar_content?: SidebarContentRenderer } }> = [];
     const disposers: Array<() => void | Promise<void>> = [];
     const toasts: Array<{
       variant?: string;
@@ -81,7 +83,7 @@ describe("memory TUI plugin", () => {
     const api = {
       state: { path: { worktree: "/project", directory: "/project" } },
       slots: {
-        register(slot: { slots?: { app_bottom?: () => unknown } }) {
+        register(slot: { slots?: { sidebar_content?: SidebarContentRenderer } }) {
           slots.push(slot);
           return "memory-health";
         },
@@ -110,7 +112,9 @@ describe("memory TUI plugin", () => {
     await Promise.resolve();
 
     expect(memoryTui.id).toBe("@nguyenthdat/opencode-memory");
-    expect(slots[0]?.slots?.app_bottom).toBeFunction();
+    expect(slots[0]?.slots?.sidebar_content).toBeFunction();
+    expect(slots[0]?.slots).not.toHaveProperty("app_bottom");
+    expect(slots[0]?.slots).not.toHaveProperty("sidebar_footer");
     expect(layers[0]?.commands).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -139,7 +143,7 @@ describe("memory TUI plugin", () => {
   test.skipIf(!usesSharedSolidRuntime)(
     "updates the mounted health badge after the initial check",
     async () => {
-      const slots: Array<{ slots?: { app_bottom?: () => unknown } }> = [];
+      const slots: Array<{ slots?: { sidebar_content?: SidebarContentRenderer } }> = [];
       const disposers: Array<() => void | Promise<void>> = [];
       const controller = new AbortController();
       let resolveStatus: (status: NativeMemoryStatus) => void = () => undefined;
@@ -161,7 +165,7 @@ describe("memory TUI plugin", () => {
       const api = {
         state: { path: { worktree: "/project", directory: "/project" } },
         slots: {
-          register(slot: { slots?: { app_bottom?: () => unknown } }) {
+          register(slot: { slots?: { sidebar_content?: SidebarContentRenderer } }) {
             slots.push(slot);
             return "memory-health";
           },
@@ -184,23 +188,30 @@ describe("memory TUI plugin", () => {
             success: "#00ff00",
             warning: "#ffff00",
             error: "#ff0000",
+            text: "#ffffff",
             textMuted: "#888888",
           },
         },
       };
 
       await tui(api as never, undefined, {} as never);
-      const appBottom = slots[0]?.slots?.app_bottom;
-      expect(appBottom).toBeFunction();
-      const rendered = await testRender(() => appBottom?.() as never, { width: 40, height: 2 });
+      const sidebarContent = slots[0]?.slots?.sidebar_content;
+      expect(sidebarContent).toBeFunction();
+      const rendered = await testRender(
+        () => sidebarContent?.({}, { session_id: "session-1" }) as never,
+        { width: 40, height: 2 },
+      );
 
       try {
         await rendered.flush();
-        expect(rendered.captureCharFrame()).toContain("Memory: checking");
+        const checkingFrame = rendered.captureCharFrame();
+        const checkingLines = checkingFrame.split("\n");
+        expect(checkingLines[0]?.startsWith("Memory")).toBe(true);
+        expect(checkingLines[1]?.startsWith("• Checking")).toBe(true);
 
         resolveStatus(nativeStatus);
-        const frame = await rendered.waitForFrame((next) => next.includes("Memory: healthy"));
-        expect(frame).not.toContain("Memory: checking");
+        const frame = await rendered.waitForFrame((next) => next.includes("• Healthy"));
+        expect(frame).not.toContain("• Checking");
       } finally {
         controller.abort();
         await Promise.all(disposers.map((dispose) => dispose()));
@@ -211,13 +222,16 @@ describe("memory TUI plugin", () => {
 
   test("formats each badge state", () => {
     expect(memoryHealthText({ status: "checking", ready: false, message: "checking" })).toBe(
-      "Memory: checking",
+      "Memory • Checking",
     );
     expect(memoryHealthText({ status: "healthy", ready: true, message: "ready" })).toBe(
-      "Memory: healthy",
+      "Memory • Healthy",
+    );
+    expect(memoryHealthText({ status: "degraded", ready: true, message: "degraded" })).toBe(
+      "Memory • Degraded",
     );
     expect(memoryHealthText({ status: "unavailable", ready: false, message: "down" })).toBe(
-      "Memory: unavailable",
+      "Memory • Unavailable",
     );
   });
 

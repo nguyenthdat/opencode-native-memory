@@ -14,6 +14,8 @@ import { buildMemoryStatusResponse } from "./plugin-health.js";
 const PLUGIN_ID = "@nguyenthdat/opencode-memory";
 const DEFAULT_REFRESH_INTERVAL_MS = 30_000;
 const DEFAULT_HEALTH_CHECK_TIMEOUT_MS = 15_000;
+const MEMORY_LABEL = "Memory";
+const MEMORY_STATUS_DOT = "•";
 
 export interface MemoryTuiHealth {
   status: MemoryPluginHealthStatus | "checking";
@@ -85,9 +87,9 @@ export function createMemoryTui(root: string, dependencies: MemoryTuiDependencie
     };
 
     api.slots.register({
-      order: 120,
+      order: 350,
       slots: {
-        app_bottom() {
+        sidebar_content() {
           return <MemoryHealthBadge api={api} health={health} />;
         },
       },
@@ -130,7 +132,7 @@ export function createMemoryTui(root: string, dependencies: MemoryTuiDependencie
 }
 
 export function memoryHealthText(health: MemoryTuiHealth): string {
-  return `Memory: ${health.status.replace("_", " ")}`;
+  return `${MEMORY_LABEL} ${MEMORY_STATUS_DOT} ${memoryHealthStatusText(health)}`;
 }
 
 export async function requestHealthStatus(
@@ -164,13 +166,28 @@ export async function requestHealthStatus(
 
 function MemoryHealthBadge(props: { api: TuiPluginApi; health: () => MemoryTuiHealth }) {
   return (
-    <box paddingLeft={1} paddingRight={1}>
+    <box flexShrink={0}>
+      <text fg={props.api.theme.current.text}>
+        <b>{MEMORY_LABEL}</b>
+      </text>
       {() => {
         const current = props.health();
-        return <text fg={healthColor(props.api, current.status)}>{memoryHealthText(current)}</text>;
+        return (
+          <box flexDirection="row" gap={1}>
+            <text flexShrink={0} fg={healthColor(props.api, current.status)}>
+              {MEMORY_STATUS_DOT}
+            </text>
+            <text fg={props.api.theme.current.textMuted}>{memoryHealthStatusText(current)}</text>
+          </box>
+        );
       }}
     </box>
   );
+}
+
+function memoryHealthStatusText(health: MemoryTuiHealth): string {
+  const status = health.status.replace("_", " ");
+  return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
 function healthColor(

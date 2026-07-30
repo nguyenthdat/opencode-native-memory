@@ -38,7 +38,7 @@ The package also includes an OpenCode TUI companion. Enable it in `tui.json`:
 }
 ```
 
-Use the project `.opencode/tui.json` or the user-level `~/.config/opencode/tui.json` depending on the desired scope. The companion displays `Memory: checking`, `Memory: healthy`, `Memory: degraded`, or `Memory: unavailable` in the TUI bottom bar. Run `/memory-health` to refresh it and show the detailed result as a toast. OpenCode's plugin installer can configure both the server and TUI entrypoints from the same package.
+Use the project `.opencode/tui.json` or the user-level `~/.config/opencode/tui.json` depending on the desired scope. The companion adds a `Memory` section to the TUI sidebar and displays `• Checking`, `• Healthy`, `• Degraded`, or `• Unavailable`. The bullet uses the theme's semantic status color while the status stays muted. Run `/memory-health` to refresh it and show the detailed result as a toast. OpenCode's plugin installer can configure both the server and TUI entrypoints from the same package.
 
 On a supported platform, npm installs one matching optional native package. Reinstall without `--omit=optional`; the plugin intentionally has no postinstall script or runtime binary download.
 
