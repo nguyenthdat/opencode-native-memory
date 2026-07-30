@@ -1,14 +1,6 @@
-import { fileURLToPath } from "node:url";
-import { basename, dirname, resolve } from "node:path";
-import { createMemoryPlugin } from "./plugin.js";
+import memoryPlugin from "./server.js";
 
-const moduleDirectory = dirname(fileURLToPath(import.meta.url));
-const packageRoot =
-  basename(moduleDirectory) === "dist"
-    ? resolve(moduleDirectory, "..")
-    : resolve(moduleDirectory, "../..");
-
-export default createMemoryPlugin({ root: packageRoot });
+export default memoryPlugin;
 
 // Contracts and constants
 export {
