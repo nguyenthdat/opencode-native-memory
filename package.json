@@ -36,7 +36,7 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "generate:protocol": "protoc --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --es_out=opencode-memory/src/generated --es_opt=target=ts,import_extension=js -I schema schema/opencode/memory/v1/memory.proto schema/opencode/memory/model/v1/model.proto schema/opencode/memory/daemon/v1/daemon.proto",
+    "generate:protocol": "protoc --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --es_out=opencode-memory/src/generated --es_opt=target=ts,import_extension=js -I schema schema/opencode/memory/v1/memory.proto schema/opencode/memory/model/v1/model.proto schema/opencode/memory/graph/v1/graph.proto schema/opencode/memory/daemon/v1/daemon.proto",
     "generate:protocol:check": "bun scripts/check-generated-protocol.ts",
     "lint:proto": "buf lint",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -58,6 +58,7 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.13.0",
+    "@opencode-ai/sdk": "1.18.4",
     "yaml": "^2.9.0"
   },
   "peerDependencies": {

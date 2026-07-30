@@ -1,12 +1,16 @@
 # Knowledge Graph Plan: Hindsight, Graphiti, and OpenCode Providers
 
-Status: Proposed, documentation only
+Status: Phases 1-3 implemented on 2026-07-30; Phase 4 safety foundation implemented, alternative backends remain gated
 
 Research snapshot: 2026-07-29
 
-Scope: design review before implementation. This document does not change the
-Rust daemon, Protobuf contract, TypeScript plugin, dependencies, or persisted
-state.
+Scope: original design review plus the implementation baseline. The current
+code implements the native sidecar, graph Protobuf domain, explicit provider
+tooling, temporal/RRF retrieval, durable leased extraction jobs, source
+invalidation, status/search/export, periodic daemon maintenance, an active local
+embedding-generation pointer, lexical fallback, and tests. Reviewed observation
+summaries, real target-generation model switching, and remote embedding adapters
+remain gated on quality/runtime/provider work.
 
 ## Executive Recommendation
 
@@ -523,13 +527,15 @@ depends_on
 implements
 causes
 related_to
+supports
+contradicts
 ```
 
 `mentions` is a `GraphMention` association, not an entity-to-entity edge.
-`supports` and `contradicts` should be added only after introducing a real
-assertion/fact type or relation-to-relation references. `supersedes` is also
-intentionally deferred until graph fact invalidation is clearly separated from
-memory record lifecycle supersession.
+`supports` and `contradicts` are source-backed graph predicates with temporal
+history and evidence; they are never mapped to lifecycle `conflict_with`.
+`supersedes` remains intentionally separate because memory record replacement
+is not graph fact invalidation.
 
 ### Entity resolution
 
@@ -822,6 +828,11 @@ Exit criteria:
 
 ### Phase 2: Temporal facts and graph retrieval
 
+Implementation status: delivered for temporal current/as-of filtering,
+source-backed invalidation versions, eligible-edge traversal, graph-to-memory
+RRF, and existing context packing. Reviewed observation summaries remain
+optional and deferred.
+
 Deliverables:
 
 - `valid_at`/`invalid_at` query semantics;
@@ -842,6 +853,11 @@ Exit criteria:
 
 ### Phase 3: Durable background extraction
 
+Implementation status: delivered as actor-owned durable graph jobs with
+enqueue/claim/renew/finish/status/cancel operations, expiring leases, bounded
+retry/backoff, restart recovery, and source-revision fencing. Automatic document
+triggering remains disabled because provider egress is still explicit.
+
 Only after the explicit tool is reliable:
 
 - persist extraction jobs and extraction revisions in the native daemon;
@@ -854,6 +870,11 @@ Only after the explicit tool is reliable:
 - keep remote extraction disabled for scopes that do not permit egress.
 
 ### Phase 4: Optional embedding backends
+
+Implementation status: the existing local collection now has an atomic active
+generation/profile pointer and dense failures fall back explicitly to lexical
+retrieval. Target-generation migration and remote adapters remain blocked until
+the worker/memory-admission path and a real embedding-provider contract exist.
 
 This is independent of the graph sidecar and requires a separate review of the
 current project embedding model-switch plan:

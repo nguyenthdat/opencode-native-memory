@@ -9,6 +9,8 @@ const nativeStatus: NativeMemoryStatus = {
   zvec_version: "0.1.0",
   embedding_model: "test-model",
   embedding_dimension: 2560,
+  active_profile_id: "qwen3-text-4b-q4",
+  active_generation_id: "legacy",
   project_root: "/project",
   project_id: "project-id",
   collection_path: "/data/collection",
@@ -149,5 +151,25 @@ describe("memory plugin health", () => {
         { component: "backend", message: "1 memory delete is pending recovery" },
       ],
     });
+  });
+
+  test("uses the optimize action threshold for backend index health", () => {
+    for (const [completeness, status] of [
+      [0.979, "degraded"],
+      [0.98, "degraded"],
+      [0.99, "degraded"],
+      [1, "healthy"],
+    ] as const) {
+      const response = buildMemoryStatusResponse(
+        {
+          status: "fulfilled",
+          value: { ...nativeStatus, indexes: [{ name: "embedding", completeness }] },
+        },
+        { status: "fulfilled", value: undefined },
+        { status: "fulfilled", value: undefined },
+      );
+
+      expect(response.plugin_health.status).toBe(status);
+    }
   });
 });

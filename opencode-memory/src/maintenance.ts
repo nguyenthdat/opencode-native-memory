@@ -1,9 +1,9 @@
-import type { NativeMemoryStatus } from "./contracts.js";
+import type { NativeMemoryStatus, OptimizeResponse } from "./contracts.js";
 import type { NativeMemoryRequester } from "./daemon-client.js";
 import { requestIdempotently } from "./outcome-reconciliation.js";
 
 export const DEFAULT_OPTIMIZE_DEBOUNCE_MS = 5_000;
-export const DEFAULT_OPTIMIZE_INDEX_THRESHOLD = 0.98;
+export const DEFAULT_OPTIMIZE_INDEX_THRESHOLD = 1;
 
 export interface MemoryMaintenanceOptions {
   enabled?: boolean;
@@ -54,8 +54,10 @@ export class MemoryMaintenanceScheduler {
   }
 
   observeStatus(
-    status: Pick<NativeMemoryStatus, "indexes" | "pending_upsert_count" | "pending_delete_count">,
+    status: Pick<NativeMemoryStatus, "indexes" | "pending_upsert_count" | "pending_delete_count"> &
+      Partial<Pick<NativeMemoryStatus, "ready">>,
   ): void {
+    if (status.ready === false) return;
     if (
       status.pending_upsert_count > 0 ||
       status.pending_delete_count > 0 ||
@@ -87,7 +89,7 @@ export class MemoryMaintenanceScheduler {
   private async run(): Promise<void> {
     if (this.disposed || !this.pending) return;
     this.pending = false;
-    const operation = requestIdempotently<Record<string, unknown>>(this.native, "optimize", {})
+    const operation = requestIdempotently<OptimizeResponse>(this.native, "optimize", {})
       .then(() => undefined)
       .catch((error) => {
         this.onError(error);

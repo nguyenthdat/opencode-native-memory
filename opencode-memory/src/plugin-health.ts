@@ -5,6 +5,7 @@ import type {
   MemoryStatusResponse,
   NativeMemoryStatus,
 } from "./contracts.js";
+import { DEFAULT_OPTIMIZE_INDEX_THRESHOLD } from "./maintenance.js";
 
 export function buildMemoryStatusResponse(
   backend: PromiseSettledResult<NativeMemoryStatus>,
@@ -20,7 +21,7 @@ export function buildMemoryStatusResponse(
     issues.push({ component: "backend", message: "Native memory backend is not ready" });
   } else {
     for (const index of backend.value.indexes) {
-      if (index.completeness < 1) {
+      if (index.completeness < DEFAULT_OPTIMIZE_INDEX_THRESHOLD) {
         issues.push({
           component: "backend",
           message: `Index ${index.name} is ${(index.completeness * 100).toFixed(1)}% complete`,

@@ -96,6 +96,16 @@ export interface MemoryRecord {
     error: number;
   };
   score?: number;
+  score_breakdown?: {
+    dense: number;
+    reciprocal_rank: number;
+    lexical: number;
+    channel_agreement: number;
+    calibrated: number;
+    retention: number;
+    feedback: number;
+    graph_rrf?: number;
+  };
   pinned: boolean;
   locked: boolean;
   lock_reason?: string | null;
@@ -185,6 +195,278 @@ export interface DocumentIndexResponse {
   warnings: string[];
 }
 
+export interface GraphAuthorization {
+  readonly session_scope_key: string;
+  readonly agent_scope_key: string;
+}
+
+export interface GraphScopeFilter {
+  readonly memory_scope?: (typeof MEMORY_SCOPES)[number];
+  readonly verified_scope_key?: string;
+}
+
+export interface GraphTimeFilter {
+  /** Inclusive valid-at bounds. Equal bounds represent an exact as-of instant. */
+  readonly valid_after_ms?: number;
+  readonly valid_before_ms?: number;
+  readonly extracted_after_ms?: number;
+  readonly extracted_before_ms?: number;
+}
+
+export interface GraphSearchRequest {
+  readonly authorization: GraphAuthorization;
+  readonly query: string;
+  readonly scope?: GraphScopeFilter;
+  readonly time?: GraphTimeFilter;
+  readonly max_depth: number;
+  readonly max_fanout: number;
+  readonly max_results: number;
+  readonly max_evidence_per_fact: number;
+}
+
+export interface GraphStatusRequest {
+  readonly authorization: GraphAuthorization;
+  readonly scope?: GraphScopeFilter;
+}
+
+export interface GraphExportRequest {
+  readonly authorization: GraphAuthorization;
+  readonly scope?: GraphScopeFilter;
+  readonly cursor?: string;
+  readonly page_limit: number;
+}
+
+export interface GraphDerivedScope {
+  readonly project_id: string;
+  readonly memory_scope: string;
+  readonly verified_scope_key: string;
+}
+
+export interface GraphCandidateEvidence {
+  readonly source_unit_id: string;
+  readonly quote: string;
+  readonly utf8_start?: number;
+  readonly utf8_end?: number;
+  readonly occurrence_index: number;
+}
+
+export interface GraphSourceBinding {
+  readonly source_memory_id: string;
+  readonly source_unit_id: string;
+  readonly content_hash: string;
+  readonly extraction_revision: string;
+  readonly derived_scope?: GraphDerivedScope;
+  readonly origin: string;
+  readonly policy_revision: string;
+  readonly remote_eligible: boolean;
+}
+
+export interface GraphExtractionUnit {
+  readonly source?: GraphSourceBinding;
+  readonly text: string;
+  readonly remote_ineligible_reason?: string;
+}
+
+export interface GraphRejectedSource {
+  readonly source_memory_id: string;
+  readonly code: string;
+  readonly message: string;
+}
+
+export interface GraphProviderIdentity {
+  readonly provider_id: string;
+  readonly model_id: string;
+  readonly extractor_version: string;
+  readonly prompt_version: string;
+  readonly schema_version: string;
+  readonly variant?: string;
+}
+
+export interface GraphRunReceipt {
+  readonly extraction_run_id: string;
+  readonly idempotency_digest: string;
+  readonly outcome: string;
+  readonly committed_at_ms: number;
+  readonly source_count: number;
+  readonly accepted_entity_count: number;
+  readonly accepted_relation_count: number;
+  readonly rejected_candidate_count: number;
+  readonly conflict_count: number;
+  readonly warning_count: number;
+  readonly terminal: boolean;
+}
+
+export interface GraphUpsertCandidatesResponse {
+  readonly receipt?: GraphRunReceipt;
+  readonly accepted_entities: readonly unknown[];
+  readonly accepted_relations: readonly unknown[];
+  readonly rejected_candidates: readonly unknown[];
+  readonly conflicts: readonly unknown[];
+  readonly warnings: readonly string[];
+}
+
+export type GraphExtractionJobState =
+  "queued" | "claimed" | "running" | "completed" | "failed" | "cancelled";
+
+export interface GraphExtractionJob {
+  readonly job_id: string;
+  readonly idempotency_digest: string;
+  readonly state: GraphExtractionJobState;
+  readonly sources: readonly GraphSourceBinding[];
+  readonly provider?: GraphProviderIdentity;
+  readonly attempt_count: number;
+  readonly max_attempts: number;
+  readonly created_at_ms: number;
+  readonly updated_at_ms: number;
+  readonly lease_expires_at_ms?: number;
+  readonly extraction_run_id: string;
+  readonly next_attempt_at_ms?: number;
+  readonly cancel_requested: boolean;
+  readonly error_code: string;
+  readonly error_message: string;
+  readonly max_unit_text_bytes: number;
+  readonly max_total_text_bytes: number;
+}
+
+export interface GraphExtractEnqueueResponse {
+  readonly job?: GraphExtractionJob;
+  readonly existing: boolean;
+  readonly rejected_sources: readonly GraphRejectedSource[];
+  readonly warnings: readonly string[];
+}
+
+export interface GraphExtractClaimResponse {
+  readonly found: boolean;
+  readonly job?: GraphExtractionJob;
+  readonly lease_token: string;
+  readonly units: readonly GraphExtractionUnit[];
+  readonly rejected_sources: readonly GraphRejectedSource[];
+  readonly warnings: readonly string[];
+}
+
+export interface GraphExtractRenewResponse {
+  readonly job?: GraphExtractionJob;
+  readonly lease_expires_at_ms: number;
+  readonly cancel_requested: boolean;
+}
+
+export interface GraphExtractFinishResponse {
+  readonly job?: GraphExtractionJob;
+  readonly upsert?: GraphUpsertCandidatesResponse;
+  readonly warnings: readonly string[];
+}
+
+export interface GraphExtractJobStatusResponse {
+  readonly found: boolean;
+  readonly job?: GraphExtractionJob;
+}
+
+export interface GraphExtractCancelResponse {
+  readonly job?: GraphExtractionJob;
+  readonly outcome: "cancelled" | "cancel_requested" | "already_terminal";
+}
+
+export interface GraphEvidenceProvenance {
+  readonly source_memory_id: string;
+  readonly source_unit_id: string;
+  readonly content_hash: string;
+  readonly extraction_revision: string;
+  readonly derived_scope?: GraphDerivedScope;
+  readonly evidence: readonly GraphCandidateEvidence[];
+}
+
+export interface GraphEntity {
+  readonly entity_id: string;
+  readonly canonical_name: string;
+  readonly entity_type: string;
+  readonly aliases: readonly string[];
+  readonly derived_scope?: GraphDerivedScope;
+  readonly first_seen_at_ms: number;
+  readonly last_seen_at_ms: number;
+  readonly source_count: number;
+}
+
+export interface GraphRelation {
+  readonly relation_id: string;
+  readonly subject_entity_id: string;
+  readonly predicate: string;
+  readonly object_entity_id: string;
+  readonly relation_type: string;
+  readonly valid_at_ms?: number;
+  readonly invalid_at_ms?: number;
+  readonly created_at_ms: number;
+  readonly extracted_at_ms: number;
+  readonly confidence: number;
+  readonly status: string;
+  readonly source_memory_ids: readonly string[];
+  readonly evidence: readonly GraphCandidateEvidence[];
+  readonly extractor_version: string;
+  readonly derived_scope?: GraphDerivedScope;
+}
+
+export interface GraphScoreComponent {
+  readonly name: string;
+  readonly value: number;
+}
+
+export interface GraphMemorySearchResult {
+  readonly source_memory_id: string;
+  readonly score: number;
+  readonly provenance: readonly GraphEvidenceProvenance[];
+  readonly score_trace: readonly GraphScoreComponent[];
+}
+
+export interface GraphEntitySearchResult {
+  readonly entity?: GraphEntity;
+  readonly score: number;
+  readonly provenance: readonly GraphEvidenceProvenance[];
+  readonly score_trace: readonly GraphScoreComponent[];
+}
+
+export interface GraphRelationSearchResult {
+  readonly relation?: GraphRelation;
+  readonly score: number;
+  readonly provenance: readonly GraphEvidenceProvenance[];
+  readonly score_trace: readonly GraphScoreComponent[];
+}
+
+export interface GraphSearchResponse {
+  readonly memories: readonly GraphMemorySearchResult[];
+  readonly entities: readonly GraphEntitySearchResult[];
+  readonly relations: readonly GraphRelationSearchResult[];
+  readonly eligible_source_count: number;
+  readonly truncated: boolean;
+}
+
+export interface GraphLastExtraction {
+  readonly extraction_run_id: string;
+  readonly completed_at_ms: number;
+  readonly source_count: number;
+}
+
+export interface GraphStatusResponse {
+  readonly schema_version: string;
+  readonly entity_count: number;
+  readonly relation_count: number;
+  readonly pending_job_count: number;
+  readonly last_extraction?: GraphLastExtraction;
+}
+
+export interface GraphExportProvenance {
+  readonly fact_kind: string;
+  readonly fact_id: string;
+  readonly sources: readonly GraphEvidenceProvenance[];
+}
+
+export interface GraphExportResponse {
+  readonly schema_version: string;
+  readonly entities: readonly GraphEntity[];
+  readonly relations: readonly GraphRelation[];
+  readonly provenance: readonly GraphExportProvenance[];
+  readonly next_cursor?: string;
+  readonly complete: boolean;
+}
+
 export interface NativeMemoryStatus {
   ready: boolean;
   rpc_protocol_version: number;
@@ -192,6 +474,8 @@ export interface NativeMemoryStatus {
   zvec_version: string;
   embedding_model: string;
   embedding_dimension: number;
+  active_profile_id: string;
+  active_generation_id: string;
   project_root: string;
   project_id: string;
   collection_path: string;
@@ -205,6 +489,14 @@ export interface NativeMemoryStatus {
   pending_delete_count: number;
   indexes: Array<{ name: string; completeness: number }>;
   capabilities: string[];
+}
+
+export interface OptimizeResponse {
+  optimized: boolean;
+  document_count: number;
+  pruned_expired: number;
+  pruned_retrievals: number;
+  indexes: Array<{ name: string; completeness: number }>;
 }
 
 export type MemoryPluginHealthStatus = "healthy" | "degraded" | "unavailable";

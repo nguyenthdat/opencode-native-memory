@@ -116,6 +116,20 @@ impl ProjectRegistry {
         }
     }
 
+    pub(crate) fn schedule_maintenance(&self, interval: Duration) -> usize {
+        let actors = self
+            .actors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        actors
+            .into_iter()
+            .filter(|actor| actor.enqueue_maintenance(interval))
+            .count()
+    }
+
     pub(crate) fn has_activity(&self) -> bool {
         self.actors
             .lock()
@@ -208,5 +222,13 @@ mod tests {
         first.release_lease();
         second.release_lease();
         first.stop().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn periodic_maintenance_does_not_create_an_actor() {
+        let registry = ProjectRegistry::new();
+
+        assert_eq!(registry.schedule_maintenance(Duration::ZERO), 0);
+        assert!(registry.actors.lock().expect("registry lock").is_empty());
     }
 }

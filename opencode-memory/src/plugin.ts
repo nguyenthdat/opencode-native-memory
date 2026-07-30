@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import type { Plugin, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type {
@@ -8,6 +9,23 @@ import type {
   IngestResponse,
   DocumentIndexResponse,
   NativeMemoryStatus,
+  GraphAuthorization as GraphAuthorizationContract,
+  GraphSearchRequest,
+  GraphSearchResponse,
+  GraphStatusRequest,
+  GraphStatusResponse,
+  GraphExportRequest,
+  GraphExportResponse,
+  GraphExtractCancelResponse,
+  GraphExtractClaimResponse,
+  GraphExtractEnqueueResponse,
+  GraphExtractFinishResponse,
+  GraphExtractJobStatusResponse,
+  GraphExtractRenewResponse,
+  GraphExtractionJob,
+  GraphExtractionUnit,
+  GraphProviderIdentity,
+  GraphSourceBinding,
 } from "./contracts.js";
 import {
   MEMORY_KINDS,
@@ -19,7 +37,8 @@ import {
   RETRIEVAL_MODES,
   isUserProfileTaxonomy,
 } from "./contracts.js";
-import { acquireNativeMemoryClient } from "./daemon-client.js";
+import { acquireNativeMemoryClient, DaemonOutcomeUnknownError } from "./daemon-client.js";
+import { createGraphExtractor, type GraphExtractionCandidates } from "./graph-extractor.js";
 import {
   COMPACTION_CONTEXT,
   formatRecalledMemories,
@@ -45,7 +64,7 @@ import { validateDeleteRecords, validateUpdateArgs } from "./validation.js";
 import { BACKGROUND_JOB_ID_PATTERN, BackgroundJobQueue } from "./background-jobs.js";
 import { buildMemoryStatusResponse } from "./plugin-health.js";
 import { listModelProfiles, preflightModelSwitch } from "./model-control.js";
-import { MemoryMaintenanceScheduler } from "./maintenance.js";
+import { DEFAULT_OPTIMIZE_DEBOUNCE_MS, MemoryMaintenanceScheduler } from "./maintenance.js";
 import { requestIdempotently } from "./outcome-reconciliation.js";
 import { captureWithOutcomeReconciliation } from "./capture-reconciliation.js";
 
@@ -64,8 +83,23 @@ export interface MemoryPluginOptions {
   projectRoot?: string;
 }
 
+type GraphPreparedUnit = GraphExtractionUnit;
+
+interface GraphPrepareResponse {
+  readonly units: readonly GraphPreparedUnit[];
+  readonly rejected_sources: readonly unknown[];
+  readonly warnings: readonly string[];
+}
+
+const GRAPH_JOB_LEASE_MS = 60_000;
+const GRAPH_JOB_RENEW_INTERVAL_MS = 20_000;
+const GRAPH_JOB_POLL_MS = 1_000;
+const GRAPH_EXTRACTOR_VERSION = "opencode-sdk-v2-json-schema-v1";
+const GRAPH_PROMPT_VERSION = "knowledge-graph-extraction-v1";
+const GRAPH_CANDIDATE_SCHEMA_VERSION = "knowledge-graph-candidates-v1";
+
 export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
-  return async ({ client: opencode, directory, worktree }) => {
+  return async ({ client: opencode, directory, worktree, serverUrl }) => {
     const settings = resolveMemoryPluginOptions(options);
     const memoryProjectRoot = options.projectRoot ?? worktree;
     const memoryInstructions = await loadMemoryInstructions(options.root);
@@ -90,6 +124,304 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
       scope: (typeof WRITABLE_MEMORY_SCOPES)[number];
     };
     const ingestJobs = new BackgroundJobQueue<IngestJobInput, IngestResponse>();
+    const extractionSessions = new Set<string>();
+    const graphModels = new Map<
+      string,
+      { providerID: string; modelID: string; variant?: string }
+    >();
+
+    const graphAuthorization = async (
+      sessionID: string,
+      agent: string,
+    ): Promise<GraphAuthorizationContract> => ({
+      session_scope_key: await session.resolveSessionRoot(sessionID),
+      agent_scope_key: agent,
+    });
+
+    const graphWorkerID = `plugin-${randomUUID()}`;
+    const graphWorkerAbort = new AbortController();
+    const graphWork = new Map<string, GraphAuthorizationContract>();
+    const graphDiscoveries = new Map<string, GraphAuthorizationContract>();
+    const graphAttemptAborts = new Map<string, AbortController>();
+    let graphWorker: Promise<void> | undefined;
+
+    const graphJobStatus = async (
+      jobID: string,
+      authorization: GraphAuthorizationContract,
+      signal: AbortSignal,
+    ): Promise<GraphExtractJobStatusResponse> =>
+      await native.request<GraphExtractJobStatusResponse>(
+        "graph_extract_job_status",
+        { authorization, job_id: jobID },
+        signal,
+      );
+
+    const reconcileGraphFinish = async (
+      method: "graph_extract_complete" | "graph_extract_fail",
+      params: Record<string, unknown>,
+      jobID: string,
+      authorization: GraphAuthorizationContract,
+      signal: AbortSignal,
+    ): Promise<GraphExtractFinishResponse | undefined> => {
+      try {
+        return await native.request<GraphExtractFinishResponse>(method, params, signal);
+      } catch (error) {
+        if (!(error instanceof DaemonOutcomeUnknownError)) throw error;
+        const status = await graphJobStatus(jobID, authorization, signal);
+        if (!status.found || !status.job) throw error;
+        if (["completed", "failed", "cancelled", "queued"].includes(status.job.state)) {
+          return undefined;
+        }
+        return await native.request<GraphExtractFinishResponse>(method, params, signal);
+      }
+    };
+
+    const claimGraphJob = async (
+      jobID: string | undefined,
+      authorization: GraphAuthorizationContract,
+    ): Promise<GraphExtractClaimResponse> =>
+      await native.request<GraphExtractClaimResponse>(
+        "graph_extract_claim",
+        {
+          authorization,
+          claim_request_id: randomUUID(),
+          worker_id: graphWorkerID,
+          ...(jobID === undefined ? {} : { job_id: jobID }),
+          lease_ttl_ms: GRAPH_JOB_LEASE_MS,
+        },
+        graphWorkerAbort.signal,
+      );
+
+    const processClaimedGraphJob = async (
+      claim: GraphExtractClaimResponse,
+      authorization: GraphAuthorizationContract,
+    ): Promise<void> => {
+      if (!claim.found || !claim.job || !claim.lease_token) return;
+      if (claim.job.state === "failed" || claim.job.state === "cancelled") return;
+      const provider = claim.job.provider;
+      if (!provider) throw new Error("Claimed graph job omitted its provider identity");
+      const units = claim.units.filter(
+        (unit): unit is GraphExtractionUnit & { source: GraphSourceBinding } =>
+          unit.source?.remote_eligible === true,
+      );
+      if (units.length === 0) {
+        await reconcileGraphFinish(
+          "graph_extract_fail",
+          {
+            authorization,
+            job_id: claim.job.job_id,
+            lease_token: claim.lease_token,
+            extraction_run_id: claim.job.extraction_run_id,
+            retryable: false,
+            error_code: "no_eligible_sources",
+            error_message: "claimed graph job has no remotely eligible source units",
+          },
+          claim.job.job_id,
+          authorization,
+          graphWorkerAbort.signal,
+        );
+        return;
+      }
+
+      const attemptAbort = new AbortController();
+      graphAttemptAborts.set(claim.job.job_id, attemptAbort);
+      const attemptSignal = AbortSignal.any([graphWorkerAbort.signal, attemptAbort.signal]);
+      let renewalFailure: Error | undefined;
+      let renewal = Promise.resolve();
+      const renewLease = async (): Promise<void> => {
+        const response = await native.request<GraphExtractRenewResponse>(
+          "graph_extract_renew",
+          {
+            authorization,
+            job_id: claim.job!.job_id,
+            lease_token: claim.lease_token,
+            lease_ttl_ms: GRAPH_JOB_LEASE_MS,
+          },
+          graphWorkerAbort.signal,
+        );
+        if (response.cancel_requested) {
+          attemptAbort.abort(new Error("Graph extraction was cancelled"));
+        }
+      };
+      await renewLease();
+      const renewalTimer = setInterval(() => {
+        renewal = renewal.then(renewLease).catch((error: unknown) => {
+          renewalFailure = asPluginError(error);
+          attemptAbort.abort(renewalFailure);
+        });
+      }, GRAPH_JOB_RENEW_INTERVAL_MS);
+      renewalTimer.unref?.();
+      attemptAbort.signal.addEventListener("abort", () => clearInterval(renewalTimer), {
+        once: true,
+      });
+
+      let candidates: GraphExtractionCandidates | undefined;
+      let candidatePayload: ReturnType<typeof graphCandidatePayload> | undefined;
+      let extractionFailure: Error | undefined;
+      try {
+        const extractor = createGraphExtractor(
+          { serverUrl, directory },
+          {
+            providerID: provider.provider_id,
+            modelID: provider.model_id,
+            ...(provider.variant === undefined ? {} : { variant: provider.variant }),
+            retryCount: 0,
+            onSessionChange: (sessionID, active) => {
+              if (active) extractionSessions.add(sessionID);
+              else extractionSessions.delete(sessionID);
+            },
+          },
+        );
+        candidates = await extractor.extract(
+          units.map((unit) => ({
+            source_unit_id: unit.source.source_unit_id,
+            text: unit.text,
+          })),
+          attemptSignal,
+        );
+        candidatePayload = graphCandidatePayload(candidates);
+      } catch (error) {
+        extractionFailure = asPluginError(error);
+      } finally {
+        clearInterval(renewalTimer);
+        await renewal;
+      }
+      if (graphAttemptAborts.get(claim.job.job_id) === attemptAbort) {
+        graphAttemptAborts.delete(claim.job.job_id);
+      }
+      if (graphWorkerAbort.signal.aborted || renewalFailure) return;
+      if (!candidates || !candidatePayload || extractionFailure) {
+        const cancelled = attemptAbort.signal.aborted;
+        await reconcileGraphFinish(
+          "graph_extract_fail",
+          {
+            authorization,
+            job_id: claim.job.job_id,
+            lease_token: claim.lease_token,
+            extraction_run_id: claim.job.extraction_run_id,
+            retryable: !cancelled,
+            error_code: cancelled ? "cancelled" : "provider_error",
+            error_message: boundedGraphJobError(
+              extractionFailure?.message ?? "graph provider extraction failed",
+            ),
+          },
+          claim.job.job_id,
+          authorization,
+          graphWorkerAbort.signal,
+        );
+        return;
+      }
+      await reconcileGraphFinish(
+        "graph_extract_complete",
+        {
+          authorization,
+          job_id: claim.job.job_id,
+          lease_token: claim.lease_token,
+          extraction_run_id: claim.job.extraction_run_id,
+          ...candidatePayload,
+        },
+        claim.job.job_id,
+        authorization,
+        graphWorkerAbort.signal,
+      );
+    };
+
+    const processGraphJob = async (
+      job: GraphExtractionJob,
+      authorization: GraphAuthorizationContract,
+    ): Promise<void> => {
+      const claim = await claimGraphJob(job.job_id, authorization);
+      await processClaimedGraphJob(claim, authorization);
+    };
+
+    const runGraphWorker = async (): Promise<void> => {
+      while (
+        !graphWorkerAbort.signal.aborted &&
+        (graphWork.size > 0 || graphDiscoveries.size > 0)
+      ) {
+        let progressed = false;
+        for (const [key, authorization] of [...graphDiscoveries]) {
+          if (graphWorkerAbort.signal.aborted) return;
+          try {
+            const claim = await claimGraphJob(undefined, authorization);
+            if (!claim.found || !claim.job) {
+              const aggregate = await native.request<GraphStatusResponse>(
+                "graph_status",
+                { authorization },
+                graphWorkerAbort.signal,
+              );
+              if (aggregate.pending_job_count === 0) graphDiscoveries.delete(key);
+              continue;
+            }
+            progressed = true;
+            graphWork.set(claim.job.job_id, authorization);
+            await processClaimedGraphJob(claim, authorization);
+          } catch (error) {
+            if (!graphWorkerAbort.signal.aborted) session.warnOnce(error);
+          }
+        }
+        for (const [jobID, authorization] of [...graphWork]) {
+          if (graphWorkerAbort.signal.aborted) return;
+          try {
+            const status = await graphJobStatus(jobID, authorization, graphWorkerAbort.signal);
+            if (!status.found || !status.job || status.job.state === "completed") {
+              graphWork.delete(jobID);
+              continue;
+            }
+            if (status.job.state === "failed" || status.job.state === "cancelled") {
+              graphWork.delete(jobID);
+              if (status.job.error_message) session.warnOnce(new Error(status.job.error_message));
+              continue;
+            }
+            if (
+              status.job.state === "queued" &&
+              (status.job.next_attempt_at_ms === undefined ||
+                status.job.next_attempt_at_ms <= Date.now())
+            ) {
+              progressed = true;
+              await processGraphJob(status.job, authorization);
+            }
+          } catch (error) {
+            if (!graphWorkerAbort.signal.aborted) session.warnOnce(error);
+          }
+        }
+        if (
+          !progressed &&
+          !graphWorkerAbort.signal.aborted &&
+          (graphWork.size > 0 || graphDiscoveries.size > 0)
+        ) {
+          await graphWorkerDelay(GRAPH_JOB_POLL_MS, graphWorkerAbort.signal);
+        }
+      }
+    };
+
+    const startGraphWorker = (): void => {
+      if (
+        graphWorker ||
+        graphWorkerAbort.signal.aborted ||
+        (graphWork.size === 0 && graphDiscoveries.size === 0)
+      ) {
+        return;
+      }
+      const running = runGraphWorker();
+      const tracked = running.finally(() => {
+        if (graphWorker === tracked) graphWorker = undefined;
+        startGraphWorker();
+      });
+      graphWorker = tracked;
+    };
+
+    const scheduleGraphJob = (jobID: string, authorization: GraphAuthorizationContract): void => {
+      if (graphWorkerAbort.signal.aborted) return;
+      graphWork.set(jobID, authorization);
+      startGraphWorker();
+    };
+
+    const scheduleGraphDiscovery = (authorization: GraphAuthorizationContract): void => {
+      if (graphWorkerAbort.signal.aborted) return;
+      graphDiscoveries.set(graphAuthorizationKey(authorization), authorization);
+      startGraphWorker();
+    };
 
     const syncSharedMemories = async (force = false): Promise<void> => {
       if (!settings.sharedSync) return;
@@ -178,6 +510,11 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     return {
       dispose: async () => {
         if (documentSyncTimer) clearTimeout(documentSyncTimer);
+        graphWorkerAbort.abort();
+        if (graphWorker) await graphWorker.catch(() => undefined);
+        graphWork.clear();
+        graphDiscoveries.clear();
+        graphAttemptAborts.clear();
         await maintenance.dispose();
         await ingestJobs.dispose();
         if (sharedSync) await sharedSync.catch(() => undefined);
@@ -189,6 +526,8 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
         session.sessionParents.clear();
         session.sessionRoots.clear();
         session.sessionAgents.clear();
+        extractionSessions.clear();
+        graphModels.clear();
         await nativeLease.release();
       },
       config: async (config) => {
@@ -224,6 +563,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           session.sessionParents.delete(sessID);
           session.sessionRoots.delete(sessID);
           session.sessionAgents.delete(sessID);
+          graphModels.delete(sessID);
           return;
         }
         if (event.type === "session.idle") {
@@ -244,6 +584,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           return;
         }
         if (event.type !== "session.compacted") return;
+        if (extractionSessions.has(event.properties.sessionID)) return;
         if (!settings.automaticCapture) return;
 
         try {
@@ -296,18 +637,32 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         }
       },
       "chat.message": async (input, output) => {
+        if (extractionSessions.has(input.sessionID)) return;
+        if (input.model) {
+          graphModels.set(input.sessionID, {
+            providerID: input.model.providerID,
+            modelID: input.model.modelID,
+            ...(input.variant === undefined ? {} : { variant: input.variant }),
+          });
+        }
+        if (input.agent) session.sessionAgents.set(input.sessionID, input.agent);
+        const discoveryAgent =
+          input.agent ?? session.sessionAgents.get(input.sessionID) ?? "unknown";
+        void graphAuthorization(input.sessionID, discoveryAgent)
+          .then(scheduleGraphDiscovery)
+          .catch(session.warnOnce);
         session.latestQuery.delete(input.sessionID);
         session.invalidateRecall(input.sessionID);
         session.discardPendingRecall(input.sessionID);
         const query = deriveRecallQuery(output.parts);
         if (!query) return;
-        if (input.agent) session.sessionAgents.set(input.sessionID, input.agent);
         session.latestQuery.set(input.sessionID, {
           query: truncateText(query, 2_000),
           agent: input.agent,
         });
       },
       "experimental.chat.system.transform": async (input, output) => {
+        if (input.sessionID && extractionSessions.has(input.sessionID)) return;
         if (!output.system.some((entry) => entry.includes(MEMORY_INSTRUCTIONS_MARKER))) {
           output.system.push(memoryInstructions.content);
         }
@@ -358,6 +713,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 min_score: settings.minScore,
                 include_stale: false,
                 include_superseded: false,
+                include_graph: true,
                 track_feedback: settings.feedbackTracking,
               });
               for (const warning of response.warnings) session.warnOnce(new Error(warning));
@@ -394,7 +750,8 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         });
         if (opened) output.system.push(formatted.text);
       },
-      "experimental.session.compacting": async (_input, output) => {
+      "experimental.session.compacting": async (input, output) => {
+        if (extractionSessions.has(input.sessionID)) return;
         output.context.push(COMPACTION_CONTEXT);
       },
       tool: {
@@ -428,6 +785,322 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               can_start: response.preflight.can_start,
               blocker_count: response.preflight.blockers.length,
             });
+          },
+        }),
+        memory_graph_extract: tool({
+          description:
+            "Explicitly extract source-backed knowledge graph candidates with the current OpenCode provider, then validate and persist them in the native project graph. This sends eligible source units to the provider and always asks permission first.",
+          args: {
+            source_memory_ids: tool.schema
+              .array(tool.schema.string().min(1).max(128))
+              .min(1)
+              .max(64),
+            dry_run: tool.schema
+              .boolean()
+              .default(false)
+              .describe("Return validated candidates without persisting graph facts."),
+            retry_count: tool.schema.number().int().min(0).max(3).default(2),
+          },
+          async execute(args, context) {
+            const model = graphModels.get(context.sessionID);
+            if (!model) {
+              throw new Error(
+                "The active OpenCode provider/model is unknown. Send a normal chat message in this session before graph extraction.",
+              );
+            }
+            const authorization = await graphAuthorization(context.sessionID, context.agent);
+            const prepared = await native.request<GraphPrepareResponse>(
+              "graph_extract_prepare",
+              {
+                authorization,
+                source_memory_ids: args.source_memory_ids,
+                max_units: 64,
+                max_unit_text_bytes: 32 * 1_024,
+                max_total_text_bytes: 256 * 1_024,
+              },
+              context.abort,
+            );
+            const eligible = prepared.units.filter(
+              (unit): unit is GraphPreparedUnit & { source: GraphSourceBinding } =>
+                unit.source?.remote_eligible === true,
+            );
+            if (eligible.length === 0) {
+              return result(
+                "Knowledge graph extraction blocked",
+                {
+                  persisted: false,
+                  rejected_sources: prepared.rejected_sources,
+                  warnings: prepared.warnings,
+                  message: "No requested source is eligible for remote extraction.",
+                },
+                {
+                  eligible_source_count: 0,
+                  rejected_source_count: prepared.rejected_sources.length,
+                },
+              );
+            }
+            const totalBytes = eligible.reduce(
+              (total, unit) => total + new TextEncoder().encode(unit.text).byteLength,
+              0,
+            );
+            await context.ask({
+              permission: "memory_graph_extract",
+              patterns: [`${model.providerID}/${model.modelID}`],
+              always: [],
+              metadata: {
+                provider_id: model.providerID,
+                model_id: model.modelID,
+                source_count: eligible.length,
+                source_bytes: totalBytes,
+              },
+            });
+            if (args.dry_run) {
+              const extractor = createGraphExtractor(
+                { serverUrl, directory },
+                {
+                  ...model,
+                  retryCount: args.retry_count,
+                  onSessionChange: (sessionID, active) => {
+                    if (active) extractionSessions.add(sessionID);
+                    else extractionSessions.delete(sessionID);
+                  },
+                },
+              );
+              const candidates = await extractor.extract(
+                eligible.map((unit) => ({
+                  source_unit_id: unit.source.source_unit_id,
+                  text: unit.text,
+                })),
+                context.abort,
+              );
+              return result(
+                "Knowledge graph extraction dry run",
+                {
+                  persisted: false,
+                  provider: model,
+                  candidates,
+                  rejected_sources: prepared.rejected_sources,
+                  warnings: prepared.warnings,
+                },
+                {
+                  source_count: eligible.length,
+                  entity_count: candidates.entities.length,
+                  relation_count: candidates.relations.length,
+                },
+              );
+            }
+            const provider = {
+              provider_id: model.providerID,
+              model_id: model.modelID,
+              extractor_version: GRAPH_EXTRACTOR_VERSION,
+              prompt_version: GRAPH_PROMPT_VERSION,
+              schema_version: GRAPH_CANDIDATE_SCHEMA_VERSION,
+              ...(model.variant === undefined ? {} : { variant: model.variant }),
+            } satisfies GraphProviderIdentity;
+            const maxAttempts = args.retry_count + 1;
+            const jobID = graphExtractionJobID(
+              eligible.map((unit) => unit.source),
+              provider,
+              maxAttempts,
+            );
+            let response: GraphExtractEnqueueResponse;
+            try {
+              response = await native.request<GraphExtractEnqueueResponse>(
+                "graph_extract_enqueue",
+                {
+                  authorization,
+                  job_id: jobID,
+                  source_memory_ids: eligible.map((unit) => unit.source.source_memory_id),
+                  provider,
+                  max_attempts: maxAttempts,
+                  max_unit_text_bytes: 32 * 1_024,
+                  max_total_text_bytes: 256 * 1_024,
+                },
+                context.abort,
+              );
+            } catch (error) {
+              scheduleGraphDiscovery(authorization);
+              throw error;
+            }
+            const job = response.job;
+            if (!job) throw new Error("Native memory daemon omitted the enqueued graph job");
+            scheduleGraphJob(job.job_id, authorization);
+            return result(
+              response.existing
+                ? "Knowledge graph extraction already queued"
+                : "Queued knowledge graph extraction",
+              response,
+              {
+                job_id: job.job_id,
+                state: job.state,
+                source_count: job.sources.length,
+                attempt_count: job.attempt_count,
+                max_attempts: job.max_attempts,
+              },
+            );
+          },
+        }),
+        memory_graph_extract_status: tool({
+          description:
+            "Inspect a durable graph extraction job. Queued or lease-recovering work is resumed by this plugin worker without creating a duplicate job.",
+          args: {
+            job_id: tool.schema.string().min(1).max(128),
+          },
+          async execute(args, context) {
+            const authorization = await graphAuthorization(context.sessionID, context.agent);
+            const response = await native.request<GraphExtractJobStatusResponse>(
+              "graph_extract_job_status",
+              { authorization, job_id: args.job_id },
+              context.abort,
+            );
+            if (
+              response.found &&
+              response.job &&
+              !["completed", "failed", "cancelled"].includes(response.job.state)
+            ) {
+              scheduleGraphJob(response.job.job_id, authorization);
+            }
+            return result("Knowledge graph extraction job", response, {
+              job_id: args.job_id,
+              found: response.found,
+              state: response.job?.state ?? "not_found",
+            });
+          },
+        }),
+        memory_graph_extract_cancel: tool({
+          description:
+            "Cancel a durable graph extraction job. Active provider work stops cooperatively.",
+          args: {
+            job_id: tool.schema.string().min(1).max(128),
+            reason: tool.schema.string().max(512).default("cancelled by user"),
+          },
+          async execute(args, context) {
+            const authorization = await graphAuthorization(context.sessionID, context.agent);
+            const cancelRequest = {
+              authorization,
+              job_id: args.job_id,
+              reason: boundedGraphJobError(args.reason),
+            };
+            let response: GraphExtractCancelResponse;
+            try {
+              response = await native.request<GraphExtractCancelResponse>(
+                "graph_extract_cancel",
+                cancelRequest,
+                context.abort,
+              );
+            } catch (error) {
+              if (!(error instanceof DaemonOutcomeUnknownError)) throw error;
+              const status = await graphJobStatus(args.job_id, authorization, context.abort);
+              if (!status.found || !status.job || status.job.state === "queued") {
+                response = await native.request<GraphExtractCancelResponse>(
+                  "graph_extract_cancel",
+                  cancelRequest,
+                  context.abort,
+                );
+              } else {
+                response = {
+                  job: status.job,
+                  outcome: status.job.cancel_requested
+                    ? "cancel_requested"
+                    : status.job.state === "cancelled"
+                      ? "cancelled"
+                      : "already_terminal",
+                };
+              }
+            }
+            if (response.outcome === "cancel_requested" || response.outcome === "cancelled") {
+              graphAttemptAborts
+                .get(args.job_id)
+                ?.abort(new Error("Graph extraction was cancelled"));
+            }
+            return result("Cancelled knowledge graph extraction", response, {
+              job_id: args.job_id,
+              outcome: response.outcome,
+              state: response.job?.state ?? "not_found",
+            });
+          },
+        }),
+        memory_graph_search: tool({
+          description:
+            "Search source-backed entities and relations in the native project knowledge graph with bounded traversal.",
+          args: {
+            query: tool.schema.string().min(1).max(2_000),
+            limit: tool.schema.number().int().min(1).max(64).default(20),
+            max_depth: tool.schema.number().int().min(0).max(2).default(2),
+            max_fanout: tool.schema.number().int().min(1).max(32).default(32),
+            as_of_ms: tool.schema
+              .number()
+              .int()
+              .min(0)
+              .max(Number.MAX_SAFE_INTEGER)
+              .optional()
+              .describe(
+                "Optional historical instant. Relation validity starts inclusively and ends exclusively.",
+              ),
+          },
+          async execute(args, context) {
+            const authorization = await graphAuthorization(context.sessionID, context.agent);
+            const request = {
+              authorization,
+              query: args.query,
+              ...(args.as_of_ms === undefined
+                ? {}
+                : {
+                    time: {
+                      valid_after_ms: args.as_of_ms,
+                      valid_before_ms: args.as_of_ms,
+                    },
+                  }),
+              max_depth: args.max_depth,
+              max_fanout: args.max_fanout,
+              max_results: args.limit,
+              max_evidence_per_fact: 8,
+            } satisfies GraphSearchRequest;
+            const response = await native.request<GraphSearchResponse>(
+              "graph_search",
+              request,
+              context.abort,
+            );
+            return result("Knowledge graph search", response, {
+              query: args.query,
+              ...(args.as_of_ms === undefined ? {} : { as_of_ms: args.as_of_ms }),
+            });
+          },
+        }),
+        memory_graph_status: tool({
+          description: "Inspect source-visible native knowledge graph counts and last extraction.",
+          args: {},
+          async execute(_args, context) {
+            const authorization = await graphAuthorization(context.sessionID, context.agent);
+            const request = { authorization } satisfies GraphStatusRequest;
+            const response = await native.request<GraphStatusResponse>(
+              "graph_status",
+              request,
+              context.abort,
+            );
+            return result("Knowledge graph status", response, {});
+          },
+        }),
+        memory_graph_export: tool({
+          description:
+            "Export one bounded page of source-visible entities, relations, and provenance from the native knowledge graph.",
+          args: {
+            cursor: tool.schema.string().max(32).optional(),
+            limit: tool.schema.number().int().min(1).max(100).default(50),
+          },
+          async execute(args, context) {
+            const authorization = await graphAuthorization(context.sessionID, context.agent);
+            const request = {
+              authorization,
+              ...(args.cursor === undefined ? {} : { cursor: args.cursor }),
+              page_limit: args.limit,
+            } satisfies GraphExportRequest;
+            const response = await native.request<GraphExportResponse>(
+              "graph_export",
+              request,
+              context.abort,
+            );
+            return result("Knowledge graph export", response, { cursor: args.cursor ?? "0" });
           },
         }),
         memory_search: tool({
@@ -486,6 +1159,10 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .boolean()
               .default(false)
               .describe("Include historical memories replaced by a successor."),
+            include_graph: tool.schema
+              .boolean()
+              .default(false)
+              .describe("Fuse source-backed knowledge-graph memory IDs with normal retrieval."),
           },
           async execute(args, context) {
             session.discardPendingRecall(context.sessionID);
@@ -506,6 +1183,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 min_score: args.min_score,
                 include_stale: args.include_stale,
                 include_superseded: args.include_superseded,
+                include_graph: args.include_graph,
                 track_feedback: settings.feedbackTracking,
               },
               context.abort,
@@ -639,6 +1317,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               context.abort,
             );
             session.invalidateRecall();
+            maintenance.schedule();
             return result("Stored memory", response, {
               id: response.id,
               inserted: response.inserted,
@@ -703,6 +1382,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                   if (signal.aborted) throw new Error("Background memory ingestion was cancelled");
                   for (const warning of response.warnings) session.warnOnce(new Error(warning));
                   session.invalidateRecall();
+                  maintenance.schedule();
                   return response;
                 } catch (error) {
                   if (!signal.aborted) session.warnOnce(error);
@@ -896,6 +1576,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               context.abort,
             );
             session.invalidateRecall();
+            maintenance.schedule();
             return result("Updated memory", response, response);
           },
         }),
@@ -978,6 +1659,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               context.abort,
             );
             session.invalidateRecall();
+            maintenance.schedule();
             return result("Deleted memories", response, response);
           },
         }),
@@ -1109,6 +1791,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               context.abort,
             );
             session.invalidateRecall();
+            maintenance.schedule();
             return result("Imported memory snapshot", response, response);
           },
         }),
@@ -1236,7 +1919,8 @@ export function resolveMemoryPluginOptions(
     throw new Error("memory documentIndexDebounceMs must be between 50 and 60000");
   }
   const optimizeDebounceMs =
-    options.optimizeDebounceMs ?? envNumber("OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS", 5_000);
+    options.optimizeDebounceMs ??
+    envNumber("OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS", DEFAULT_OPTIMIZE_DEBOUNCE_MS);
   if (
     !Number.isFinite(optimizeDebounceMs) ||
     optimizeDebounceMs < 50 ||
@@ -1263,6 +1947,100 @@ export function resolveMemoryPluginOptions(
 
 export function isSupportedDocumentPath(path: string): boolean {
   return /\.(?:pdf|md|markdown|html|htm)$/i.test(path);
+}
+
+function graphCandidatePayload(candidates: GraphExtractionCandidates) {
+  return {
+    entities: candidates.entities.map((candidate) => ({
+      mention: candidate.mention,
+      canonical_hint: candidate.canonical_hint,
+      entity_type: candidate.entity_type,
+      aliases: [...candidate.aliases],
+      evidence: candidate.evidence.map((evidence) => ({
+        source_unit_id: evidence.source_unit_id,
+        quote: evidence.quote,
+        occurrence_index: 0,
+      })),
+      confidence: candidate.confidence,
+    })),
+    relations: candidates.relations.map((candidate) => ({
+      subject_mention: candidate.subject_mention,
+      predicate: candidate.predicate,
+      object_mention: candidate.object_mention,
+      relation_type: candidate.relation_type,
+      ...(parseGraphTime(candidate.valid_at) === undefined
+        ? {}
+        : { valid_at_ms: parseGraphTime(candidate.valid_at) }),
+      ...(parseGraphTime(candidate.invalid_at) === undefined
+        ? {}
+        : { invalid_at_ms: parseGraphTime(candidate.invalid_at) }),
+      evidence: candidate.evidence.map((evidence) => ({
+        source_unit_id: evidence.source_unit_id,
+        quote: evidence.quote,
+        occurrence_index: 0,
+      })),
+      confidence: candidate.confidence,
+    })),
+  };
+}
+
+function parseGraphTime(value: string | null | undefined): number | undefined {
+  if (value === undefined || value === null || value.trim() === "") return undefined;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || !Number.isSafeInteger(parsed)) {
+    throw new Error(`Graph temporal value is invalid: ${value}`);
+  }
+  return parsed;
+}
+
+function asPluginError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function graphAuthorizationKey(authorization: GraphAuthorizationContract): string {
+  return `${authorization.session_scope_key}\0${authorization.agent_scope_key}`;
+}
+
+function graphExtractionJobID(
+  sources: readonly GraphSourceBinding[],
+  provider: GraphProviderIdentity,
+  maxAttempts: number,
+): string {
+  const bindings = sources
+    .map((source) => ({
+      source_memory_id: source.source_memory_id,
+      source_unit_id: source.source_unit_id,
+      content_hash: source.content_hash,
+      extraction_revision: source.extraction_revision,
+      derived_scope: source.derived_scope,
+      origin: source.origin,
+      policy_revision: source.policy_revision,
+      remote_eligible: source.remote_eligible,
+    }))
+    .toSorted((left, right) => left.source_memory_id.localeCompare(right.source_memory_id));
+  const digest = createHash("sha256")
+    .update(JSON.stringify({ bindings, provider, max_attempts: maxAttempts }))
+    .digest("hex");
+  return `job_${digest.slice(0, 32)}`;
+}
+
+function boundedGraphJobError(value: string): string {
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  return [...(normalized || "graph extraction failed")].slice(0, 2_048).join("");
+}
+
+async function graphWorkerDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolveDelay) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolveDelay();
+    };
+    const timer = setTimeout(finish, ms);
+    timer.unref?.();
+    signal.addEventListener("abort", finish, { once: true });
+  });
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {

@@ -311,6 +311,14 @@ impl MemoryState {
         before.saturating_sub(self.retrievals.len())
     }
 
+    pub(crate) fn retrieval_prune_required(&self, now_ms: i64) -> bool {
+        self.retrievals.len() > MAX_RETRIEVALS
+            || self
+                .retrievals
+                .values()
+                .any(|record| now_ms.saturating_sub(record.created_at_ms) > RETRIEVAL_RETENTION_MS)
+    }
+
     fn normalize_relations(&mut self) {
         for metadata in self.records.values_mut() {
             if let Some(sid) = metadata.superseded_by.take() {

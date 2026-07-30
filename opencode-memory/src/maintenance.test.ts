@@ -43,6 +43,78 @@ describe("memory maintenance", () => {
     expect(calls).toBe(1);
   });
 
+  test("uses the same action threshold for index maintenance observations", async () => {
+    const cases = [
+      { completeness: 0.979, expectedCalls: 1 },
+      { completeness: 0.98, expectedCalls: 1 },
+      { completeness: 0.99, expectedCalls: 1 },
+      { completeness: 1, expectedCalls: 0 },
+    ];
+
+    for (const testCase of cases) {
+      let calls = 0;
+      const scheduler = new MemoryMaintenanceScheduler(
+        requester(async () => {
+          calls += 1;
+          return { optimized: true };
+        }),
+        { debounceMs: 50 },
+      );
+      scheduler.observeStatus({
+        indexes: [{ name: "embedding", completeness: testCase.completeness }],
+        pending_upsert_count: 0,
+        pending_delete_count: 0,
+      });
+      await scheduler.flush();
+      await scheduler.dispose();
+
+      expect(calls).toBe(testCase.expectedCalls);
+    }
+  });
+
+  test("schedules maintenance for pending durable journal entries", async () => {
+    for (const field of ["pending_upsert_count", "pending_delete_count"] as const) {
+      let calls = 0;
+      const scheduler = new MemoryMaintenanceScheduler(
+        requester(async () => {
+          calls += 1;
+          return { optimized: true };
+        }),
+        { debounceMs: 50 },
+      );
+      scheduler.observeStatus({
+        indexes: [{ name: "embedding", completeness: 1 }],
+        pending_upsert_count: field === "pending_upsert_count" ? 1 : 0,
+        pending_delete_count: field === "pending_delete_count" ? 1 : 0,
+      });
+      await scheduler.flush();
+      await scheduler.dispose();
+
+      expect(calls).toBe(1);
+    }
+  });
+
+  test("does not schedule maintenance for a not-ready backend", async () => {
+    let calls = 0;
+    const scheduler = new MemoryMaintenanceScheduler(
+      requester(async () => {
+        calls += 1;
+        return { optimized: true };
+      }),
+      { debounceMs: 50 },
+    );
+    scheduler.observeStatus({
+      ready: false,
+      indexes: [{ name: "embedding", completeness: 0.1 }],
+      pending_upsert_count: 1,
+      pending_delete_count: 1,
+    });
+    await scheduler.flush();
+    await scheduler.dispose();
+
+    expect(calls).toBe(0);
+  });
+
   test("dispose cancels a scheduled optimization", async () => {
     let calls = 0;
     const native = requester(async () => {

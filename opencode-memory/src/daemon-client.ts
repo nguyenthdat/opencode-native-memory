@@ -39,14 +39,16 @@ import type {
 } from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
 import type { Response as MemoryResponse } from "./generated/opencode/memory/v1/memory_pb.js";
 import type { ModelResponse } from "./generated/opencode/memory/model/v1/model_pb.js";
+import type { GraphResponse } from "./generated/opencode/memory/graph/v1/graph_pb.js";
 import {
   createProjectRequest,
   decodeMemoryResponse,
+  decodeGraphResponse,
   decodeModelResponse,
   DelimitedFrameDecoder,
   encodeDelimited,
 } from "./protocol.js";
-import type { MemoryMethod, ModelMethod } from "./protocol.js";
+import type { GraphMethod, MemoryMethod, ModelMethod } from "./protocol.js";
 
 const MiB = 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300_000;
@@ -57,7 +59,7 @@ const STARTUP_TIMEOUT_MS = 15_000;
 const START_LOCK_STALE_MS = 30_000;
 const START_LOCK_TIMEOUT_MS = START_LOCK_STALE_MS + STARTUP_TIMEOUT_MS;
 const DAEMON_PROTOCOL_GENERATION = 1;
-const DOMAIN_SCHEMA_GENERATION = 2;
+const DOMAIN_SCHEMA_GENERATION = 4;
 const require = createRequire(import.meta.url);
 const NATIVE_PACKAGES: Partial<Record<string, string>> = {
   "darwin-arm64": "@nguyenthdat/opencode-memory-darwin-arm64",
@@ -78,6 +80,22 @@ const RETRY_SAFE_METHODS = new Set<MemoryMethod>([
   "export",
   "model_profiles",
   "model_switch_status",
+  "graph_extract_prepare",
+  "graph_extract_enqueue",
+  "graph_extract_claim",
+  "graph_extract_renew",
+  "graph_extract_job_status",
+  "graph_extract_cancel",
+  "graph_run_status",
+  "graph_search",
+  "graph_status",
+  "graph_export",
+]);
+const OUTCOME_RECONCILABLE_METHODS = new Set<MemoryMethod>([
+  "graph_extract_enqueue",
+  "graph_extract_claim",
+  "graph_extract_renew",
+  "graph_extract_cancel",
 ]);
 
 export function isRetrySafeMemoryMethod(method: MemoryMethod): boolean {
@@ -219,7 +237,9 @@ class DaemonProjectClient implements NativeMemoryRequester {
             timeoutMs: this.requestTimeoutMs,
             ...(projectRequest.kind === "memory"
               ? { request: projectRequest.request }
-              : { modelRequest: projectRequest.modelRequest }),
+              : projectRequest.kind === "model"
+                ? { modelRequest: projectRequest.modelRequest }
+                : { graphRequest: projectRequest.graphRequest }),
           });
           const pending = this.send(
             { case: "projectCall", value: body },
@@ -236,9 +256,10 @@ class DaemonProjectClient implements NativeMemoryRequester {
           }
           const memoryResponse = response.body.value.response;
           const modelResponse = response.body.value.modelResponse;
-          if (Boolean(memoryResponse) === Boolean(modelResponse)) {
+          const graphResponse = response.body.value.graphResponse;
+          if ([memoryResponse, modelResponse, graphResponse].filter(Boolean).length !== 1) {
             throw new Error(
-              "Native memory daemon project response must contain exactly one domain response",
+              "Native memory daemon project response must contain exactly one memory, model, or graph response",
             );
           }
           if (projectRequest.kind === "memory") {
@@ -250,13 +271,22 @@ class DaemonProjectClient implements NativeMemoryRequester {
             }
             return this.unwrapMemoryResponse<T>(memoryResponse);
           }
-          if (!modelResponse) {
+          if (projectRequest.kind === "model") {
+            if (!modelResponse) {
+              throw new Error("Native memory daemon returned the wrong domain response branch");
+            }
+            if (modelResponse.id !== BigInt(requestId)) {
+              throw new Error("Native memory daemon returned a mismatched model response ID");
+            }
+            return this.unwrapModelResponse<T>(modelResponse, projectRequest.method);
+          }
+          if (!graphResponse) {
             throw new Error("Native memory daemon returned the wrong domain response branch");
           }
-          if (modelResponse.id !== BigInt(requestId)) {
-            throw new Error("Native memory daemon returned a mismatched model response ID");
+          if (graphResponse.id !== BigInt(requestId)) {
+            throw new Error("Native memory daemon returned a mismatched graph response ID");
           }
-          return this.unwrapModelResponse<T>(modelResponse, projectRequest.method);
+          return this.unwrapGraphResponse<T>(graphResponse, projectRequest.method);
         } catch (error) {
           const failure = asError(error);
           const retryableTransport = failure instanceof DaemonTransportError;
@@ -294,7 +324,11 @@ class DaemonProjectClient implements NativeMemoryRequester {
           const ambiguousMutation =
             !rejectedBeforeAdmission &&
             (isAmbiguousFailure(failure) || !(failure instanceof NativeMemoryOperationError));
-          if (!isRetrySafe && dispatched && ambiguousMutation) {
+          if (
+            dispatched &&
+            ambiguousMutation &&
+            (!isRetrySafe || OUTCOME_RECONCILABLE_METHODS.has(method))
+          ) {
             throw new DaemonOutcomeUnknownError(
               `Native memory ${method} may have committed before its response was lost (call_id=${callId})`,
               callId,
@@ -633,6 +667,14 @@ class DaemonProjectClient implements NativeMemoryRequester {
     const decoded = decodeModelResponse(response, method);
     if (!decoded.ok) {
       throw new NativeMemoryOperationError(decoded.error || "Native memory model operation failed");
+    }
+    return decoded.result as T;
+  }
+
+  private unwrapGraphResponse<T>(response: GraphResponse, method: GraphMethod): T {
+    const decoded = decodeGraphResponse(response, method);
+    if (!decoded.ok) {
+      throw new NativeMemoryOperationError(decoded.error || "Native memory graph operation failed");
     }
     return decoded.result as T;
   }

@@ -33,7 +33,7 @@ use crate::rpc::{
 use crate::{EmbeddingConfig, MemoryConfig};
 
 pub const DAEMON_PROTOCOL_GENERATION: u32 = 1;
-pub const DOMAIN_SCHEMA_GENERATION: u32 = 2;
+pub const DOMAIN_SCHEMA_GENERATION: u32 = 4;
 const MAX_SESSIONS: usize = 64;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_OUTSTANDING_CALLS_PER_CONNECTION: usize = 32;
@@ -43,6 +43,7 @@ const HEARTBEAT_INTERVAL_SECONDS: u32 = 10;
 const LEASE_TTL_SECONDS: u32 = 30;
 const DEFAULT_PROJECT_IDLE_SECONDS: u64 = 5 * 60;
 const DEFAULT_DAEMON_IDLE_SECONDS: u64 = 10 * 60;
+const DEFAULT_MAINTENANCE_INTERVAL_SECONDS: u64 = 5 * 60;
 const MAX_CALL_TIMEOUT_MS: u32 = 2 * 60 * 60 * 1_000;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -203,6 +204,10 @@ async fn run_async(endpoint: PathBuf) -> Result<()> {
         "OPENCODE_MEMORY_DAEMON_IDLE_SECONDS",
         DEFAULT_DAEMON_IDLE_SECONDS,
     );
+    let maintenance_interval = configured_duration(
+        "OPENCODE_MEMORY_MAINTENANCE_INTERVAL_SECONDS",
+        DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    );
     let mut maintenance = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -238,6 +243,9 @@ async fn run_async(endpoint: PathBuf) -> Result<()> {
             }
             _ = maintenance.tick() => {
                 state.expire_sessions();
+                if !state.drain_requested.load(Ordering::Acquire) {
+                    state.registry.schedule_maintenance(maintenance_interval);
+                }
                 state.registry.evict_idle(project_idle).await;
                 if state.drain_requested.load(Ordering::Acquire) && !state.is_busy() {
                     let not_before = *state
@@ -797,19 +805,18 @@ fn admit_project_call(
             "project timeout_ms is outside the supported range",
         ));
     }
-    let domain_request = match (request.request, request.model_request) {
-        (Some(request), None) => ProjectRequest::Memory(request),
-        (None, Some(request)) => ProjectRequest::Model(request),
-        (Some(_), Some(_)) => {
+    let domain_request = match (
+        request.request,
+        request.model_request,
+        request.graph_request,
+    ) {
+        (Some(request), None, None) => ProjectRequest::Memory(request),
+        (None, Some(request), None) => ProjectRequest::Model(request),
+        (None, None, Some(request)) => ProjectRequest::Graph(request),
+        _ => {
             return Err(DaemonFailure::new(
                 DaemonStatusCode::InvalidArgument,
-                "project call must contain exactly one memory or model request",
-            ));
-        }
-        (None, None) => {
-            return Err(DaemonFailure::new(
-                DaemonStatusCode::InvalidArgument,
-                "project call must contain exactly one memory or model request",
+                "project call must contain exactly one memory, model, or graph request",
             ));
         }
     };
@@ -887,9 +894,15 @@ async fn execute_project_call(
     state: &DaemonState,
     admitted: AdmittedProjectCall,
 ) -> DaemonResult<ProjectCallResponse> {
-    let (request_id, expects_memory_response) = match &admitted.domain_request {
-        ProjectRequest::Memory(request) => (request.id, true),
-        ProjectRequest::Model(request) => (request.id, false),
+    enum Domain {
+        Memory,
+        Model,
+        Graph,
+    }
+    let (request_id, domain) = match &admitted.domain_request {
+        ProjectRequest::Memory(request) => (request.id, Domain::Memory),
+        ProjectRequest::Model(request) => (request.id, Domain::Model),
+        ProjectRequest::Graph(request) => (request.id, Domain::Graph),
     };
     let response = admitted
         .actor
@@ -912,7 +925,7 @@ async fn execute_project_call(
         DaemonFailure::new(code, message)
     })?;
     match response {
-        ProjectResponse::Memory(response) if expects_memory_response => {
+        ProjectResponse::Memory(response) if matches!(domain, Domain::Memory) => {
             if response.id != request_id {
                 return Err(DaemonFailure::new(
                     DaemonStatusCode::Internal,
@@ -923,9 +936,10 @@ async fn execute_project_call(
                 call_id: admitted.call_id,
                 response: Some(response),
                 model_response: None,
+                graph_response: None,
             })
         }
-        ProjectResponse::Model(response) if !expects_memory_response => {
+        ProjectResponse::Model(response) if matches!(domain, Domain::Model) => {
             if response.id != request_id {
                 return Err(DaemonFailure::new(
                     DaemonStatusCode::Internal,
@@ -936,6 +950,21 @@ async fn execute_project_call(
                 call_id: admitted.call_id,
                 response: None,
                 model_response: Some(response),
+                graph_response: None,
+            })
+        }
+        ProjectResponse::Graph(response) if matches!(domain, Domain::Graph) => {
+            if response.id != request_id {
+                return Err(DaemonFailure::new(
+                    DaemonStatusCode::Internal,
+                    "graph response id does not match the admitted request",
+                ));
+            }
+            Ok(ProjectCallResponse {
+                call_id: admitted.call_id,
+                response: None,
+                model_response: None,
+                graph_response: Some(response),
             })
         }
         _ => Err(DaemonFailure::new(
@@ -1185,6 +1214,15 @@ fn capabilities() -> Vec<String> {
         "no-mutation-replay".to_string(),
         "model-profile-catalog-v1".to_string(),
         "model-switch-preflight-v1".to_string(),
+        "knowledge-graph-v1".to_string(),
+        "graph-extraction-prepare-v1".to_string(),
+        "graph-idempotent-upsert-v1".to_string(),
+        "graph-run-receipts-v1".to_string(),
+        "graph-search-v1".to_string(),
+        "graph-export-v1".to_string(),
+        "graph-rrf-fusion-v1".to_string(),
+        "graph-durable-extraction-jobs-v1".to_string(),
+        "daemon-periodic-optimize-v1".to_string(),
     ]
 }
 
@@ -1360,6 +1398,7 @@ mod tests {
             timeout_ms: 1_000,
             request,
             model_request,
+            graph_request: None,
         }
     }
 

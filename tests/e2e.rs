@@ -89,6 +89,7 @@ fn stores_recalls_and_forgets_project_memory() {
             include_stale: false,
             include_superseded: false,
             track_feedback: true,
+            include_graph: false,
         })
         .expect("search memories");
     assert_eq!(
@@ -122,6 +123,7 @@ fn stores_recalls_and_forgets_project_memory() {
             include_stale: false,
             include_superseded: false,
             track_feedback: true,
+            include_graph: false,
         })
         .expect("search feedback candidates");
     assert!(feedback_search.memories.len() >= 2);

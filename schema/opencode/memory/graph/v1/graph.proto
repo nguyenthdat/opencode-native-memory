@@ -1,0 +1,485 @@
+syntax = "proto3";
+
+package opencode.memory.graph.v1;
+
+enum GraphStatusCode {
+  GRAPH_STATUS_CODE_UNSPECIFIED = 0;
+  GRAPH_STATUS_CODE_OK = 1;
+  GRAPH_STATUS_CODE_INVALID_ARGUMENT = 2;
+  GRAPH_STATUS_CODE_FAILED_PRECONDITION = 3;
+  GRAPH_STATUS_CODE_NOT_FOUND = 4;
+  GRAPH_STATUS_CODE_ALREADY_EXISTS = 5;
+  GRAPH_STATUS_CODE_RESOURCE_EXHAUSTED = 6;
+  GRAPH_STATUS_CODE_UNAVAILABLE = 7;
+  GRAPH_STATUS_CODE_INTERNAL = 8;
+}
+
+message GraphOperationStatus {
+  GraphStatusCode code = 1;
+  string message = 2;
+}
+
+message GraphAuthorization {
+  string session_scope_key = 1; // required
+  string agent_scope_key = 2; // required
+}
+
+message GraphScopeFilter {
+  optional string memory_scope = 1;
+  optional string verified_scope_key = 2;
+}
+
+message GraphDerivedScope {
+  string project_id = 1;
+  string memory_scope = 2;
+  string verified_scope_key = 3;
+}
+
+message GraphSourceBinding {
+  string source_memory_id = 1; // required
+  string source_unit_id = 2; // required
+  string content_hash = 3; // required
+  string extraction_revision = 4; // required
+  GraphDerivedScope derived_scope = 5; // required
+  string origin = 6;
+  string policy_revision = 7; // required
+  bool remote_eligible = 8;
+}
+
+message GraphExtractionUnit {
+  GraphSourceBinding source = 1; // required
+  string text = 2;
+  optional string remote_ineligible_reason = 3;
+}
+
+message GraphRejectedSource {
+  string source_memory_id = 1;
+  string code = 2;
+  string message = 3;
+}
+
+message GraphProviderIdentity {
+  string provider_id = 1; // required
+  string model_id = 2; // required
+  string extractor_version = 3; // required
+  string prompt_version = 4; // required
+  string schema_version = 5; // required
+  optional string variant = 6;
+}
+
+message GraphCandidateEvidence {
+  string source_unit_id = 1; // required
+  string quote = 2; // required
+  optional uint32 utf8_start = 3;
+  optional uint32 utf8_end = 4;
+  uint32 occurrence_index = 5;
+}
+
+message GraphEntityCandidate {
+  string mention = 1; // required
+  string canonical_hint = 2;
+  string entity_type = 3; // required
+  repeated string aliases = 4;
+  repeated GraphCandidateEvidence evidence = 5;
+  double confidence = 6;
+}
+
+message GraphRelationCandidate {
+  string subject_mention = 1; // required
+  string predicate = 2; // required
+  string object_mention = 3; // required
+  string relation_type = 4; // required
+  optional uint64 valid_at_ms = 5;
+  optional uint64 invalid_at_ms = 6;
+  repeated GraphCandidateEvidence evidence = 7;
+  double confidence = 8;
+}
+
+message GraphRunReceipt {
+  string extraction_run_id = 1;
+  string idempotency_digest = 2;
+  string outcome = 3;
+  uint64 committed_at_ms = 4;
+  uint64 source_count = 5;
+  uint64 accepted_entity_count = 6;
+  uint64 accepted_relation_count = 7;
+  uint64 rejected_candidate_count = 8;
+  uint64 conflict_count = 9;
+  uint64 warning_count = 10;
+  bool terminal = 11;
+}
+
+message GraphAcceptedEntity {
+  uint32 candidate_index = 1;
+  string entity_id = 2;
+  string canonical_name = 3;
+  string entity_type = 4;
+  GraphDerivedScope derived_scope = 5;
+  repeated GraphCandidateEvidence evidence = 6;
+}
+
+message GraphAcceptedRelation {
+  uint32 candidate_index = 1;
+  string relation_id = 2;
+  string subject_entity_id = 3;
+  string predicate = 4;
+  string object_entity_id = 5;
+  string relation_type = 6;
+  GraphDerivedScope derived_scope = 7;
+  repeated GraphCandidateEvidence evidence = 8;
+}
+
+message GraphRejectedCandidate {
+  string candidate_kind = 1;
+  uint32 candidate_index = 2;
+  string code = 3;
+  string message = 4;
+}
+
+message GraphCandidateConflict {
+  string candidate_kind = 1;
+  uint32 candidate_index = 2;
+  string existing_id = 3;
+  string code = 4;
+  string message = 5;
+}
+
+message GraphEvidenceProvenance {
+  string source_memory_id = 1;
+  string source_unit_id = 2;
+  string content_hash = 3;
+  string extraction_revision = 4;
+  GraphDerivedScope derived_scope = 5;
+  repeated GraphCandidateEvidence evidence = 6;
+}
+
+message GraphEntity {
+  string entity_id = 1;
+  string canonical_name = 2;
+  string entity_type = 3;
+  repeated string aliases = 4;
+  GraphDerivedScope derived_scope = 5;
+  uint64 first_seen_at_ms = 6;
+  uint64 last_seen_at_ms = 7;
+  uint64 source_count = 8;
+}
+
+message GraphRelation {
+  string relation_id = 1;
+  string subject_entity_id = 2;
+  string predicate = 3;
+  string object_entity_id = 4;
+  string relation_type = 5;
+  optional uint64 valid_at_ms = 6;
+  optional uint64 invalid_at_ms = 7;
+  uint64 created_at_ms = 8;
+  uint64 extracted_at_ms = 9;
+  double confidence = 10;
+  string status = 11;
+  repeated string source_memory_ids = 12;
+  repeated GraphCandidateEvidence evidence = 13;
+  string extractor_version = 14;
+  GraphDerivedScope derived_scope = 15;
+}
+
+message GraphScoreComponent {
+  string name = 1;
+  double value = 2;
+}
+
+message GraphMemorySearchResult {
+  string source_memory_id = 1;
+  double score = 2;
+  repeated GraphEvidenceProvenance provenance = 3;
+  repeated GraphScoreComponent score_trace = 4;
+}
+
+message GraphEntitySearchResult {
+  GraphEntity entity = 1;
+  double score = 2;
+  repeated GraphEvidenceProvenance provenance = 3;
+  repeated GraphScoreComponent score_trace = 4;
+}
+
+message GraphRelationSearchResult {
+  GraphRelation relation = 1;
+  double score = 2;
+  repeated GraphEvidenceProvenance provenance = 3;
+  repeated GraphScoreComponent score_trace = 4;
+}
+
+message GraphLastExtraction {
+  string extraction_run_id = 1;
+  uint64 completed_at_ms = 2;
+  uint64 source_count = 3;
+}
+
+message GraphExportProvenance {
+  string fact_kind = 1;
+  string fact_id = 2;
+  repeated GraphEvidenceProvenance sources = 3;
+}
+
+message GraphExtractPrepareRequest {
+  GraphAuthorization authorization = 1; // required
+  repeated string source_memory_ids = 2;
+  uint32 max_units = 3;
+  uint32 max_unit_text_bytes = 4;
+  uint32 max_total_text_bytes = 5;
+}
+
+message GraphExtractPrepareResponse {
+  uint64 requested_source_count = 1;
+  repeated GraphExtractionUnit units = 2;
+  repeated GraphRejectedSource rejected_sources = 3;
+  repeated string warnings = 4;
+}
+
+message GraphUpsertCandidatesRequest {
+  GraphAuthorization authorization = 1; // required
+  string extraction_run_id = 2; // required
+  repeated GraphSourceBinding sources = 3;
+  GraphProviderIdentity provider = 4; // required
+  repeated GraphEntityCandidate entities = 5;
+  repeated GraphRelationCandidate relations = 6;
+}
+
+message GraphUpsertCandidatesResponse {
+  GraphRunReceipt receipt = 1; // required
+  repeated GraphAcceptedEntity accepted_entities = 2;
+  repeated GraphAcceptedRelation accepted_relations = 3;
+  repeated GraphRejectedCandidate rejected_candidates = 4;
+  repeated GraphCandidateConflict conflicts = 5;
+  repeated string warnings = 6;
+}
+
+enum GraphExtractionJobState {
+  GRAPH_EXTRACTION_JOB_STATE_UNSPECIFIED = 0;
+  GRAPH_EXTRACTION_JOB_STATE_QUEUED = 1;
+  GRAPH_EXTRACTION_JOB_STATE_CLAIMED = 2;
+  GRAPH_EXTRACTION_JOB_STATE_RUNNING = 3;
+  GRAPH_EXTRACTION_JOB_STATE_COMPLETED = 4;
+  GRAPH_EXTRACTION_JOB_STATE_FAILED = 5;
+  GRAPH_EXTRACTION_JOB_STATE_CANCELLED = 6;
+}
+
+enum GraphExtractFinishOutcome {
+  GRAPH_EXTRACT_FINISH_OUTCOME_UNSPECIFIED = 0;
+  GRAPH_EXTRACT_FINISH_OUTCOME_COMPLETED = 1;
+  GRAPH_EXTRACT_FINISH_OUTCOME_RETRYABLE_FAILURE = 2;
+  GRAPH_EXTRACT_FINISH_OUTCOME_PERMANENT_FAILURE = 3;
+}
+
+message GraphExtractionJob {
+  string job_id = 1;
+  string idempotency_digest = 2;
+  GraphExtractionJobState state = 3;
+  repeated GraphSourceBinding sources = 4;
+  GraphProviderIdentity provider = 5;
+  uint32 attempt_count = 6;
+  uint32 max_attempts = 7;
+  uint64 created_at_ms = 8;
+  uint64 updated_at_ms = 9;
+  optional uint64 lease_expires_at_ms = 10;
+  string extraction_run_id = 11;
+  optional uint64 next_attempt_at_ms = 12;
+  bool cancel_requested = 13;
+  string error_code = 14;
+  string error_message = 15;
+  uint32 max_unit_text_bytes = 16;
+  uint32 max_total_text_bytes = 17;
+}
+
+message GraphExtractEnqueueRequest {
+  GraphAuthorization authorization = 1; // required
+  string job_id = 2; // idempotency key, required
+  repeated string source_memory_ids = 3;
+  GraphProviderIdentity provider = 4; // required
+  uint32 max_attempts = 5;
+  uint32 max_unit_text_bytes = 6;
+  uint32 max_total_text_bytes = 7;
+}
+
+message GraphExtractEnqueueResponse {
+  GraphExtractionJob job = 1; // required
+  bool existing = 2;
+  repeated GraphRejectedSource rejected_sources = 3;
+  repeated string warnings = 4;
+}
+
+message GraphExtractClaimRequest {
+  GraphAuthorization authorization = 1; // required
+  string claim_request_id = 2; // idempotency key, required
+  string worker_id = 3; // required
+  optional string job_id = 4;
+  uint32 lease_ttl_ms = 5;
+}
+
+message GraphExtractClaimResponse {
+  bool found = 1;
+  optional GraphExtractionJob job = 2;
+  string lease_token = 3;
+  repeated GraphExtractionUnit units = 4;
+  repeated GraphRejectedSource rejected_sources = 5;
+  repeated string warnings = 6;
+}
+
+message GraphExtractRenewRequest {
+  GraphAuthorization authorization = 1; // required
+  string job_id = 2; // required
+  string lease_token = 3; // required
+  uint32 lease_ttl_ms = 4;
+}
+
+message GraphExtractRenewResponse {
+  GraphExtractionJob job = 1; // required
+  uint64 lease_expires_at_ms = 2;
+  bool cancel_requested = 3;
+}
+
+message GraphExtractFinishRequest {
+  GraphAuthorization authorization = 1; // required
+  string job_id = 2; // required
+  string lease_token = 3; // required
+  string extraction_run_id = 4; // required
+  GraphExtractFinishOutcome outcome = 5;
+  repeated GraphEntityCandidate entities = 6;
+  repeated GraphRelationCandidate relations = 7;
+  string error_code = 8;
+  string error_message = 9;
+}
+
+message GraphExtractFinishResponse {
+  GraphExtractionJob job = 1; // required
+  optional GraphUpsertCandidatesResponse upsert = 2;
+  repeated string warnings = 3;
+}
+
+message GraphExtractJobStatusRequest {
+  GraphAuthorization authorization = 1; // required
+  string job_id = 2; // required
+}
+
+message GraphExtractJobStatusResponse {
+  bool found = 1;
+  optional GraphExtractionJob job = 2;
+}
+
+message GraphExtractCancelRequest {
+  GraphAuthorization authorization = 1; // required
+  string job_id = 2; // required
+  string reason = 3;
+}
+
+message GraphExtractCancelResponse {
+  GraphExtractionJob job = 1; // required
+  string outcome = 2;
+}
+
+message GraphRunStatusRequest {
+  GraphAuthorization authorization = 1; // required
+  string extraction_run_id = 2; // required
+}
+
+message GraphRunStatusResponse {
+  bool found = 1;
+  optional GraphRunReceipt receipt = 2;
+}
+
+message GraphTimeFilter {
+  // Inclusive lower bound on valid_at_ms. When equal to valid_before_ms, the
+  // pair is an exact as-of instant: valid_at_ms is inclusive and invalid_at_ms
+  // is exclusive. Without an exact as-of pair, current validity is required.
+  optional uint64 valid_after_ms = 1;
+  // Inclusive upper bound on valid_at_ms, or the exact as-of instant when it
+  // equals valid_after_ms.
+  optional uint64 valid_before_ms = 2;
+  // Inclusive extraction-time bounds.
+  optional uint64 extracted_after_ms = 3;
+  optional uint64 extracted_before_ms = 4;
+}
+
+message GraphSearchRequest {
+  GraphAuthorization authorization = 1; // required
+  string query = 2; // required
+  optional GraphScopeFilter scope = 3;
+  optional GraphTimeFilter time = 4;
+  uint32 max_depth = 5;
+  uint32 max_fanout = 6;
+  uint32 max_results = 7;
+  uint32 max_evidence_per_fact = 8;
+}
+
+message GraphSearchResponse {
+  repeated GraphMemorySearchResult memories = 1;
+  repeated GraphEntitySearchResult entities = 2;
+  repeated GraphRelationSearchResult relations = 3;
+  uint64 eligible_source_count = 4;
+  bool truncated = 5;
+}
+
+message GraphStatusRequest {
+  GraphAuthorization authorization = 1; // required
+  optional GraphScopeFilter scope = 2;
+}
+
+message GraphStatusResponse {
+  string schema_version = 1;
+  uint64 entity_count = 2;
+  uint64 relation_count = 3;
+  uint64 pending_job_count = 4;
+  optional GraphLastExtraction last_extraction = 5;
+}
+
+message GraphExportRequest {
+  GraphAuthorization authorization = 1; // required
+  optional GraphScopeFilter scope = 2;
+  optional string cursor = 3;
+  uint32 page_limit = 4;
+}
+
+message GraphExportResponse {
+  string schema_version = 1;
+  repeated GraphEntity entities = 2;
+  repeated GraphRelation relations = 3;
+  repeated GraphExportProvenance provenance = 4;
+  optional string next_cursor = 5;
+  bool complete = 6;
+}
+
+message GraphRequest {
+  uint64 id = 1;
+  oneof operation {
+    GraphExtractPrepareRequest extract_prepare = 10;
+    GraphUpsertCandidatesRequest upsert_candidates = 11;
+    GraphRunStatusRequest run_status = 12;
+    GraphSearchRequest search = 13;
+    GraphStatusRequest status = 14;
+    GraphExportRequest export = 15;
+    GraphExtractEnqueueRequest extract_enqueue = 16;
+    GraphExtractClaimRequest extract_claim = 17;
+    GraphExtractRenewRequest extract_renew = 18;
+    GraphExtractFinishRequest extract_finish = 19;
+    GraphExtractJobStatusRequest extract_job_status = 20;
+    GraphExtractCancelRequest extract_cancel = 21;
+  }
+}
+
+message GraphResponse {
+  uint64 id = 1;
+  GraphOperationStatus status = 2;
+  oneof result {
+    GraphExtractPrepareResponse extract_prepare = 10;
+    GraphUpsertCandidatesResponse upsert_candidates = 11;
+    GraphRunStatusResponse run_status = 12;
+    GraphSearchResponse search = 13;
+    GraphStatusResponse graph_status = 14;
+    GraphExportResponse export = 15;
+    GraphExtractEnqueueResponse extract_enqueue = 16;
+    GraphExtractClaimResponse extract_claim = 17;
+    GraphExtractRenewResponse extract_renew = 18;
+    GraphExtractFinishResponse extract_finish = 19;
+    GraphExtractJobStatusResponse extract_job_status = 20;
+    GraphExtractCancelResponse extract_cancel = 21;
+  }
+}

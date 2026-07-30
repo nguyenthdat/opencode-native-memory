@@ -48,6 +48,12 @@ Use `memory_index_documents` for project-wide supported documents and `memory_in
 
 `memory_ingest` is asynchronous. It returns a `job_id` immediately so the agent does not block the task. For one or more submitted documents, call `memory_ingest_status` with their exact job IDs and wait for `succeeded` before relying on their contents. Handle `failed` explicitly; a job ID expiring does not undo already persisted memory. Multiple ingestion jobs are processed in order by one writer-safe worker.
 
+## Knowledge Graph
+
+Graph extraction is explicit provider egress, not part of ordinary document indexing. Call `memory_graph_extract` only when the user requests graph extraction or explicitly approves building source-backed entities and relations from selected memory IDs. The tool asks permission before enqueueing durable provider work and returns a job ID; use `memory_graph_extract_status` to inspect/resume it and `memory_graph_extract_cancel` to stop it cooperatively. Use `dry_run=true` when the user wants to review candidates without creating a durable job.
+
+Repository-scoped, code-backed, secret-like, and prompt-injection-shaped sources are blocked from remote extraction by default. Do not work around that policy by copying their text into a new memory. Use `memory_graph_search` for graph-specific entity/relation traversal, or `memory_search(include_graph=true)` for rank-fused source memories. Use `memory_graph_status` for counts and `memory_graph_export` for auditable provenance. Every graph result is derived evidence; inspect its source memory before relying on it.
+
 ## Capture Durable Memory
 
 Store one atomic observation at a time. Good project candidates are a verified decision, stable fact, repeatable fix pattern, tested gotcha, team convention, or durable workflow preference. Treat the MCP entity-relation-observation model as follows: named people, organizations, projects, and significant events are entities in the observation text; active-voice relationship facts use `user_relationship`; corrections use `memory_update` so lifecycle history records supersession instead of silently duplicating the old fact.

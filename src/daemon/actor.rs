@@ -1,6 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -58,6 +58,18 @@ struct CommandPermit {
     pending_commands: Arc<AtomicUsize>,
 }
 
+struct MaintenancePermit {
+    pending_commands: Arc<AtomicUsize>,
+    maintenance_queued: Arc<AtomicBool>,
+}
+
+impl Drop for MaintenancePermit {
+    fn drop(&mut self) {
+        self.pending_commands.fetch_sub(1, Ordering::AcqRel);
+        self.maintenance_queued.store(false, Ordering::Release);
+    }
+}
+
 impl Drop for CommandPermit {
     fn drop(&mut self) {
         self.pending_commands.fetch_sub(1, Ordering::AcqRel);
@@ -86,11 +98,14 @@ enum ActorState {
 
 enum ActorCommand {
     Call {
-        request: ProjectRequest,
+        request: Box<ProjectRequest>,
         deadline: Instant,
         command_permit: CommandPermit,
         call_state: Arc<AtomicU8>,
         reply: oneshot::Sender<Result<ProjectResponse, String>>,
+    },
+    Maintenance {
+        permit: MaintenancePermit,
     },
     Stop,
 }
@@ -113,6 +128,9 @@ pub(crate) struct ProjectActor {
     leases: AtomicUsize,
     active_commands: AtomicUsize,
     pending_commands: Arc<AtomicUsize>,
+    engine_initialized: AtomicBool,
+    maintenance_queued: Arc<AtomicBool>,
+    last_maintenance_attempt: Mutex<Option<Instant>>,
     failure: Mutex<Option<String>>,
     queued_bytes: Arc<AtomicUsize>,
     global_queued_bytes: Arc<AtomicUsize>,
@@ -143,6 +161,9 @@ impl ProjectActor {
             leases: AtomicUsize::new(0),
             active_commands: AtomicUsize::new(0),
             pending_commands: Arc::new(AtomicUsize::new(0)),
+            engine_initialized: AtomicBool::new(false),
+            maintenance_queued: Arc::new(AtomicBool::new(false)),
+            last_maintenance_attempt: Mutex::new(None),
             failure: Mutex::new(None),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             global_queued_bytes,
@@ -173,7 +194,17 @@ impl ProjectActor {
                             reply,
                         } => {
                             let is_memory_request =
-                                matches!(&request, ProjectRequest::Memory(_));
+                                matches!(request.as_ref(), ProjectRequest::Memory(_));
+                            let is_optimize_request = matches!(
+                                request.as_ref(),
+                                ProjectRequest::Memory(request)
+                                    if request.method
+                                        == crate::memory_proto::Method::Optimize as i32
+                            );
+                            let initializes_engine = matches!(
+                                request.as_ref(),
+                                ProjectRequest::Memory(_) | ProjectRequest::Graph(_)
+                            );
                             actor_for_thread
                                 .active_commands
                                 .fetch_add(1, Ordering::AcqRel);
@@ -254,8 +285,27 @@ impl ProjectActor {
                                 continue;
                             }
                             let handled = catch_unwind(AssertUnwindSafe(|| {
-                                service.handle_project(request)
+                                service.handle_project(*request)
                             }));
+                            if initializes_engine && matches!(&handled, Ok(Ok(_))) {
+                                let was_initialized = actor_for_thread
+                                    .engine_initialized
+                                    .swap(true, Ordering::AcqRel);
+                                if !was_initialized {
+                                    *actor_for_thread
+                                        .last_maintenance_attempt
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(Instant::now());
+                                }
+                            }
+                            if is_optimize_request {
+                                *actor_for_thread
+                                    .last_maintenance_attempt
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(Instant::now());
+                            }
                             actor_for_thread.touch();
                             actor_for_thread
                                 .active_commands
@@ -288,6 +338,44 @@ impl ProjectActor {
                                         state_sender.send(ActorState::Failed(message.to_string()));
                                     break;
                                 }
+                            }
+                        }
+                        ActorCommand::Maintenance { permit } => {
+                            actor_for_thread
+                                .active_commands
+                                .fetch_add(1, Ordering::AcqRel);
+                            let should_run = actor_for_thread.lease_count() > 0
+                                && actor_for_thread.engine_initialized.load(Ordering::Acquire)
+                                && !actor_for_thread.is_draining();
+                            let handled = should_run.then(|| {
+                                *actor_for_thread
+                                    .last_maintenance_attempt
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(Instant::now());
+                                catch_unwind(AssertUnwindSafe(|| {
+                                    service.run_maintenance().map(|_| ())
+                                }))
+                            });
+                            actor_for_thread
+                                .active_commands
+                                .fetch_sub(1, Ordering::AcqRel);
+                            drop(permit);
+                            match handled {
+                                Some(Ok(Err(error))) => {
+                                    eprintln!(
+                                        "native memory project maintenance failed for {}: {error:#}",
+                                        actor_for_thread.store_key.display()
+                                    );
+                                }
+                                Some(Err(_)) => {
+                                    let message = "project actor panicked while executing maintenance";
+                                    actor_for_thread.record_failure(message.to_string());
+                                    let _ =
+                                        state_sender.send(ActorState::Failed(message.to_string()));
+                                    break;
+                                }
+                                Some(Ok(Ok(()))) | None => {}
                             }
                         }
                         ActorCommand::Stop => break,
@@ -329,6 +417,45 @@ impl ProjectActor {
     pub(crate) fn has_work(&self) -> bool {
         self.pending_commands.load(Ordering::Acquire) > 0
             || self.active_commands.load(Ordering::Acquire) > 0
+    }
+
+    pub(crate) fn enqueue_maintenance(&self, interval: Duration) -> bool {
+        if self.lease_count() == 0
+            || !self.engine_initialized.load(Ordering::Acquire)
+            || self.has_work()
+        {
+            return false;
+        }
+        let accepting = self
+            .accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*accepting
+            || self.lease_count() == 0
+            || !self.engine_initialized.load(Ordering::Acquire)
+            || self.has_work()
+            || self
+                .last_maintenance_attempt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some_and(|last| last.elapsed() < interval)
+            || self
+                .maintenance_queued
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+
+        self.pending_commands.fetch_add(1, Ordering::AcqRel);
+        self.sender
+            .try_send(ActorCommand::Maintenance {
+                permit: MaintenancePermit {
+                    pending_commands: Arc::clone(&self.pending_commands),
+                    maintenance_queued: Arc::clone(&self.maintenance_queued),
+                },
+            })
+            .is_ok()
     }
 
     pub(crate) fn is_draining(&self) -> bool {
@@ -412,6 +539,7 @@ impl ProjectActor {
         let encoded_len = match &request {
             ProjectRequest::Memory(request) => request.encoded_len(),
             ProjectRequest::Model(request) => request.encoded_len(),
+            ProjectRequest::Graph(request) => request.encoded_len(),
         };
         let queue_permit = match QueuePermit::reserve(
             Arc::clone(&self.queued_bytes),
@@ -436,7 +564,7 @@ impl ProjectActor {
             }
             self.pending_commands.fetch_add(1, Ordering::AcqRel);
             let command = ActorCommand::Call {
-                request,
+                request: Box::new(request),
                 deadline,
                 command_permit: CommandPermit {
                     _queue: queue_permit,
@@ -500,4 +628,85 @@ impl ProjectActor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_is_actor_owned_and_coalesced() {
+        let (sender, mut receiver) = mpsc::channel(PROJECT_QUEUE_CAPACITY);
+        let (state_sender, state) = watch::channel(ActorState::Ready);
+        let actor = ProjectActor {
+            store_key: PathBuf::from("/tmp/maintenance-test"),
+            fingerprint: "maintenance-test".to_string(),
+            sender,
+            state,
+            state_sender,
+            accepting: Mutex::new(true),
+            leases: AtomicUsize::new(1),
+            active_commands: AtomicUsize::new(0),
+            pending_commands: Arc::new(AtomicUsize::new(0)),
+            engine_initialized: AtomicBool::new(true),
+            maintenance_queued: Arc::new(AtomicBool::new(false)),
+            last_maintenance_attempt: Mutex::new(None),
+            failure: Mutex::new(None),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            global_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            global_queue_limit: AGGREGATE_TEST_QUEUE_BYTES,
+            last_activity: Mutex::new(Instant::now()),
+            worker: Mutex::new(None),
+        };
+
+        assert!(actor.enqueue_maintenance(Duration::ZERO));
+        assert!(!actor.enqueue_maintenance(Duration::ZERO));
+        assert_eq!(actor.pending_commands.load(Ordering::Acquire), 1);
+
+        let command = receiver.try_recv().expect("maintenance command");
+        assert!(matches!(&command, ActorCommand::Maintenance { .. }));
+        drop(command);
+        assert_eq!(actor.pending_commands.load(Ordering::Acquire), 0);
+        assert!(!actor.maintenance_queued.load(Ordering::Acquire));
+        *actor
+            .last_maintenance_attempt
+            .lock()
+            .expect("maintenance timestamp lock") = Some(Instant::now());
+        assert!(!actor.enqueue_maintenance(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn maintenance_skips_inactive_or_lazy_actors() {
+        let (sender, mut receiver) = mpsc::channel(PROJECT_QUEUE_CAPACITY);
+        let (state_sender, state) = watch::channel(ActorState::Ready);
+        let actor = ProjectActor {
+            store_key: PathBuf::from("/tmp/maintenance-test"),
+            fingerprint: "maintenance-test".to_string(),
+            sender,
+            state,
+            state_sender,
+            accepting: Mutex::new(true),
+            leases: AtomicUsize::new(0),
+            active_commands: AtomicUsize::new(0),
+            pending_commands: Arc::new(AtomicUsize::new(0)),
+            engine_initialized: AtomicBool::new(false),
+            maintenance_queued: Arc::new(AtomicBool::new(false)),
+            last_maintenance_attempt: Mutex::new(None),
+            failure: Mutex::new(None),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            global_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            global_queue_limit: AGGREGATE_TEST_QUEUE_BYTES,
+            last_activity: Mutex::new(Instant::now()),
+            worker: Mutex::new(None),
+        };
+
+        actor.engine_initialized.store(true, Ordering::Release);
+        assert!(!actor.enqueue_maintenance(Duration::ZERO));
+        actor.engine_initialized.store(false, Ordering::Release);
+        actor.leases.store(1, Ordering::Release);
+        assert!(!actor.enqueue_maintenance(Duration::ZERO));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    const AGGREGATE_TEST_QUEUE_BYTES: usize = PROJECT_QUEUE_BYTES * 2;
 }

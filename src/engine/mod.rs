@@ -1,3 +1,4 @@
+mod knowledge_graph;
 mod retrieval;
 
 use std::cmp::Reverse;
@@ -19,14 +20,17 @@ use crate::contract::{
     GetRequest, ImportRequest, ImportResponse, IndexStatus, IngestRequest, IngestResponse,
     LifecycleResponse, ListRequest, ListResponse, LockRequest, MemoryKind, MemoryOrigin,
     MemoryRecord, MemoryScope, MemorySnapshot, OptimizeResponse, PinRequest, PurgeRequest,
-    PurgeResponse, SharedMemoryRejection, StatusResponse, StoreRequest, StoreResponse,
-    SyncSharedRequest, SyncSharedResponse, TombstoneSnapshot, UpdateRequest, UpdateResponse,
+    PurgeResponse, SearchRequest, SharedMemoryRejection, StatusResponse, StoreRequest,
+    StoreResponse, SyncSharedRequest, SyncSharedResponse, TombstoneSnapshot, UpdateRequest,
+    UpdateResponse,
 };
 use crate::document::{
     ExtractedDocument, extract_inspected_document, inspect_document, split_markdown,
 };
 use crate::document_index::{DocumentIndexManifest, IndexedDocument, discover_documents};
 use crate::embedding::{Embedder, LlamaCppEmbedder};
+use crate::embedding_generation::ActiveEmbedding;
+use crate::graph::GraphStore;
 use crate::lifecycle::{
     default_expiry, default_half_life_days, ensure_delete_allowed, ensure_store_overwrite_allowed,
     expiry_from_days, is_expired, is_prunable_expired, resolve_update,
@@ -56,6 +60,8 @@ pub struct MemoryEngine {
     state: MemoryState,
     document_index: DocumentIndexManifest,
     shared_sync_rejections: Vec<SharedMemoryRejection>,
+    graph: GraphStore,
+    active_embedding: ActiveEmbedding,
     _writer_lock: File,
 }
 
@@ -86,11 +92,19 @@ impl MemoryEngine {
         let writer_lock = zvec::acquire_writer_lock(&config.project_data_dir())?;
         let state = MemoryState::load(&config.state_path())?;
         let document_index = DocumentIndexManifest::load(&config.document_index_path())?;
+        let graph = GraphStore::load(&config.graph_state_path(), &config.graph_pending_path())?;
         let embedder = LlamaCppEmbedder::load(config.embedding(), config.model_cache())?;
         let collection = zvec::open_collection(
             &config,
             embedder.model_id(),
             embedder.dimension(),
+            now_ms()?,
+        )?;
+        let active_embedding = ActiveEmbedding::load_or_initialize(
+            &config,
+            &crate::model::configured_profile_id(config.embedding()),
+            embedder.dimension(),
+            state.generation,
             now_ms()?,
         )?;
 
@@ -102,6 +116,8 @@ impl MemoryEngine {
             state,
             document_index,
             shared_sync_rejections: Vec::new(),
+            graph,
+            active_embedding,
             _writer_lock: writer_lock,
         };
         engine.recover_pending_upserts()?;
@@ -1297,6 +1313,11 @@ impl MemoryEngine {
             request.session_scope_key.as_deref(),
             request.agent_scope_key.as_deref(),
         )?;
+        self.ensure_graph_source_visibility(
+            &request.ids,
+            request.session_scope_key.as_deref(),
+            request.agent_scope_key.as_deref(),
+        )?;
         self.ensure_rpc_mutable(&request.ids)?;
         self.delete_internal(&request.ids, request.tombstone, request.reason)
     }
@@ -1329,6 +1350,8 @@ impl MemoryEngine {
             "project id confirmation does not match the active memory store"
         );
         let deleted = self.collection.stats()?.doc_count;
+        self.graph
+            .purge(&format!("purge:{}", self.config.project_id()))?;
         if deleted > 0 {
             self.collection.delete_by_filter("created_at >= 0")?;
             self.collection.flush()?;
@@ -1575,6 +1598,8 @@ impl MemoryEngine {
             zvec_version: zvec_rust::version().clone(),
             embedding_model: self.embedder.model_id().to_string(),
             embedding_dimension: self.embedder.dimension(),
+            active_profile_id: self.active_embedding.profile_id.clone(),
+            active_generation_id: self.active_embedding.generation_id.clone(),
             project_root: self.config.project_root().display().to_string(),
             project_id: self.config.project_id().to_string(),
             collection_path: self.config.collection_dir().display().to_string(),
@@ -1604,6 +1629,10 @@ impl MemoryEngine {
                 "durable_upsert_journal_v1",
                 "capture_gate_v1",
                 "snapshot_portability_v1",
+                "graph_rrf_fusion_v1",
+                "active_embedding_generation_v1",
+                "embedding_lexical_fallback_v1",
+                "periodic_actor_maintenance_v1",
             ],
         })
     }
@@ -1623,14 +1652,13 @@ impl MemoryEngine {
             .filter(|(_, metadata)| is_prunable_expired(metadata, now))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        let pruned_expired = if expired_ids.is_empty() {
-            0
-        } else {
-            usize::try_from(
-                self.delete_internal(&expired_ids, false, DeleteReason::Obsolete)?
+        let mut pruned_expired = 0;
+        for ids in expired_id_batches(&expired_ids) {
+            pruned_expired += usize::try_from(
+                self.delete_internal(ids, false, DeleteReason::Obsolete)?
                     .deleted,
-            )?
-        };
+            )?;
+        }
         let pruned_retrievals = self.state.prune_retrievals(now);
         self.collection.optimize()?;
         self.collection.flush()?;
@@ -1650,6 +1678,24 @@ impl MemoryEngine {
                 })
                 .collect(),
         })
+    }
+
+    pub(crate) fn needs_maintenance(&self) -> Result<bool> {
+        let now = now_ms()?;
+        Ok(!self.state.pending_upserts.is_empty()
+            || !self.state.pending_deletes.is_empty()
+            || self
+                .state
+                .records
+                .values()
+                .any(|metadata| is_prunable_expired(metadata, now))
+            || self.state.retrieval_prune_required(now)
+            || self
+                .collection
+                .stats()?
+                .indexes
+                .iter()
+                .any(|index| index.completeness < 1.0))
     }
 
     /// Diagnose lifecycle state and code anchors without repairing data.
@@ -1753,6 +1799,7 @@ impl MemoryEngine {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        self.erase_graph_sources(&ids.iter().cloned().collect(), "recover-delete")?;
         let documents = self.fetch_documents(&ids)?;
         let found_ids = documents
             .iter()
@@ -1793,6 +1840,7 @@ impl MemoryEngine {
                     .ok_or_else(|| anyhow!("pending upsert disappeared during recovery: {id}"))
             })
             .collect::<Result<Vec<_>>>()?;
+        self.invalidate_graph_sources_for_upserts(&pending)?;
         let documents = pending
             .iter()
             .map(|item| &item.document)
@@ -1907,6 +1955,7 @@ impl MemoryEngine {
             self.state = before_prepare;
             return Err(error);
         }
+        self.invalidate_graph_sources_for_upserts(&pending)?;
         let documents = pending
             .iter()
             .map(|item| &item.document)
@@ -2116,6 +2165,7 @@ impl MemoryEngine {
             let metadata = self.state.metadata(&stored.id)?;
             ensure_delete_allowed(&metadata)?;
         }
+        self.erase_graph_sources(&ids.iter().cloned().collect(), "delete")?;
 
         let now = now_ms()?;
         let mut tombstones_created = 0;
@@ -2515,11 +2565,15 @@ fn now_ms() -> Result<i64> {
     i64::try_from(duration.as_millis()).context("system timestamp exceeds i64")
 }
 
+fn expired_id_batches(expired_ids: &[String]) -> impl Iterator<Item = &[String]> {
+    expired_ids.chunks(MAX_ID_COUNT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         apply_pending_upsert_to_state, deterministic_memory_id, document_chunk_from_source,
-        document_path_from_source, legacy_deterministic_memory_id,
+        document_path_from_source, expired_id_batches, legacy_deterministic_memory_id,
     };
     use crate::contract::{FeedbackStats, MemoryKind, MemoryOrigin, MemoryScope, StoreRequest};
     use crate::storage::state::{
@@ -2591,6 +2645,21 @@ mod tests {
         assert_eq!(state.record_revisions[TARGET], 20);
         assert_eq!(state.record_revisions[PREDECESSOR], 20);
         assert_eq!(state.record_revisions[CONFLICT], 20);
+    }
+
+    #[test]
+    fn optimize_expired_ids_are_batched_at_the_validation_limit() {
+        let expired_ids = (0..201)
+            .map(|index| format!("mem_{index:032x}"))
+            .collect::<Vec<_>>();
+
+        let batches = expired_id_batches(&expired_ids).collect::<Vec<_>>();
+
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            [100, 100, 1]
+        );
+        assert_eq!(batches.concat(), expired_ids);
     }
 
     #[test]

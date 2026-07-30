@@ -51,6 +51,19 @@ describe("shared daemon client", () => {
     expect(isRetrySafeMemoryMethod("model_switch_status")).toBe(true);
     expect(isRetrySafeMemoryMethod("model_switch")).toBe(false);
     expect(isRetrySafeMemoryMethod("model_switch_cancel")).toBe(false);
+    expect(isRetrySafeMemoryMethod("graph_extract_prepare")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_extract_enqueue")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_extract_claim")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_extract_renew")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_extract_job_status")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_extract_cancel")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_extract_complete")).toBe(false);
+    expect(isRetrySafeMemoryMethod("graph_extract_fail")).toBe(false);
+    expect(isRetrySafeMemoryMethod("graph_run_status")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_search")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_status")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_export")).toBe(true);
+    expect(isRetrySafeMemoryMethod("graph_upsert_candidates")).toBe(false);
   });
 
   test("releases the shared project client only after the final local lease", async () => {

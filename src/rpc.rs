@@ -9,6 +9,9 @@ use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use serde_json::{Map, Number, Value as JsonValue, json};
 
+use crate::graph_proto::{
+    GraphRequest, GraphResponse, GraphStatusCode, graph_request, graph_response,
+};
 use crate::memory_proto::{Method, Request, Response, Value, ValueList, ValueObject, value};
 use crate::model::{self, ModelSwitchRequest};
 use crate::model_proto::{
@@ -38,11 +41,14 @@ const MAX_MODEL_ID_BYTES: usize = 128;
 pub(crate) enum ProjectRequest {
     Memory(Request),
     Model(ModelRequest),
+    Graph(GraphRequest),
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ProjectResponse {
     Memory(Response),
     Model(ModelResponse),
+    Graph(GraphResponse),
 }
 
 pub(crate) struct Service {
@@ -86,8 +92,22 @@ impl Service {
             .ok_or_else(|| anyhow!("memory engine did not initialize"))
     }
 
+    pub(crate) fn run_maintenance(&mut self) -> Result<bool> {
+        let Some(engine) = self.engine.as_mut() else {
+            return Ok(false);
+        };
+        if !engine.needs_maintenance()? {
+            return Ok(false);
+        }
+        engine.optimize()?;
+        Ok(true)
+    }
+
     pub(crate) fn prepare_project_request(&mut self, request: &ProjectRequest) -> Result<()> {
-        if matches!(request, ProjectRequest::Memory(_)) {
+        if matches!(
+            request,
+            ProjectRequest::Memory(_) | ProjectRequest::Graph(_)
+        ) {
             self.engine()?;
         }
         Ok(())
@@ -106,6 +126,11 @@ impl Service {
                 request.id,
                 ModelStatusCode::Internal,
                 format!("model service initialization failed: {error:#}"),
+            )),
+            ProjectRequest::Graph(request) => ProjectResponse::Graph(graph_error(
+                request.id,
+                GraphStatusCode::Internal,
+                format!("graph store initialization failed: {error:#}"),
             )),
         }
     }
@@ -215,6 +240,77 @@ impl Service {
             ProjectRequest::Model(request) => {
                 Ok((ProjectResponse::Model(self.handle_model(request)), false))
             }
+            ProjectRequest::Graph(request) => {
+                Ok((ProjectResponse::Graph(self.handle_graph(request)), false))
+            }
+        }
+    }
+
+    fn handle_graph(&mut self, request: GraphRequest) -> GraphResponse {
+        let id = request.id;
+        if let Err(error) = validate_graph_request(&request) {
+            return graph_error(id, GraphStatusCode::InvalidArgument, error.to_string());
+        }
+        let Some(operation) = request.operation else {
+            return graph_error(
+                id,
+                GraphStatusCode::InvalidArgument,
+                "graph request operation is required",
+            );
+        };
+        let result = match operation {
+            graph_request::Operation::ExtractPrepare(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_extract_prepare(&request))
+                .map(graph_response::Result::ExtractPrepare),
+            graph_request::Operation::UpsertCandidates(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_upsert_candidates(&request))
+                .map(graph_response::Result::UpsertCandidates),
+            graph_request::Operation::RunStatus(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_run_status(&request))
+                .map(graph_response::Result::RunStatus),
+            graph_request::Operation::Search(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_search(&request))
+                .map(graph_response::Result::Search),
+            graph_request::Operation::Status(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_status(&request))
+                .map(graph_response::Result::GraphStatus),
+            graph_request::Operation::Export(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_export(&request))
+                .map(graph_response::Result::Export),
+            graph_request::Operation::ExtractEnqueue(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_extract_enqueue(&request))
+                .map(graph_response::Result::ExtractEnqueue),
+            graph_request::Operation::ExtractClaim(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_extract_claim(&request))
+                .map(graph_response::Result::ExtractClaim),
+            graph_request::Operation::ExtractRenew(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_extract_renew(&request))
+                .map(graph_response::Result::ExtractRenew),
+            graph_request::Operation::ExtractFinish(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_extract_finish(&request))
+                .map(graph_response::Result::ExtractFinish),
+            graph_request::Operation::ExtractJobStatus(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_extract_job_status(&request))
+                .map(graph_response::Result::ExtractJobStatus),
+            graph_request::Operation::ExtractCancel(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_extract_cancel(&request))
+                .map(graph_response::Result::ExtractCancel),
+        };
+        match result {
+            Ok(result) => graph_ok(id, result),
+            Err(error) => graph_error(id, graph_error_code(&error), error.to_string()),
         }
     }
 
@@ -233,7 +329,7 @@ impl Service {
 
         match operation {
             model_request::Operation::ListProfiles(_) => {
-                match model_profiles_response(model::profiles(&self.config)) {
+                match model::profiles(&self.config).and_then(model_profiles_response) {
                     Ok(response) => model_ok(id, model_response::Result::ListProfiles(response)),
                     Err(error) => model_error(id, ModelStatusCode::Internal, error.to_string()),
                 }
@@ -311,6 +407,178 @@ pub(crate) fn validate_project_request(request: &ProjectRequest) -> Result<()> {
             Ok(())
         }
         ProjectRequest::Model(request) => validate_model_request(request),
+        ProjectRequest::Graph(request) => validate_graph_request(request),
+    }
+}
+
+fn validate_graph_request(request: &GraphRequest) -> Result<()> {
+    anyhow::ensure!(request.id != 0, "graph request id is required");
+    let Some(operation) = request.operation.as_ref() else {
+        anyhow::bail!("graph request operation is required");
+    };
+    let authorization = match operation {
+        graph_request::Operation::ExtractPrepare(request) => request.authorization.as_ref(),
+        graph_request::Operation::UpsertCandidates(request) => request.authorization.as_ref(),
+        graph_request::Operation::RunStatus(request) => request.authorization.as_ref(),
+        graph_request::Operation::Search(request) => request.authorization.as_ref(),
+        graph_request::Operation::Status(request) => request.authorization.as_ref(),
+        graph_request::Operation::Export(request) => request.authorization.as_ref(),
+        graph_request::Operation::ExtractEnqueue(request) => request.authorization.as_ref(),
+        graph_request::Operation::ExtractClaim(request) => request.authorization.as_ref(),
+        graph_request::Operation::ExtractRenew(request) => request.authorization.as_ref(),
+        graph_request::Operation::ExtractFinish(request) => request.authorization.as_ref(),
+        graph_request::Operation::ExtractJobStatus(request) => request.authorization.as_ref(),
+        graph_request::Operation::ExtractCancel(request) => request.authorization.as_ref(),
+    }
+    .ok_or_else(|| anyhow!("graph authorization is required"))?;
+    anyhow::ensure!(
+        !authorization.session_scope_key.trim().is_empty()
+            && !authorization.agent_scope_key.trim().is_empty(),
+        "graph authorization scope keys are required"
+    );
+    match operation {
+        graph_request::Operation::ExtractPrepare(request) => {
+            anyhow::ensure!(
+                request.source_memory_ids.len() <= 64,
+                "graph source count exceeds limit"
+            );
+        }
+        graph_request::Operation::UpsertCandidates(request) => {
+            anyhow::ensure!(
+                !request.extraction_run_id.trim().is_empty(),
+                "graph extraction run ID is required"
+            );
+            anyhow::ensure!(
+                request.provider.is_some(),
+                "graph provider identity is required"
+            );
+        }
+        graph_request::Operation::RunStatus(request) => {
+            anyhow::ensure!(
+                !request.extraction_run_id.trim().is_empty(),
+                "graph extraction run ID is required"
+            );
+        }
+        graph_request::Operation::Search(request) => {
+            anyhow::ensure!(
+                !request.query.trim().is_empty(),
+                "graph search query is required"
+            );
+        }
+        graph_request::Operation::Status(_) | graph_request::Operation::Export(_) => {}
+        graph_request::Operation::ExtractEnqueue(request) => {
+            anyhow::ensure!(
+                !request.job_id.trim().is_empty(),
+                "graph job ID is required"
+            );
+            anyhow::ensure!(
+                request.source_memory_ids.len() <= 64,
+                "graph job source count exceeds limit"
+            );
+            anyhow::ensure!(
+                request.provider.is_some(),
+                "graph provider identity is required"
+            );
+        }
+        graph_request::Operation::ExtractClaim(request) => {
+            anyhow::ensure!(
+                !request.claim_request_id.trim().is_empty(),
+                "graph claim request ID is required"
+            );
+            anyhow::ensure!(
+                !request.worker_id.trim().is_empty(),
+                "graph worker ID is required"
+            );
+        }
+        graph_request::Operation::ExtractRenew(request) => {
+            anyhow::ensure!(
+                !request.job_id.trim().is_empty(),
+                "graph job ID is required"
+            );
+            anyhow::ensure!(
+                !request.lease_token.trim().is_empty(),
+                "graph job lease token is required"
+            );
+        }
+        graph_request::Operation::ExtractFinish(request) => {
+            anyhow::ensure!(
+                !request.job_id.trim().is_empty(),
+                "graph job ID is required"
+            );
+            anyhow::ensure!(
+                !request.lease_token.trim().is_empty(),
+                "graph job lease token is required"
+            );
+            anyhow::ensure!(
+                !request.extraction_run_id.trim().is_empty(),
+                "graph extraction run ID is required"
+            );
+            anyhow::ensure!(
+                request.entities.len() <= 64 && request.relations.len() <= 64,
+                "graph candidate count exceeds limit"
+            );
+        }
+        graph_request::Operation::ExtractJobStatus(request) => {
+            anyhow::ensure!(
+                !request.job_id.trim().is_empty(),
+                "graph job ID is required"
+            );
+        }
+        graph_request::Operation::ExtractCancel(request) => {
+            anyhow::ensure!(
+                !request.job_id.trim().is_empty(),
+                "graph job ID is required"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn graph_error_code(error: &anyhow::Error) -> GraphStatusCode {
+    let message = error.to_string();
+    if message.contains("lease duration is invalid") || message.contains("lease token is invalid") {
+        GraphStatusCode::InvalidArgument
+    } else if message.contains("already used")
+        || message.contains("stale")
+        || message.contains("changed")
+        || message.contains("expired")
+        || message.contains("lease")
+        || message.contains("not active")
+    {
+        GraphStatusCode::FailedPrecondition
+    } else if message.contains("not found") {
+        GraphStatusCode::NotFound
+    } else if message.contains("exceeds") || message.contains("limit") {
+        GraphStatusCode::ResourceExhausted
+    } else if message.contains("invalid")
+        || message.contains("required")
+        || message.contains("unknown")
+    {
+        GraphStatusCode::InvalidArgument
+    } else {
+        GraphStatusCode::Internal
+    }
+}
+
+fn graph_ok(id: u64, result: graph_response::Result) -> GraphResponse {
+    GraphResponse {
+        id,
+        status: Some(crate::graph_proto::GraphOperationStatus {
+            code: GraphStatusCode::Ok as i32,
+            message: String::new(),
+        }),
+        result: Some(result),
+    }
+}
+
+fn graph_error(id: u64, code: GraphStatusCode, message: impl Into<String>) -> GraphResponse {
+    GraphResponse {
+        id,
+        status: Some(crate::graph_proto::GraphOperationStatus {
+            code: code as i32,
+            message: message.into(),
+        }),
+        result: None,
     }
 }
 
@@ -775,6 +1043,9 @@ mod tests {
         Method, ProjectRequest, ProjectResponse, RPC_PROTOCOL_VERSION, Request, Service,
         decode_value, encode_value, read_frame, run_protocol_io,
     };
+    use crate::graph_proto::{
+        GraphAuthorization, GraphRequest, GraphStatusCode, GraphStatusRequest, graph_request,
+    };
     use crate::model_proto::{
         CancelModelSwitchRequest, GetModelSwitchStatusRequest, ListModelProfilesRequest,
         ModelPreflightDecision, ModelProfileCapability, ModelProfileRole, ModelRequest,
@@ -895,6 +1166,40 @@ mod tests {
                 .error
                 .contains("memory engine initialization failed")
         );
+    }
+
+    #[test]
+    fn graph_requests_initialize_the_actor_owned_engine_and_return_typed_setup_failures() {
+        let (temp, config) = config();
+        let config = config.with_embedding(EmbeddingConfig {
+            model_path: Some(temp.path().join("missing.gguf")),
+            ..EmbeddingConfig::default()
+        });
+        let mut service = Service::new(config);
+        let request = ProjectRequest::Graph(GraphRequest {
+            id: 20,
+            operation: Some(graph_request::Operation::Status(GraphStatusRequest {
+                authorization: Some(GraphAuthorization {
+                    session_scope_key: "session".to_string(),
+                    agent_scope_key: "agent".to_string(),
+                }),
+                scope: None,
+            })),
+        });
+
+        let error = service
+            .prepare_project_request(&request)
+            .expect_err("missing local model should fail graph setup");
+        let ProjectResponse::Graph(response) = Service::setup_failure_response(&request, &error)
+        else {
+            panic!("graph setup failure returned the wrong domain")
+        };
+        assert_eq!(response.id, 20);
+        assert_eq!(
+            response.status.as_ref().map(|status| status.code),
+            Some(GraphStatusCode::Internal as i32)
+        );
+        assert!(response.result.is_none());
     }
 
     #[test]

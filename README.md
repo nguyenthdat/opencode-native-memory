@@ -13,6 +13,7 @@ Local-first persistent memory for OpenCode. The plugin connects to one user-scop
 - Durable project and default-user taxonomy, confidence, supersession, conflict, pin, lock, expiry, and tombstone metadata
 - Deterministic capture gate with quarantine, skip, duplicate, supersession, and conflict outcomes
 - Crash-recoverable batch upsert journal and portable export/import snapshots
+- Source-backed knowledge graph sidecar with deterministic entity resolution, temporal relations, evidence, and durable extraction receipts
 - Markdown-backed shared repository memory under `.opencode/memory/`
 - Versioned length-delimited Protobuf IPC over an owner-only Unix domain socket
 - One serialized project actor and `MemoryEngine` per canonical physical store
@@ -65,29 +66,45 @@ The plugin automatically registers its packaged `rules/native-memory.md` as an O
 
 ## Memory Tools
 
-| Tool                     | Purpose                                                                   |
-| ------------------------ | ------------------------------------------------------------------------- |
-| `memory_search`          | Retrieve relevant memories within a context budget                        |
-| `memory_store`           | Store a verified durable memory                                           |
-| `memory_ingest`          | Queue one local PDF, Markdown, or HTML document for background extraction |
-| `memory_ingest_status`   | Poll background document ingestion jobs                                   |
-| `memory_index_documents` | Incrementally index all non-ignored project documents                     |
-| `memory_get`             | Fetch complete records by ID                                              |
-| `memory_list`            | Review/filter lifecycle-indexed memories                                  |
-| `memory_update`          | Correct semantic content or lifecycle metadata                            |
-| `memory_pin`             | Pin or unpin without re-embedding                                         |
-| `memory_lock`            | Lock or unlock without re-embedding                                       |
-| `memory_delete`          | Delete records, with tombstones by default                                |
-| `memory_promote`         | Promote reviewed local memory to repository Markdown                      |
-| `memory_export`          | Export records, lifecycle relations, and tombstones                       |
-| `memory_import`          | Validate and restore a portable JSON snapshot                             |
-| `memory_feedback`        | Record whether recalled memories were useful                              |
-| `memory_optimize`        | Prune expired records and optimize indexes                                |
-| `memory_status`          | Health-check the plugin and inspect backend, model, and schema status     |
-| `memory_doctor`          | Run shallow or deep integrity checks                                      |
-| `memory_purge`           | Confirm and delete the complete project store                             |
-| `memory_model_profiles`  | List stable, preview, and unsupported embedding model profiles            |
-| `memory_model_switch`    | Run a non-mutating model switch preflight                                 |
+| Tool                          | Purpose                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------- |
+| `memory_search`               | Retrieve relevant memories within a context budget                        |
+| `memory_store`                | Store a verified durable memory                                           |
+| `memory_ingest`               | Queue one local PDF, Markdown, or HTML document for background extraction |
+| `memory_ingest_status`        | Poll background document ingestion jobs                                   |
+| `memory_index_documents`      | Incrementally index all non-ignored project documents                     |
+| `memory_get`                  | Fetch complete records by ID                                              |
+| `memory_list`                 | Review/filter lifecycle-indexed memories                                  |
+| `memory_update`               | Correct semantic content or lifecycle metadata                            |
+| `memory_pin`                  | Pin or unpin without re-embedding                                         |
+| `memory_lock`                 | Lock or unlock without re-embedding                                       |
+| `memory_delete`               | Delete records, with tombstones by default                                |
+| `memory_promote`              | Promote reviewed local memory to repository Markdown                      |
+| `memory_export`               | Export records, lifecycle relations, and tombstones                       |
+| `memory_import`               | Validate and restore a portable JSON snapshot                             |
+| `memory_feedback`             | Record whether recalled memories were useful                              |
+| `memory_optimize`             | Prune expired records and optimize indexes                                |
+| `memory_status`               | Health-check the plugin and inspect backend, model, and schema status     |
+| `memory_doctor`               | Run shallow or deep integrity checks                                      |
+| `memory_purge`                | Confirm and delete the complete project store                             |
+| `memory_model_profiles`       | List stable, preview, and unsupported embedding model profiles            |
+| `memory_model_switch`         | Run a non-mutating model switch preflight                                 |
+| `memory_graph_extract`        | Explicitly extract and persist source-backed entities and relations       |
+| `memory_graph_extract_status` | Inspect and resume a durable graph extraction job                         |
+| `memory_graph_extract_cancel` | Cooperatively cancel a durable graph extraction job                       |
+| `memory_graph_search`         | Search entities/relations through bounded graph traversal                 |
+| `memory_graph_status`         | Inspect source-visible graph counts and last extraction                   |
+| `memory_graph_export`         | Export one bounded page of graph facts and provenance                     |
+
+### Knowledge Graph
+
+Knowledge graph extraction is opt-in. `memory_graph_extract` first asks the native daemon to prepare bounded source units and derive their scope, content hash, extraction revision, and remote-egress eligibility. The tool then asks permission before enqueueing durable provider work. The daemon persists bounded source revisions and a retry/lease state machine; it never persists source text in the job. A plugin worker claims and renews the lease, uses an isolated OpenCode SDK v2 session with JSON Schema output, denied permissions, disabled tools, strict response limits, and guaranteed session cleanup, then atomically commits the job receipt and graph facts. `dry_run=true` validates and returns candidates without creating a job.
+
+Repository-scoped and code-backed memories are blocked from remote extraction by default. Secret-like and prompt-injection-shaped source content is also blocked before provider dispatch. The native daemon rechecks source visibility, hash, extraction revision, scope, policy revision, evidence quotes, candidate limits, and allowed predicates (`uses`, `depends_on`, `implements`, `causes`, `related_to`, `supports`, `contradicts`) immediately before commit. Provider credentials remain inside OpenCode and never enter native configuration or graph state.
+
+Accepted graph facts live under the project data root in `knowledge-graph.json`; `knowledge-graph.pending.json` journals one bounded transaction. The project actor and existing `writer.lock` remain the only writer. Store replacement, supersession, delete/forget, document replacement/removal, shared Markdown sync, import, expiry pruning, recovery, and purge all invalidate or erase source-owned evidence before the authoritative memory mutation. Graph reads independently revalidate current source visibility, expiry, supersession, stale anchors, and extraction revision.
+
+`memory_graph_search` provides current or historical temporal queries over lexical seeds and depth-2 bounded traversal. Eligible graph results are projected back to source-memory IDs and can be fused into normal `memory_search` with rank-only RRF before the existing MMR and character-budget packing; automatic recall enables this local graph channel. Temporal assertion versions preserve invalidation history, and `supports`/`contradicts` stay separate from lifecycle relations.
 
 ### Embedding Profiles
 
@@ -106,9 +123,13 @@ Use the safe phase-1 commands:
 /memory model switch qwen3-vl-embedding-8b --dry-run
 ```
 
-The current release performs preflight only. It never changes an existing
-project's model or mixes incompatible vectors. Durable collection-generation
-migration, cancellation, resume, and rollback are a later phase.
+The current release persists `active-embedding.json` as the authoritative local
+generation/profile identity and rejects implicit profile changes. If dense
+inference is unavailable, dense/hybrid retrieval degrades explicitly to the
+lexical index instead of substituting another vector space. Model switch remains
+preflight-only: separate target collection migration, cancellation, cutover,
+rollback, and remote embedding adapters are not enabled without a validated
+embedding API and worker supervisor.
 
 The 20 stable taxonomy values are `task_attempt`, `tool_call`, `session_summary`, `architecture_fact`, `codebase_fact`, `user_fact`, `user_identity`, `user_behavior`, `user_preference`, `user_goal`, `user_relationship`, `fix_pattern`, `code_template`, `tool_heuristic`, `code_style`, `library_pref`, `workflow_pref`, `decision`, `team_convention`, and `project_standard`.
 
@@ -137,40 +158,41 @@ Changing model identity or vector-affecting preprocessing requires rebuilding th
 
 ### Environment
 
-| Variable                                     | Default / purpose                                                            |
-| -------------------------------------------- | ---------------------------------------------------------------------------- |
-| `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH`       | Local GGUF path; bypasses Hugging Face                                       |
-| `OPENCODE_MEMORY_EMBEDDING_MODEL_REPO`       | `Qwen/Qwen3-Embedding-4B-GGUF`                                               |
-| `OPENCODE_MEMORY_EMBEDDING_MODEL_FILE`       | `Qwen3-Embedding-4B-Q4_K_M.gguf`                                             |
-| `OPENCODE_MEMORY_EMBEDDING_MODEL_REVISION`   | Pinned Hugging Face commit                                                   |
-| `OPENCODE_MEMORY_EMBEDDING_POOLING`          | `last`; accepts `unspecified`, `mean`, `cls`, `last`                         |
-| `OPENCODE_MEMORY_EMBEDDING_ATTENTION`        | `causal`; accepts `unspecified`, `causal`, `non_causal`                      |
-| `OPENCODE_MEMORY_EMBEDDING_QUERY_TEMPLATE`   | Query instruction containing `{text}`                                        |
-| `OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE` | `{text}`                                                                     |
-| `OPENCODE_MEMORY_EMBEDDING_ADD_BOS`          | `true`                                                                       |
-| `OPENCODE_MEMORY_EMBEDDING_APPEND_EOS`       | `true`                                                                       |
-| `OPENCODE_MEMORY_EMBEDDING_NORMALIZE`        | `true`                                                                       |
-| `OPENCODE_MEMORY_EMBEDDING_DIMENSION`        | Native model dimension; lower values use MRL truncation then renormalization |
-| `OPENCODE_MEMORY_EMBEDDING_CONTEXT_SIZE`     | `8192`                                                                       |
-| `OPENCODE_MEMORY_EMBEDDING_THREADS`          | Hard per-inference maximum; daemon default shares CPU capacity across actors |
-| `OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS`       | All layers when GPU offload is supported, otherwise `0`                      |
-| `OPENCODE_MEMORY_PROJECT_ROOT`               | Override project discovery root                                              |
-| `OPENCODE_MEMORY_DATA_DIR`                   | Override project store base directory                                        |
-| `OPENCODE_MEMORY_MODEL_CACHE`                | Replace the complete local Hugging Face model-cache path                     |
-| `OPENCODE_MEMORY_REQUEST_TIMEOUT_MS`         | Native RPC timeout in milliseconds; default 5 minutes, maximum 2 hours       |
-| `OPENCODE_NATIVE_MEMORY_BIN`                 | Development/debug native daemon binary override                              |
-| `OPENCODE_MEMORY_PROJECT_IDLE_SECONDS`       | Release an unleased project actor after 5 minutes                            |
-| `OPENCODE_MEMORY_DAEMON_IDLE_SECONDS`        | Stop the daemon after 10 minutes with no sessions or project activity        |
-| `OPENCODE_MEMORY_WARMUP`                     | Enable model/shared-memory warmup; default `true`                            |
-| `OPENCODE_MEMORY_AUTO_RECALL`                | Enable automatic contextual recall; default `true`                           |
-| `OPENCODE_MEMORY_AUTO_CAPTURE`               | Evaluate compaction candidates through the capture gate; default `true`      |
-| `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS`       | Incrementally index non-ignored project documents; default `true`            |
-| `OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS` | File-watcher re-index debounce; default `750`                                |
-| `OPENCODE_MEMORY_AUTO_OPTIMIZE`              | Coalesced zvec compaction after writes/index drift; default `true`           |
-| `OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS`       | Maintenance debounce; default `5000`                                         |
-| `OPENCODE_MEMORY_SHARED_SYNC`                | Synchronize `.opencode/memory/**/*.md`; default `true`                       |
-| `OPENCODE_MEMORY_FEEDBACK_TRACKING`          | Track retrieval feedback; default `true`                                     |
-| `OPENCODE_MEMORY_MIN_SCORE`                  | Default calibrated search threshold; default `0.42`                          |
+| Variable                                       | Default / purpose                                                            |
+| ---------------------------------------------- | ---------------------------------------------------------------------------- |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH`         | Local GGUF path; bypasses Hugging Face                                       |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_REPO`         | `Qwen/Qwen3-Embedding-4B-GGUF`                                               |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_FILE`         | `Qwen3-Embedding-4B-Q4_K_M.gguf`                                             |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_REVISION`     | Pinned Hugging Face commit                                                   |
+| `OPENCODE_MEMORY_EMBEDDING_POOLING`            | `last`; accepts `unspecified`, `mean`, `cls`, `last`                         |
+| `OPENCODE_MEMORY_EMBEDDING_ATTENTION`          | `causal`; accepts `unspecified`, `causal`, `non_causal`                      |
+| `OPENCODE_MEMORY_EMBEDDING_QUERY_TEMPLATE`     | Query instruction containing `{text}`                                        |
+| `OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE`   | `{text}`                                                                     |
+| `OPENCODE_MEMORY_EMBEDDING_ADD_BOS`            | `true`                                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_APPEND_EOS`         | `true`                                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_NORMALIZE`          | `true`                                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_DIMENSION`          | Native model dimension; lower values use MRL truncation then renormalization |
+| `OPENCODE_MEMORY_EMBEDDING_CONTEXT_SIZE`       | `8192`                                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_THREADS`            | Hard per-inference maximum; daemon default shares CPU capacity across actors |
+| `OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS`         | All layers when GPU offload is supported, otherwise `0`                      |
+| `OPENCODE_MEMORY_PROJECT_ROOT`                 | Override project discovery root                                              |
+| `OPENCODE_MEMORY_DATA_DIR`                     | Override project store base directory                                        |
+| `OPENCODE_MEMORY_MODEL_CACHE`                  | Replace the complete local Hugging Face model-cache path                     |
+| `OPENCODE_MEMORY_REQUEST_TIMEOUT_MS`           | Native RPC timeout in milliseconds; default 5 minutes, maximum 2 hours       |
+| `OPENCODE_NATIVE_MEMORY_BIN`                   | Development/debug native daemon binary override                              |
+| `OPENCODE_MEMORY_PROJECT_IDLE_SECONDS`         | Release an unleased project actor after 5 minutes                            |
+| `OPENCODE_MEMORY_DAEMON_IDLE_SECONDS`          | Stop the daemon after 10 minutes with no sessions or project activity        |
+| `OPENCODE_MEMORY_MAINTENANCE_INTERVAL_SECONDS` | Native active-project maintenance probe; default `300`                       |
+| `OPENCODE_MEMORY_WARMUP`                       | Enable model/shared-memory warmup; default `true`                            |
+| `OPENCODE_MEMORY_AUTO_RECALL`                  | Enable automatic contextual recall; default `true`                           |
+| `OPENCODE_MEMORY_AUTO_CAPTURE`                 | Evaluate compaction candidates through the capture gate; default `true`      |
+| `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS`         | Incrementally index non-ignored project documents; default `true`            |
+| `OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS`   | File-watcher re-index debounce; default `750`                                |
+| `OPENCODE_MEMORY_AUTO_OPTIMIZE`                | Coalesced zvec compaction after writes/index drift; default `true`           |
+| `OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS`         | Maintenance debounce; default `5000`                                         |
+| `OPENCODE_MEMORY_SHARED_SYNC`                  | Synchronize `.opencode/memory/**/*.md`; default `true`                       |
+| `OPENCODE_MEMORY_FEEDBACK_TRACKING`            | Track retrieval feedback; default `true`                                     |
+| `OPENCODE_MEMORY_MIN_SCORE`                    | Default calibrated search threshold; default `0.42`                          |
 
 Example local model:
 
@@ -183,7 +205,9 @@ export OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE="search_document: {text}"
 
 ## Storage and Sharing
 
-Private state uses the data directory under `opencode/memory/projects/<project-id>/`. Downloaded models use OpenCode's data home under `opencode/memory/models/<model-revision>/`; versioning by immutable model revision avoids downloading the same multi-gigabyte GGUF again on plugin-only upgrades. Existing downloads under `~/.cache/opencode/memory/models/` are not moved automatically; point `OPENCODE_MEMORY_MODEL_CACHE` there to reuse them.
+Private state uses the data directory under `opencode/memory/projects/<project-id>/`. `active-embedding.json` records the selected local profile and generation without storing credentials. Downloaded models use OpenCode's data home under `opencode/memory/models/<model-revision>/`; versioning by immutable model revision avoids downloading the same multi-gigabyte GGUF again on plugin-only upgrades. Existing downloads under `~/.cache/opencode/memory/models/` are not moved automatically; point `OPENCODE_MEMORY_MODEL_CACHE` there to reuse them.
+
+The same private project directory contains `knowledge-graph.json` and its bounded pending journal. The graph stores normalized entities, relations, exact evidence quotes, source bindings, non-secret run receipts, and durable extraction job metadata; job records contain hashes/revisions but not source text. It never replaces zvec or becomes authoritative for source memory text.
 
 Repository memory is canonical Markdown in:
 
@@ -203,7 +227,10 @@ Automatic document indexing scans the project at startup and after debounced doc
 
 Automatic maintenance coalesces index/shared-memory/capture writes and runs
 `optimize` after a short debounce when zvec index completeness drops below
-98% or pending journals are observed. `index_documents`, `sync_shared`, and
+100% or pending journals are observed. The native daemon also probes active,
+already-initialized project actors every five minutes and schedules one
+actor-owned optimize only when index, expiry, or retrieval-retention state needs
+maintenance; it never opens an idle project just for maintenance. `index_documents`, `sync_shared`, and
 `optimize` are deterministic maintenance operations; if their response is
 lost after dispatch, the plugin retries the same operation once and never
 replays arbitrary mutations. Disable this behavior with
@@ -219,10 +246,10 @@ User-scoped Rust daemon
   -> project registry keyed by canonical physical store
   -> bounded, thread-affine ProjectActor
   -> one MemoryEngine / writer.lock / model context per active project
-  -> zvec vector + FTS collection and atomic lifecycle state
+  -> zvec vector + FTS collection, atomic lifecycle state, and graph sidecar journal
 ```
 
-The domain schema is `schema/opencode/memory/v1/memory.proto`; daemon sessions, leases, deadlines, cancellation outcomes, status codes, and calls use `schema/opencode/memory/daemon/v1/daemon.proto`. Rust bindings are generated at Cargo build time with `prost-build`; TypeScript bindings are committed under `opencode-memory/src/generated/` and reproduced with `bun run generate:protocol`. The daemon currently uses the plan's framed-Protobuf UDS fallback because the supported Bun 1.3.14 runtime has not passed the required large-message HTTP/2 matrix for gRPC. The stable per-user endpoint lives under `$XDG_RUNTIME_DIR/opencode-memory/` on Linux or the OS-provided private temporary directory elsewhere, with a short `/tmp/opencode-memory-<uid>/` fallback only when required by Unix socket path limits. The client validates directory and socket ownership, type, and permissions before connecting.
+Memory and graph domain schemas are `schema/opencode/memory/v1/memory.proto` and `schema/opencode/memory/graph/v1/graph.proto`; daemon sessions, leases, deadlines, cancellation outcomes, status codes, and calls use `schema/opencode/memory/daemon/v1/daemon.proto`. Rust bindings are generated at Cargo build time with `prost-build`; TypeScript bindings are committed under `opencode-memory/src/generated/` and reproduced with `bun run generate:protocol`. The daemon currently uses the plan's framed-Protobuf UDS fallback because the supported Bun 1.3.14 runtime has not passed the required large-message HTTP/2 matrix for gRPC. The stable per-user endpoint lives under `$XDG_RUNTIME_DIR/opencode-memory/` on Linux or the OS-provided private temporary directory elsewhere, with a short `/tmp/opencode-memory-<uid>/` fallback only when required by Unix socket path limits. The client validates directory and socket ownership, type, and permissions before connecting.
 
 Lifecycle state schema v4 is intentionally new-only. Older state schemas are rejected instead of migrated; move or purge an older project store before using this build. Upserts are journaled before zvec mutation and replayed as an order-independent batch when the engine opens.
 

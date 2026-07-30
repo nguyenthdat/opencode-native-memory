@@ -36,15 +36,38 @@ import {
   StartModelSwitchResponseSchema,
 } from "./generated/opencode/memory/model/v1/model_pb.js";
 import {
+  GraphExtractCancelResponseSchema,
+  GraphExtractClaimResponseSchema,
+  GraphExtractEnqueueResponseSchema,
+  GraphExtractFinishOutcome,
+  GraphExtractFinishResponseSchema,
+  GraphExtractJobStatusResponseSchema,
+  GraphExtractPrepareResponseSchema,
+  GraphExtractRenewResponseSchema,
+  GraphExtractionJobState,
+  GraphExportResponseSchema,
+  GraphOperationStatusSchema,
+  GraphRequestSchema,
+  GraphResponseSchema,
+  GraphRunStatusResponseSchema,
+  GraphSearchResponseSchema,
+  GraphStatusCode,
+  GraphStatusResponseSchema,
+  GraphUpsertCandidatesResponseSchema,
+} from "./generated/opencode/memory/graph/v1/graph_pb.js";
+import {
+  createGraphRequest,
   createModelRequest,
   createProjectRequest,
+  decodeGraphResponse,
   decodeModelResponse,
   decodeResponse,
   DelimitedFrameDecoder,
   encodeDelimited,
   encodeRequest,
 } from "./protocol.js";
-import type { ModelMethod } from "./protocol.js";
+import type { GraphMethod, ModelMethod } from "./protocol.js";
+import type { GraphRequest, GraphResponse } from "./generated/opencode/memory/graph/v1/graph_pb.js";
 
 describe("Protobuf memory protocol", () => {
   test("encodes a typed request with length-delimited framing", () => {
@@ -156,6 +179,162 @@ describe("Protobuf memory protocol", () => {
       executionMode: ModelSwitchExecutionMode.DRY_RUN,
       rebuildPolicy: ModelSwitchRebuildPolicy.FORCE_REBUILD,
     });
+  });
+
+  test("routes all graph methods through typed operations with snake_case parameters", () => {
+    const authorization = {
+      session_scope_key: "session-a",
+      agent_scope_key: "agent-a",
+    };
+    const operations: Array<
+      [GraphMethod, Record<string, unknown>, GraphRequest["operation"]["case"]]
+    > = [
+      [
+        "graph_extract_prepare",
+        { authorization, source_memory_ids: ["memory-1"], max_units: 4 },
+        "extractPrepare",
+      ],
+      [
+        "graph_upsert_candidates",
+        {
+          authorization,
+          extraction_run_id: "run-1",
+          sources: [
+            {
+              source_memory_id: "memory-1",
+              source_unit_id: "unit-1",
+              content_hash: "sha256:source",
+              extraction_revision: "revision-1",
+              derived_scope: {
+                project_id: "project-1",
+                memory_scope: "project",
+                verified_scope_key: "scope-1",
+              },
+              policy_revision: "policy-1",
+              remote_eligible: true,
+            },
+          ],
+          provider: {
+            provider_id: "opencode",
+            model_id: "model-1",
+            extractor_version: "extractor-1",
+            prompt_version: "prompt-1",
+            schema_version: "graph-1",
+          },
+          entities: [
+            {
+              mention: "zvec",
+              entity_type: "technology",
+              evidence: [{ source_unit_id: "unit-1", quote: "zvec" }],
+            },
+          ],
+          relations: [],
+        },
+        "upsertCandidates",
+      ],
+      ["graph_run_status", { authorization, extraction_run_id: "run-1" }, "runStatus"],
+      [
+        "graph_extract_enqueue",
+        {
+          authorization,
+          job_id: "job-1",
+          source_memory_ids: ["memory-1"],
+          provider: {
+            provider_id: "opencode",
+            model_id: "model-1",
+            extractor_version: "extractor-1",
+            prompt_version: "prompt-1",
+            schema_version: "graph-1",
+          },
+          max_attempts: 3,
+        },
+        "extractEnqueue",
+      ],
+      [
+        "graph_extract_claim",
+        { authorization, claim_request_id: "claim-1", worker_id: "worker-1" },
+        "extractClaim",
+      ],
+      [
+        "graph_extract_renew",
+        { authorization, job_id: "job-1", lease_token: "a".repeat(64) },
+        "extractRenew",
+      ],
+      [
+        "graph_extract_complete",
+        {
+          authorization,
+          job_id: "job-1",
+          lease_token: "a".repeat(64),
+          extraction_run_id: "run-1",
+          entities: [],
+          relations: [],
+        },
+        "extractFinish",
+      ],
+      [
+        "graph_extract_fail",
+        {
+          authorization,
+          job_id: "job-1",
+          lease_token: "a".repeat(64),
+          extraction_run_id: "run-1",
+          retryable: false,
+          error_code: "provider_error",
+          error_message: "provider failed",
+        },
+        "extractFinish",
+      ],
+      [
+        "graph_extract_finish",
+        {
+          authorization,
+          job_id: "job-1",
+          lease_token: "a".repeat(64),
+          extraction_run_id: "run-1",
+          outcome: "GRAPH_EXTRACT_FINISH_OUTCOME_RETRYABLE_FAILURE",
+          error_code: "provider_error",
+        },
+        "extractFinish",
+      ],
+      ["graph_extract_job_status", { authorization, job_id: "job-1" }, "extractJobStatus"],
+      ["graph_extract_cancel", { authorization, job_id: "job-1" }, "extractCancel"],
+      [
+        "graph_search",
+        {
+          authorization,
+          query: "vector database",
+          time: { valid_after_ms: 10 },
+          max_depth: 2,
+          max_fanout: 32,
+          max_results: 64,
+        },
+        "search",
+      ],
+      ["graph_status", { authorization, scope: { memory_scope: "project" } }, "status"],
+      ["graph_export", { authorization, cursor: "cursor-1", page_limit: 32 }, "export"],
+    ];
+
+    for (const [method, params, operation] of operations) {
+      const request = createGraphRequest(20, method, params);
+      const decoded = fromBinary(GraphRequestSchema, toBinary(GraphRequestSchema, request));
+      expect(decoded.id).toBe(20n);
+      expect(decoded.operation.case).toBe(operation);
+    }
+
+    const upsert = createGraphRequest(21, "graph_upsert_candidates", operations[1]![1]);
+    if (upsert.operation.case !== "upsertCandidates") throw new Error("expected graph upsert");
+    expect(upsert.operation.value.provider?.providerId).toBe("opencode");
+    expect(upsert.operation.value.sources[0]?.sourceMemoryId).toBe("memory-1");
+    expect(upsert.operation.value.entities[0]?.evidence[0]?.sourceUnitId).toBe("unit-1");
+
+    const completed = createGraphRequest(22, "graph_extract_complete", operations[6]![1]);
+    expect(completed.operation.case).toBe("extractFinish");
+    if (completed.operation.case !== "extractFinish") throw new Error("expected graph finish");
+    expect(completed.operation.value.outcome).toBe(GraphExtractFinishOutcome.COMPLETED);
+    const failed = createGraphRequest(23, "graph_extract_fail", operations[7]![1]);
+    if (failed.operation.case !== "extractFinish") throw new Error("expected graph failure");
+    expect(failed.operation.value.outcome).toBe(GraphExtractFinishOutcome.PERMANENT_FAILURE);
   });
 
   test("puts exactly one domain request branch on a project call", () => {
@@ -319,6 +498,380 @@ describe("Protobuf memory protocol", () => {
     expect(() => decodeModelResponse(response, "model_switch")).toThrow(
       "returned listProfiles result for model_switch",
     );
+  });
+
+  test("puts a graph request on the graph ProjectCall branch", () => {
+    const graph = createProjectRequest(22, "graph_status", {
+      authorization: { session_scope_key: "session-a", agent_scope_key: "agent-a" },
+    });
+    expect(graph.kind).toBe("graph");
+    if (graph.kind !== "graph") throw new Error("expected graph request");
+    const projectCall = create(ProjectCallRequestSchema, {
+      callId: "call-graph",
+      graphRequest: graph.graphRequest,
+    });
+    const decoded = fromBinary(
+      ProjectCallRequestSchema,
+      toBinary(ProjectCallRequestSchema, projectCall),
+    );
+    expect(decoded.request).toBeUndefined();
+    expect(decoded.modelRequest).toBeUndefined();
+    expect(decoded.graphRequest?.operation.case).toBe("status");
+  });
+
+  test("decodes all graph result branches into snake_case unknown objects", () => {
+    const status = create(GraphOperationStatusSchema, { code: GraphStatusCode.OK });
+    const receipt = {
+      extractionRunId: "run-1",
+      idempotencyDigest: "digest-1",
+      outcome: "committed",
+      committedAtMs: 100n,
+      sourceCount: 2n,
+      acceptedEntityCount: 1n,
+      acceptedRelationCount: 1n,
+      rejectedCandidateCount: 1n,
+      conflictCount: 0n,
+      warningCount: 1n,
+      terminal: true,
+    };
+    const job = {
+      jobId: "job-1",
+      idempotencyDigest: "job-digest",
+      state: GraphExtractionJobState.RUNNING,
+      attemptCount: 1,
+      maxAttempts: 3,
+      createdAtMs: 90n,
+      updatedAtMs: 100n,
+      leaseExpiresAtMs: 60_100n,
+      extractionRunId: "run-1",
+      cancelRequested: false,
+      maxUnitTextBytes: 32_768,
+      maxTotalTextBytes: 262_144,
+    };
+    const responses: Array<[GraphMethod, GraphResponse, Record<string, unknown>]> = [
+      [
+        "graph_extract_prepare",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "extractPrepare",
+            value: create(GraphExtractPrepareResponseSchema, {
+              requestedSourceCount: 2n,
+              warnings: ["one source was redacted"],
+            }),
+          },
+        }),
+        { requested_source_count: 2, warnings: ["one source was redacted"] },
+      ],
+      [
+        "graph_upsert_candidates",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "upsertCandidates",
+            value: create(GraphUpsertCandidatesResponseSchema, {
+              receipt,
+              acceptedEntities: [
+                {
+                  candidateIndex: 1,
+                  entityId: "entity-1",
+                  canonicalName: "zvec",
+                  entityType: "technology",
+                },
+              ],
+              rejectedCandidates: [
+                { candidateKind: "relation", candidateIndex: 1, code: "NO_EVIDENCE" },
+              ],
+              warnings: ["bounded"],
+            }),
+          },
+        }),
+        {
+          receipt: {
+            extraction_run_id: "run-1",
+            idempotency_digest: "digest-1",
+            outcome: "committed",
+            committed_at_ms: 100,
+            source_count: 2,
+            accepted_entity_count: 1,
+            accepted_relation_count: 1,
+            rejected_candidate_count: 1,
+            warning_count: 1,
+            terminal: true,
+          },
+          accepted_entities: [
+            {
+              candidate_index: 1,
+              entity_id: "entity-1",
+              canonical_name: "zvec",
+              entity_type: "technology",
+            },
+          ],
+          rejected_candidates: [
+            { candidate_kind: "relation", candidate_index: 1, code: "NO_EVIDENCE" },
+          ],
+          warnings: ["bounded"],
+        },
+      ],
+      [
+        "graph_run_status",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "runStatus",
+            value: create(GraphRunStatusResponseSchema, { found: true, receipt }),
+          },
+        }),
+        { found: true, receipt: { extraction_run_id: "run-1", committed_at_ms: 100 } },
+      ],
+      [
+        "graph_search",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "search",
+            value: create(GraphSearchResponseSchema, {
+              eligibleSourceCount: 3n,
+              truncated: true,
+            }),
+          },
+        }),
+        { eligible_source_count: 3, truncated: true },
+      ],
+      [
+        "graph_status",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "graphStatus",
+            value: create(GraphStatusResponseSchema, {
+              schemaVersion: "graph-1",
+              entityCount: 4n,
+              relationCount: 5n,
+              pendingJobCount: 1n,
+              lastExtraction: { extractionRunId: "run-1", completedAtMs: 100n, sourceCount: 2n },
+            }),
+          },
+        }),
+        {
+          schema_version: "graph-1",
+          entity_count: 4,
+          relation_count: 5,
+          pending_job_count: 1,
+          last_extraction: {
+            extraction_run_id: "run-1",
+            completed_at_ms: 100,
+            source_count: 2,
+          },
+        },
+      ],
+      [
+        "graph_export",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "export",
+            value: create(GraphExportResponseSchema, {
+              schemaVersion: "graph-1",
+              nextCursor: "cursor-2",
+              complete: false,
+            }),
+          },
+        }),
+        { schema_version: "graph-1", next_cursor: "cursor-2" },
+      ],
+      [
+        "graph_extract_enqueue",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "extractEnqueue",
+            value: create(GraphExtractEnqueueResponseSchema, { job, existing: false }),
+          },
+        }),
+        { job: { job_id: "job-1", state: "running" }, existing: false },
+      ],
+      [
+        "graph_extract_claim",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "extractClaim",
+            value: create(GraphExtractClaimResponseSchema, {
+              found: true,
+              job,
+              leaseToken: "a".repeat(64),
+            }),
+          },
+        }),
+        { found: true, lease_token: "a".repeat(64), job: { job_id: "job-1" } },
+      ],
+      [
+        "graph_extract_renew",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "extractRenew",
+            value: create(GraphExtractRenewResponseSchema, {
+              job,
+              leaseExpiresAtMs: 60_100n,
+            }),
+          },
+        }),
+        { lease_expires_at_ms: 60_100, job: { state: "running" } },
+      ],
+      [
+        "graph_extract_complete",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "extractFinish",
+            value: create(GraphExtractFinishResponseSchema, { job }),
+          },
+        }),
+        { job: { job_id: "job-1" } },
+      ],
+      [
+        "graph_extract_job_status",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "extractJobStatus",
+            value: create(GraphExtractJobStatusResponseSchema, { found: true, job }),
+          },
+        }),
+        { found: true, job: { updated_at_ms: 100 } },
+      ],
+      [
+        "graph_extract_cancel",
+        create(GraphResponseSchema, {
+          id: 30n,
+          status,
+          result: {
+            case: "extractCancel",
+            value: create(GraphExtractCancelResponseSchema, {
+              job,
+              outcome: "cancel_requested",
+            }),
+          },
+        }),
+        { outcome: "cancel_requested", job: { job_id: "job-1" } },
+      ],
+    ];
+
+    for (const [method, response, result] of responses) {
+      expect(decodeGraphResponse(response, method)).toMatchObject({
+        id: 30,
+        ok: true,
+        result,
+        error: undefined,
+      });
+    }
+  });
+
+  test("rejects a graph result that does not match the requested operation", () => {
+    const response = create(GraphResponseSchema, {
+      id: 31n,
+      status: create(GraphOperationStatusSchema, { code: GraphStatusCode.OK }),
+      result: {
+        case: "extractPrepare",
+        value: create(GraphExtractPrepareResponseSchema),
+      },
+    });
+    expect(() => decodeGraphResponse(response, "graph_status")).toThrow(
+      "returned extractPrepare result for graph_status",
+    );
+  });
+
+  test("rejects unknown durable graph job states and cancel outcomes", () => {
+    const status = create(GraphOperationStatusSchema, { code: GraphStatusCode.OK });
+    const unknownState = create(GraphResponseSchema, {
+      id: 35n,
+      status,
+      result: {
+        case: "extractJobStatus",
+        value: create(GraphExtractJobStatusResponseSchema, {
+          found: true,
+          job: { jobId: "job-1", state: GraphExtractionJobState.UNSPECIFIED },
+        }),
+      },
+    });
+    expect(() => decodeGraphResponse(unknownState, "graph_extract_job_status")).toThrow(
+      "unknown graph job state",
+    );
+
+    const unknownCancel = create(GraphResponseSchema, {
+      id: 36n,
+      status,
+      result: {
+        case: "extractCancel",
+        value: create(GraphExtractCancelResponseSchema, {
+          job: { jobId: "job-1", state: GraphExtractionJobState.CANCELLED },
+          outcome: "future_outcome",
+        }),
+      },
+    });
+    expect(() => decodeGraphResponse(unknownCancel, "graph_extract_cancel")).toThrow(
+      "unknown graph cancel outcome",
+    );
+  });
+
+  test("preserves default-valued graph fields in public results", () => {
+    const response = create(GraphResponseSchema, {
+      id: 33n,
+      status: create(GraphOperationStatusSchema, { code: GraphStatusCode.OK }),
+      result: {
+        case: "runStatus",
+        value: create(GraphRunStatusResponseSchema, { found: false }),
+      },
+    });
+    expect(decodeGraphResponse(response, "graph_run_status")).toEqual({
+      id: 33,
+      ok: true,
+      result: { found: false },
+      error: undefined,
+    });
+
+    const exportResponse = create(GraphResponseSchema, {
+      id: 34n,
+      status: create(GraphOperationStatusSchema, { code: GraphStatusCode.OK }),
+      result: {
+        case: "export",
+        value: create(GraphExportResponseSchema),
+      },
+    });
+    expect(decodeGraphResponse(exportResponse, "graph_export").result).toEqual({
+      schema_version: "",
+      entities: [],
+      relations: [],
+      provenance: [],
+      complete: false,
+    });
+  });
+
+  test("rejects graph uint64 values outside the JavaScript safe range", () => {
+    const response = create(GraphResponseSchema, {
+      id: 32n,
+      status: create(GraphOperationStatusSchema, { code: GraphStatusCode.OK }),
+      result: {
+        case: "graphStatus",
+        value: create(GraphStatusResponseSchema, {
+          entityCount: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+        }),
+      },
+    });
+    expect(() => decodeGraphResponse(response, "graph_status")).toThrow("safe integer range");
   });
 
   test("encodes a versioned daemon envelope with opaque request IDs", () => {

@@ -10,9 +10,17 @@ fn main() {
         )
         .expect("compile Protobuf model protocol schema");
 
+    prost_build::Config::new()
+        .compile_protos(
+            &["schema/opencode/memory/graph/v1/graph.proto"],
+            &["schema"],
+        )
+        .expect("compile Protobuf graph protocol schema");
+
     let mut daemon = prost_build::Config::new();
     daemon.extern_path(".opencode.memory.v1", "crate::memory_proto");
     daemon.extern_path(".opencode.memory.model.v1", "crate::model_proto");
+    daemon.extern_path(".opencode.memory.graph.v1", "crate::graph_proto");
     daemon
         .compile_protos(
             &["schema/opencode/memory/daemon/v1/daemon.proto"],
@@ -32,6 +40,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=schema/opencode/memory/v1/memory.proto");
     println!("cargo:rerun-if-changed=schema/opencode/memory/model/v1/model.proto");
+    println!("cargo:rerun-if-changed=schema/opencode/memory/graph/v1/graph.proto");
     println!("cargo:rerun-if-changed=schema/opencode/memory/daemon/v1/daemon.proto");
     println!("cargo:rerun-if-changed=build.rs");
 }

@@ -1,5 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "plugin": ["/Users/datnguyen/Projects/opencode-native-memory/dist/index.js"],
   "mcp": {
     "docs.rs": {
       "type": "local",
@@ -18,7 +19,7 @@
     "bitwarden": {
       "type": "local",
       "command": [
-        "bunx",
+        "npx",
         "-y",
         "@bitwarden/mcp-server"
       ],

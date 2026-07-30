@@ -230,6 +230,21 @@ impl MemoryConfig {
     }
 
     #[must_use]
+    pub(crate) fn graph_state_path(&self) -> PathBuf {
+        self.project_data_dir().join("knowledge-graph.json")
+    }
+
+    #[must_use]
+    pub(crate) fn graph_pending_path(&self) -> PathBuf {
+        self.project_data_dir().join("knowledge-graph.pending.json")
+    }
+
+    #[must_use]
+    pub(crate) fn active_embedding_path(&self) -> PathBuf {
+        self.project_data_dir().join("active-embedding.json")
+    }
+
+    #[must_use]
     pub(crate) fn document_index_path(&self) -> PathBuf {
         self.project_data_dir().join("document-index.json")
     }
@@ -281,6 +296,38 @@ impl MemoryConfig {
         );
         hash_fingerprint_field(&mut hasher, &self.embedding.context_size.to_le_bytes());
         hash_fingerprint_field(&mut hasher, b"memory-schema-v4");
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    pub(crate) fn embedding_profile_fingerprint(&self) -> Result<String> {
+        let mut hasher = Sha256::new();
+        let model_identity = match &self.embedding.model_path {
+            Some(path) => {
+                let canonical = canonicalize_nearest_existing(path)?;
+                format!(
+                    "local:{}#sha256:{}",
+                    canonical.display(),
+                    file_sha256(&canonical)?
+                )
+            }
+            None => format!(
+                "hf:{}@{}/{}",
+                self.embedding.repo, self.embedding.revision, self.embedding.filename
+            ),
+        };
+        hash_fingerprint_field(&mut hasher, model_identity.as_bytes());
+        hash_fingerprint_field(&mut hasher, self.embedding.pooling.as_bytes());
+        hash_fingerprint_field(&mut hasher, self.embedding.attention.as_bytes());
+        hash_fingerprint_field(&mut hasher, self.embedding.query_template.as_bytes());
+        hash_fingerprint_field(&mut hasher, self.embedding.passage_template.as_bytes());
+        hash_fingerprint_field(&mut hasher, &[u8::from(self.embedding.add_bos)]);
+        hash_fingerprint_field(&mut hasher, &[u8::from(self.embedding.append_eos)]);
+        hash_fingerprint_field(&mut hasher, &[u8::from(self.embedding.normalize)]);
+        hash_fingerprint_field(
+            &mut hasher,
+            &self.embedding.dimension.unwrap_or_default().to_le_bytes(),
+        );
+        hash_fingerprint_field(&mut hasher, &self.embedding.context_size.to_le_bytes());
         Ok(hex::encode(hasher.finalize()))
     }
 }

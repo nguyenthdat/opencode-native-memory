@@ -74,17 +74,36 @@ export type {
 
 export {
   createModelRequest,
+  createGraphRequest,
   createMemoryRequest,
   createProjectRequest,
   decodeMemoryResponse,
   decodeModelResponse,
+  decodeGraphResponse,
   decodeResponse,
   DelimitedFrameDecoder,
   encodeDelimited,
   encodeRequest,
   isModelMethod,
+  isGraphMethod,
 } from "./protocol.js";
-export type { MemoryMethod, ModelMethod, ProjectRequest } from "./protocol.js";
+export type { GraphMethod, MemoryMethod, ModelMethod, ProjectRequest } from "./protocol.js";
+
+export {
+  createGraphExtractor,
+  OpenCodeGraphExtractor,
+  GraphExtractionValidationError,
+  GRAPH_EXTRACTION_SCHEMA,
+  validateGraphExtractionCandidates,
+} from "./graph-extractor.js";
+export type {
+  GraphExtractionCandidates,
+  GraphEntityCandidate,
+  GraphEvidenceCandidate,
+  GraphExtractorOptions,
+  GraphRelationCandidate,
+  GraphSourceUnit,
+} from "./graph-extractor.js";
 
 export {
   listModelProfiles,

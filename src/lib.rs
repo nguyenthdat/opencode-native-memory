@@ -5,7 +5,9 @@ pub mod daemon;
 mod document;
 mod document_index;
 mod embedding;
+mod embedding_generation;
 mod engine;
+mod graph;
 mod lifecycle;
 pub mod model;
 pub mod rpc;
@@ -21,6 +23,11 @@ pub(crate) mod memory_proto {
 #[allow(clippy::enum_variant_names)]
 pub(crate) mod model_proto {
     include!(concat!(env!("OUT_DIR"), "/opencode.memory.model.v1.rs"));
+}
+
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub(crate) mod graph_proto {
+    include!(concat!(env!("OUT_DIR"), "/opencode.memory.graph.v1.rs"));
 }
 
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]

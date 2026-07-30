@@ -123,6 +123,14 @@ impl RetrievalMode {
             Self::Hybrid => "hybrid_v3_taxonomy",
         }
     }
+
+    pub(crate) const fn graph_score_version(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical_v1_taxonomy+graph_rrf_v1",
+            Self::Dense => "dense_v1_taxonomy+graph_rrf_v1",
+            Self::Hybrid => "hybrid_v3_taxonomy+graph_rrf_v1",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,6 +160,8 @@ pub struct ScoreBreakdown {
     pub calibrated: f32,
     pub retention: f32,
     pub feedback: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_rrf: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -286,6 +296,10 @@ pub struct SearchRequest {
     pub include_superseded: bool,
     #[serde(default)]
     pub track_feedback: bool,
+    /// Add source-memory IDs projected from the bounded knowledge-graph channel
+    /// and fuse them with normal retrieval using rank-only scores.
+    #[serde(default)]
+    pub include_graph: bool,
 }
 
 const fn default_max_results() -> usize {
@@ -733,6 +747,8 @@ pub struct StatusResponse {
     pub zvec_version: String,
     pub embedding_model: String,
     pub embedding_dimension: usize,
+    pub active_profile_id: String,
+    pub active_generation_id: String,
     pub project_root: String,
     pub project_id: String,
     pub collection_path: String,

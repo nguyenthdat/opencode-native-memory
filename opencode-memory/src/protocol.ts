@@ -1,4 +1,7 @@
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, fromJson, toBinary } from "@bufbuild/protobuf";
+import type { DescMessage, JsonObject, JsonValue, Message } from "@bufbuild/protobuf";
+import { isReflectList, isReflectMap, isReflectMessage, reflect } from "@bufbuild/protobuf/reflect";
+import { FeatureSet_FieldPresence } from "@bufbuild/protobuf/wkt";
 import {
   Method,
   RequestSchema,
@@ -35,6 +38,35 @@ import type {
   ModelSwitchPreflight as ProtobufModelSwitchPreflight,
   StartModelSwitchResponse,
 } from "./generated/opencode/memory/model/v1/model_pb.js";
+import {
+  GraphExtractPrepareRequestSchema,
+  GraphExtractPrepareResponseSchema,
+  GraphExtractCancelRequestSchema,
+  GraphExtractCancelResponseSchema,
+  GraphExtractClaimRequestSchema,
+  GraphExtractClaimResponseSchema,
+  GraphExtractEnqueueRequestSchema,
+  GraphExtractEnqueueResponseSchema,
+  GraphExtractFinishRequestSchema,
+  GraphExtractFinishResponseSchema,
+  GraphExtractJobStatusRequestSchema,
+  GraphExtractJobStatusResponseSchema,
+  GraphExtractRenewRequestSchema,
+  GraphExtractRenewResponseSchema,
+  GraphExportRequestSchema,
+  GraphExportResponseSchema,
+  GraphRequestSchema,
+  GraphRunStatusRequestSchema,
+  GraphRunStatusResponseSchema,
+  GraphSearchRequestSchema,
+  GraphSearchResponseSchema,
+  GraphStatusCode,
+  GraphStatusRequestSchema,
+  GraphStatusResponseSchema,
+  GraphUpsertCandidatesRequestSchema,
+  GraphUpsertCandidatesResponseSchema,
+} from "./generated/opencode/memory/graph/v1/graph_pb.js";
+import type { GraphRequest, GraphResponse } from "./generated/opencode/memory/graph/v1/graph_pb.js";
 import type {
   MemoryModelProfile,
   MemoryModelProfilesResponse,
@@ -74,11 +106,27 @@ const MEMORY_METHODS = {
 
 export type ModelMethod =
   "model_profiles" | "model_switch" | "model_switch_status" | "model_switch_cancel";
-export type MemoryMethod = keyof typeof MEMORY_METHODS | ModelMethod;
+export type GraphMethod =
+  | "graph_extract_prepare"
+  | "graph_upsert_candidates"
+  | "graph_run_status"
+  | "graph_extract_enqueue"
+  | "graph_extract_claim"
+  | "graph_extract_renew"
+  | "graph_extract_complete"
+  | "graph_extract_fail"
+  | "graph_extract_finish"
+  | "graph_extract_job_status"
+  | "graph_extract_cancel"
+  | "graph_search"
+  | "graph_status"
+  | "graph_export";
+export type MemoryMethod = keyof typeof MEMORY_METHODS | ModelMethod | GraphMethod;
 
 export type ProjectRequest =
   | { kind: "memory"; request: Request }
-  | { kind: "model"; method: ModelMethod; modelRequest: ModelRequest };
+  | { kind: "model"; method: ModelMethod; modelRequest: ModelRequest }
+  | { kind: "graph"; method: GraphMethod; graphRequest: GraphRequest };
 
 export function encodeRequest(id: number, method: string, params: unknown): Uint8Array {
   return encodeDelimited(toBinary(RequestSchema, createMemoryRequest(id, method, params)));
@@ -154,9 +202,117 @@ export function createModelRequest(id: number, method: ModelMethod, params: unkn
   return create(ModelRequestSchema, { id: BigInt(id), operation });
 }
 
+export function createGraphRequest(id: number, method: GraphMethod, params: unknown): GraphRequest {
+  validateRequestId(id);
+  const values = graphRequestParams(params, method);
+  let operation: GraphRequest["operation"];
+  switch (method) {
+    case "graph_extract_prepare":
+      operation = {
+        case: "extractPrepare",
+        value: fromJson(GraphExtractPrepareRequestSchema, values),
+      };
+      break;
+    case "graph_upsert_candidates":
+      operation = {
+        case: "upsertCandidates",
+        value: fromJson(GraphUpsertCandidatesRequestSchema, values),
+      };
+      break;
+    case "graph_run_status":
+      operation = {
+        case: "runStatus",
+        value: fromJson(GraphRunStatusRequestSchema, values),
+      };
+      break;
+    case "graph_search":
+      operation = {
+        case: "search",
+        value: fromJson(GraphSearchRequestSchema, values),
+      };
+      break;
+    case "graph_status":
+      operation = {
+        case: "status",
+        value: fromJson(GraphStatusRequestSchema, values),
+      };
+      break;
+    case "graph_export":
+      operation = {
+        case: "export",
+        value: fromJson(GraphExportRequestSchema, values),
+      };
+      break;
+    case "graph_extract_enqueue":
+      operation = {
+        case: "extractEnqueue",
+        value: fromJson(GraphExtractEnqueueRequestSchema, values),
+      };
+      break;
+    case "graph_extract_claim":
+      operation = {
+        case: "extractClaim",
+        value: fromJson(GraphExtractClaimRequestSchema, values),
+      };
+      break;
+    case "graph_extract_renew":
+      operation = {
+        case: "extractRenew",
+        value: fromJson(GraphExtractRenewRequestSchema, values),
+      };
+      break;
+    case "graph_extract_complete":
+      operation = {
+        case: "extractFinish",
+        value: fromJson(GraphExtractFinishRequestSchema, {
+          ...values,
+          outcome: "GRAPH_EXTRACT_FINISH_OUTCOME_COMPLETED",
+        }),
+      };
+      break;
+    case "graph_extract_fail": {
+      const retryable = values.retryable !== false;
+      const finishValues = { ...values };
+      delete finishValues.retryable;
+      operation = {
+        case: "extractFinish",
+        value: fromJson(GraphExtractFinishRequestSchema, {
+          ...finishValues,
+          outcome: retryable
+            ? "GRAPH_EXTRACT_FINISH_OUTCOME_RETRYABLE_FAILURE"
+            : "GRAPH_EXTRACT_FINISH_OUTCOME_PERMANENT_FAILURE",
+        }),
+      };
+      break;
+    }
+    case "graph_extract_finish":
+      operation = {
+        case: "extractFinish",
+        value: fromJson(GraphExtractFinishRequestSchema, values),
+      };
+      break;
+    case "graph_extract_job_status":
+      operation = {
+        case: "extractJobStatus",
+        value: fromJson(GraphExtractJobStatusRequestSchema, values),
+      };
+      break;
+    case "graph_extract_cancel":
+      operation = {
+        case: "extractCancel",
+        value: fromJson(GraphExtractCancelRequestSchema, values),
+      };
+      break;
+  }
+  return create(GraphRequestSchema, { id: BigInt(id), operation });
+}
+
 export function createProjectRequest(id: number, method: string, params: unknown): ProjectRequest {
   if (isModelMethod(method)) {
     return { kind: "model", method, modelRequest: createModelRequest(id, method, params) };
+  }
+  if (isGraphMethod(method)) {
+    return { kind: "graph", method, graphRequest: createGraphRequest(id, method, params) };
   }
   return { kind: "memory", request: createMemoryRequest(id, method, params) };
 }
@@ -167,6 +323,25 @@ export function isModelMethod(method: string): method is ModelMethod {
     method === "model_switch" ||
     method === "model_switch_status" ||
     method === "model_switch_cancel"
+  );
+}
+
+export function isGraphMethod(method: string): method is GraphMethod {
+  return (
+    method === "graph_extract_prepare" ||
+    method === "graph_upsert_candidates" ||
+    method === "graph_run_status" ||
+    method === "graph_extract_enqueue" ||
+    method === "graph_extract_claim" ||
+    method === "graph_extract_renew" ||
+    method === "graph_extract_complete" ||
+    method === "graph_extract_fail" ||
+    method === "graph_extract_finish" ||
+    method === "graph_extract_job_status" ||
+    method === "graph_extract_cancel" ||
+    method === "graph_search" ||
+    method === "graph_status" ||
+    method === "graph_export"
   );
 }
 
@@ -243,6 +418,69 @@ export function decodeModelResponse(response: ModelResponse, method: ModelMethod
       break;
     case undefined:
       throw new Error(`Native memory daemon omitted the model result for ${method}`);
+  }
+  return { id, ok: true, result, error: undefined };
+}
+
+export function decodeGraphResponse(response: GraphResponse, method: GraphMethod): RpcResponse {
+  const id = safeNumber(response.id, "graph response ID");
+  const status = response.status;
+  if (!status) throw new Error("Native memory daemon omitted the graph response status");
+  if (status.code !== GraphStatusCode.OK) {
+    return {
+      id,
+      ok: false,
+      error: status.message || `Native memory graph operation failed (${status.code})`,
+    };
+  }
+
+  const expectedCase = graphResultCase(method);
+  if (response.result.case !== expectedCase) {
+    throw new Error(
+      `Native memory daemon returned ${response.result.case ?? "no"} result for ${method}`,
+    );
+  }
+
+  let result: unknown;
+  switch (response.result.case) {
+    case "extractPrepare":
+      result = graphMessageObject(GraphExtractPrepareResponseSchema, response.result.value);
+      break;
+    case "upsertCandidates":
+      result = graphMessageObject(GraphUpsertCandidatesResponseSchema, response.result.value);
+      break;
+    case "runStatus":
+      result = graphMessageObject(GraphRunStatusResponseSchema, response.result.value);
+      break;
+    case "search":
+      result = graphMessageObject(GraphSearchResponseSchema, response.result.value);
+      break;
+    case "graphStatus":
+      result = graphMessageObject(GraphStatusResponseSchema, response.result.value);
+      break;
+    case "export":
+      result = graphMessageObject(GraphExportResponseSchema, response.result.value);
+      break;
+    case "extractEnqueue":
+      result = graphJobResponseObject(GraphExtractEnqueueResponseSchema, response.result.value);
+      break;
+    case "extractClaim":
+      result = graphJobResponseObject(GraphExtractClaimResponseSchema, response.result.value);
+      break;
+    case "extractRenew":
+      result = graphJobResponseObject(GraphExtractRenewResponseSchema, response.result.value);
+      break;
+    case "extractFinish":
+      result = graphJobResponseObject(GraphExtractFinishResponseSchema, response.result.value);
+      break;
+    case "extractJobStatus":
+      result = graphJobResponseObject(GraphExtractJobStatusResponseSchema, response.result.value);
+      break;
+    case "extractCancel":
+      result = graphJobResponseObject(GraphExtractCancelResponseSchema, response.result.value);
+      break;
+    case undefined:
+      throw new Error(`Native memory daemon omitted the graph result for ${method}`);
   }
   return { id, ok: true, result, error: undefined };
 }
@@ -472,6 +710,253 @@ function mapModelSwitchPreflight(preflight: ProtobufModelSwitchPreflight): Model
       message: blocker.message,
     })),
   };
+}
+
+function graphResultCase(method: GraphMethod): Exclude<GraphResponse["result"]["case"], undefined> {
+  switch (method) {
+    case "graph_extract_prepare":
+      return "extractPrepare";
+    case "graph_upsert_candidates":
+      return "upsertCandidates";
+    case "graph_run_status":
+      return "runStatus";
+    case "graph_search":
+      return "search";
+    case "graph_status":
+      return "graphStatus";
+    case "graph_export":
+      return "export";
+    case "graph_extract_enqueue":
+      return "extractEnqueue";
+    case "graph_extract_claim":
+      return "extractClaim";
+    case "graph_extract_renew":
+      return "extractRenew";
+    case "graph_extract_complete":
+    case "graph_extract_fail":
+    case "graph_extract_finish":
+      return "extractFinish";
+    case "graph_extract_job_status":
+      return "extractJobStatus";
+    case "graph_extract_cancel":
+      return "extractCancel";
+  }
+}
+
+function graphRequestParams(params: unknown, method: GraphMethod): JsonObject {
+  const value = graphJsonValue(params, `Memory ${method} parameters`, 0, new Set());
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Memory ${method} parameters must be an object`);
+  }
+
+  const authorization = requiredGraphObjectParam(value, "authorization", method);
+  requiredGraphStringParam(authorization, "session_scope_key", method);
+  requiredGraphStringParam(authorization, "agent_scope_key", method);
+  switch (method) {
+    case "graph_extract_prepare":
+      break;
+    case "graph_upsert_candidates":
+      requiredGraphStringParam(value, "extraction_run_id", method);
+      const provider = requiredGraphObjectParam(value, "provider", method);
+      for (const key of [
+        "provider_id",
+        "model_id",
+        "extractor_version",
+        "prompt_version",
+        "schema_version",
+      ]) {
+        requiredGraphStringParam(provider, key, method);
+      }
+      break;
+    case "graph_run_status":
+      requiredGraphStringParam(value, "extraction_run_id", method);
+      break;
+    case "graph_extract_enqueue": {
+      requiredGraphStringParam(value, "job_id", method);
+      const provider = requiredGraphObjectParam(value, "provider", method);
+      for (const key of [
+        "provider_id",
+        "model_id",
+        "extractor_version",
+        "prompt_version",
+        "schema_version",
+      ]) {
+        requiredGraphStringParam(provider, key, method);
+      }
+      break;
+    }
+    case "graph_extract_claim":
+      requiredGraphStringParam(value, "claim_request_id", method);
+      requiredGraphStringParam(value, "worker_id", method);
+      break;
+    case "graph_extract_renew":
+      requiredGraphStringParam(value, "job_id", method);
+      requiredGraphStringParam(value, "lease_token", method);
+      break;
+    case "graph_extract_complete":
+      requiredGraphStringParam(value, "job_id", method);
+      requiredGraphStringParam(value, "lease_token", method);
+      requiredGraphStringParam(value, "extraction_run_id", method);
+      break;
+    case "graph_extract_fail":
+      requiredGraphStringParam(value, "job_id", method);
+      requiredGraphStringParam(value, "lease_token", method);
+      requiredGraphStringParam(value, "extraction_run_id", method);
+      requiredGraphStringParam(value, "error_code", method);
+      break;
+    case "graph_extract_finish":
+      requiredGraphStringParam(value, "job_id", method);
+      requiredGraphStringParam(value, "lease_token", method);
+      requiredGraphStringParam(value, "extraction_run_id", method);
+      requiredGraphStringParam(value, "outcome", method);
+      break;
+    case "graph_extract_job_status":
+      requiredGraphStringParam(value, "job_id", method);
+      break;
+    case "graph_extract_cancel":
+      requiredGraphStringParam(value, "job_id", method);
+      break;
+    case "graph_search":
+      requiredGraphStringParam(value, "query", method);
+      break;
+    case "graph_status":
+    case "graph_export":
+      break;
+  }
+  return value;
+}
+
+function graphJsonValue(
+  value: unknown,
+  label: string,
+  depth: number,
+  ancestors: Set<object>,
+): JsonValue {
+  if (depth > MAX_VALUE_DEPTH) {
+    throw new Error(`${label} nesting exceeds limit`);
+  }
+  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "bigint") {
+    if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error(`${label} contains an integer outside the JavaScript safe range`);
+    }
+    return value.toString();
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error(`${label} contains a non-finite number`);
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Error(`${label} contains an integer outside the JavaScript safe range`);
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) throw new Error(`${label} contains a cyclic object`);
+    const nextAncestors = new Set(ancestors).add(value);
+    return value.map((item) => graphJsonValue(item, label, depth + 1, nextAncestors));
+  }
+  if (typeof value === "object") {
+    if (ancestors.has(value)) throw new Error(`${label} contains a cyclic object`);
+    const nextAncestors = new Set(ancestors).add(value);
+    const object: JsonObject = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (item !== undefined) {
+        object[key] = graphJsonValue(item, `${label}.${key}`, depth + 1, nextAncestors);
+      }
+    }
+    return object;
+  }
+  throw new Error(`${label} contains an unsupported value: ${typeof value}`);
+}
+
+function requiredGraphObjectParam(
+  params: JsonObject,
+  key: string,
+  method: GraphMethod,
+): JsonObject {
+  const value = params[key];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Memory ${method} requires ${key} to be an object`);
+  }
+  return value;
+}
+
+function requiredGraphStringParam(params: JsonObject, key: string, method: GraphMethod): string {
+  const value = params[key];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Memory ${method} requires a non-empty ${key}`);
+  }
+  return value;
+}
+
+function graphMessageObject(desc: DescMessage, message: Message): Record<string, unknown> {
+  const reflected = reflect(desc, message);
+  const result: Record<string, unknown> = {};
+  for (const field of reflected.fields) {
+    if (
+      reflected.isSet(field) ||
+      field.fieldKind === "list" ||
+      field.fieldKind === "map" ||
+      field.presence === FeatureSet_FieldPresence.IMPLICIT
+    ) {
+      result[field.name] = graphReflectValue(reflected.get(field), `graph ${field.name}`);
+    }
+  }
+  return result;
+}
+
+function graphJobResponseObject(desc: DescMessage, message: Message): Record<string, unknown> {
+  const result = graphMessageObject(desc, message);
+  if (
+    typeof result.outcome === "string" &&
+    !["cancelled", "cancel_requested", "already_terminal"].includes(result.outcome)
+  ) {
+    throw new Error(`Native memory daemon returned unknown graph cancel outcome ${result.outcome}`);
+  }
+  const job = result.job;
+  if (job === null || typeof job !== "object" || Array.isArray(job)) return result;
+  const jobRecord = job as Record<string, unknown>;
+  const state = jobRecord.state;
+  if (typeof state !== "number") return result;
+  return {
+    ...result,
+    job: {
+      ...jobRecord,
+      state: graphExtractionJobState(state),
+    },
+  };
+}
+
+function graphExtractionJobState(value: number): string {
+  switch (value) {
+    case 1:
+      return "queued";
+    case 2:
+      return "claimed";
+    case 3:
+      return "running";
+    case 4:
+      return "completed";
+    case 5:
+      return "failed";
+    case 6:
+      return "cancelled";
+    default:
+      throw new Error(`Native memory daemon returned unknown graph job state ${value}`);
+  }
+}
+
+function graphReflectValue(value: unknown, label: string): unknown {
+  if (isReflectMessage(value)) return graphMessageObject(value.desc, value.message);
+  if (isReflectList(value)) {
+    return Array.from(value, (item) => graphReflectValue(item, label));
+  }
+  if (isReflectMap(value)) {
+    return Object.fromEntries(
+      Array.from(value, ([key, item]) => [key, graphReflectValue(item, label)]),
+    );
+  }
+  if (typeof value === "bigint") return safeNumber(value, label);
+  return value;
 }
 
 function modelResultCase(method: ModelMethod): Exclude<ModelResponse["result"]["case"], undefined> {

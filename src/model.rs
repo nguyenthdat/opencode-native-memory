@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::MemoryConfig;
 use crate::config::{EmbeddingConfig, hash_hex};
+use crate::embedding_generation::ActiveEmbedding;
 
 const CURRENT_PROFILE_ID: &str = "qwen3-text-4b-q4";
 const CURRENT_PROFILE_REPOSITORY: &str = "Qwen/Qwen3-Embedding-4B-GGUF";
@@ -108,9 +109,13 @@ pub struct ModelSwitchResponse {
     pub preflight: ModelSwitchPreflight,
 }
 
-pub fn profiles(config: &MemoryConfig) -> ModelProfilesResponse {
+pub fn profiles(config: &MemoryConfig) -> anyhow::Result<ModelProfilesResponse> {
     let embedding = config.embedding();
-    let active_profile_id = active_profile_id(embedding);
+    let persisted = ActiveEmbedding::load(&config.active_embedding_path(), config.project_id())?;
+    let active_profile_id = persisted.as_ref().map_or_else(
+        || configured_profile_id(embedding),
+        |active| active.profile_id.clone(),
+    );
     let installed_current =
         active_profile_id == CURRENT_PROFILE_ID && current_profile_installed(config.model_cache());
     let mut profiles = vec![
@@ -135,13 +140,14 @@ pub fn profiles(config: &MemoryConfig) -> ModelProfilesResponse {
     if active_profile_id == "legacy-custom" {
         profiles.insert(0, custom_profile(embedding));
     }
-    ModelProfilesResponse {
+    Ok(ModelProfilesResponse {
         catalog_version: 1,
         catalog_digest: catalog_digest(),
         active_profile_id,
-        active_generation_id: "legacy".to_string(),
+        active_generation_id: persisted
+            .map_or_else(|| "legacy".to_string(), |active| active.generation_id),
         profiles,
-    }
+    })
 }
 
 fn custom_profile(config: &EmbeddingConfig) -> ModelProfile {
@@ -184,7 +190,7 @@ pub fn preflight(
     config: &MemoryConfig,
     request: &ModelSwitchRequest,
 ) -> anyhow::Result<ModelSwitchResponse> {
-    let catalog = profiles(config);
+    let catalog = profiles(config)?;
     let target = catalog
         .profiles
         .iter()
@@ -269,8 +275,22 @@ pub fn preflight(
     })
 }
 
-fn active_profile_id(config: &EmbeddingConfig) -> String {
-    if config == &EmbeddingConfig::default() {
+pub(crate) fn configured_profile_id(config: &EmbeddingConfig) -> String {
+    let default = EmbeddingConfig::default();
+    if config.model_path.is_none()
+        && config.repo == default.repo
+        && config.filename == default.filename
+        && config.revision == default.revision
+        && config.pooling == default.pooling
+        && config.attention == default.attention
+        && config.query_template == default.query_template
+        && config.passage_template == default.passage_template
+        && config.add_bos == default.add_bos
+        && config.append_eos == default.append_eos
+        && config.normalize == default.normalize
+        && config.dimension == default.dimension
+        && config.context_size == default.context_size
+    {
         CURRENT_PROFILE_ID.to_string()
     } else {
         "legacy-custom".to_string()
@@ -493,7 +513,9 @@ fn catalog_digest() -> String {
 mod tests {
     use std::fs;
 
-    use super::{CURRENT_PROFILE_ID, ModelSwitchRequest, active_profile_id, preflight, profiles};
+    use super::{
+        CURRENT_PROFILE_ID, ModelSwitchRequest, configured_profile_id, preflight, profiles,
+    };
     use crate::{EmbeddingConfig, MemoryConfig};
 
     fn config() -> (tempfile::TempDir, MemoryConfig) {
@@ -509,7 +531,7 @@ mod tests {
     #[test]
     fn current_profile_is_the_only_stable_default() {
         let (_temp, config) = config();
-        let response = profiles(&config);
+        let response = profiles(&config).expect("profiles");
         assert_eq!(response.active_profile_id, CURRENT_PROFILE_ID);
         assert_eq!(
             response
@@ -539,7 +561,7 @@ mod tests {
             .expect("create model cache");
         fs::write(&artifact, b"model").expect("write cached artifact");
 
-        assert!(profiles(&config).profiles[0].installed);
+        assert!(profiles(&config).expect("profiles").profiles[0].installed);
     }
 
     #[test]
@@ -573,12 +595,19 @@ mod tests {
             repo: "custom/model".to_string(),
             ..EmbeddingConfig::default()
         };
-        assert_eq!(active_profile_id(&config), "legacy-custom");
+        assert_eq!(configured_profile_id(&config), "legacy-custom");
 
         let local_override = EmbeddingConfig {
             model_path: Some("custom.gguf".into()),
             ..EmbeddingConfig::default()
         };
-        assert_eq!(active_profile_id(&local_override), "legacy-custom");
+        assert_eq!(configured_profile_id(&local_override), "legacy-custom");
+
+        let runtime_tuned = EmbeddingConfig {
+            threads: Some(4),
+            gpu_layers: Some(99),
+            ..EmbeddingConfig::default()
+        };
+        assert_eq!(configured_profile_id(&runtime_tuned), CURRENT_PROFILE_ID);
     }
 }

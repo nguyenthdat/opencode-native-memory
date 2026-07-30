@@ -21,6 +21,8 @@ use crate::validation::{
 const MAX_EXCERPT_CHARS: usize = 1_600;
 const MAX_CANDIDATES: usize = 1_000;
 const ABSTENTION_THRESHOLD: f32 = 0.42;
+const GRAPH_RRF_WEIGHT: f32 = 0.25;
+const GRAPH_ONLY_RRF_WEIGHT: f32 = 0.45;
 
 impl MemoryEngine {
     /// Search dense and lexical channels, calibrate scores, apply lifecycle
@@ -53,41 +55,67 @@ impl MemoryEngine {
             .unwrap_or(MAX_CANDIDATES)
             .min(MAX_CANDIDATES);
         let filter = kind_filter(&request.kinds);
-        let (dense_documents, lexical_documents, warnings) = match request.retrieval_mode {
+        let (dense_documents, lexical_documents, warnings, effective_mode) = match request
+            .retrieval_mode
+        {
             RetrievalMode::Lexical => (
                 Vec::new(),
                 self.lexical_query(&query_text, candidate_count, filter.as_deref())?,
                 Vec::new(),
+                RetrievalMode::Lexical,
             ),
-            RetrievalMode::Dense => {
-                let query_embedding = self.embed_query(&query_text)?;
-                (
+            RetrievalMode::Dense => match self.embed_query(&query_text) {
+                Ok(query_embedding) => (
                     self.dense_query(&query_embedding, candidate_count, filter.as_deref())?,
                     Vec::new(),
                     Vec::new(),
-                )
-            }
-            RetrievalMode::Hybrid => {
-                let query_embedding = self.embed_query(&query_text)?;
-                let dense =
-                    self.dense_query(&query_embedding, candidate_count, filter.as_deref())?;
-                let (lexical, warnings) =
-                    match self.lexical_query(&query_text, candidate_count, filter.as_deref()) {
-                        Ok(documents) => (documents, Vec::new()),
-                        Err(error) => (
-                            Vec::new(),
-                            vec![format!(
-                                "lexical retrieval degraded to dense-only: {error:#}"
-                            )],
-                        ),
-                    };
-                (dense, lexical, warnings)
-            }
+                    RetrievalMode::Dense,
+                ),
+                Err(error) => (
+                    Vec::new(),
+                    self.lexical_query(&query_text, candidate_count, filter.as_deref())?,
+                    vec![format!(
+                        "dense retrieval degraded to lexical-only because the embedding backend is unavailable: {error:#}"
+                    )],
+                    RetrievalMode::Lexical,
+                ),
+            },
+            RetrievalMode::Hybrid => match self.embed_query(&query_text) {
+                Ok(query_embedding) => {
+                    let dense =
+                        self.dense_query(&query_embedding, candidate_count, filter.as_deref())?;
+                    let (lexical, warnings) =
+                        match self.lexical_query(&query_text, candidate_count, filter.as_deref()) {
+                            Ok(documents) => (documents, Vec::new()),
+                            Err(error) => (
+                                Vec::new(),
+                                vec![format!(
+                                    "lexical retrieval degraded to dense-only: {error:#}"
+                                )],
+                            ),
+                        };
+                    (dense, lexical, warnings, RetrievalMode::Hybrid)
+                }
+                Err(error) => (
+                    Vec::new(),
+                    self.lexical_query(&query_text, candidate_count, filter.as_deref())?,
+                    vec![format!(
+                        "hybrid retrieval degraded to lexical-only because the embedding backend is unavailable: {error:#}"
+                    )],
+                    RetrievalMode::Lexical,
+                ),
+            },
         };
         let candidates = merge_candidates(&dense_documents, &lexical_documents)?;
-        let considered = candidates.len();
+        let mut considered = candidates.len();
         let now = now_ms()?;
-        let ranked = self.rank_candidates(candidates, request, &query_text, now)?;
+        let mut ranked =
+            self.rank_candidates(candidates, request, &query_text, now, effective_mode)?;
+        if request.include_graph {
+            let graph_ids = self.graph_ranked_memory_ids(&query_text, request, max_results)?;
+            considered = considered.saturating_add(graph_ids.len());
+            ranked = self.fuse_graph_channel(ranked, &graph_ids, request, now)?;
+        }
         let mut state_dirty = false;
 
         let ranked = deduplicate_layers(ranked);
@@ -131,7 +159,11 @@ impl MemoryEngine {
             used_chars,
             abstained,
             abstention_reason,
-            score_version: request.retrieval_mode.score_version(),
+            score_version: if request.include_graph {
+                request.retrieval_mode.graph_score_version()
+            } else {
+                request.retrieval_mode.score_version()
+            },
             warnings,
             memories,
         })
@@ -143,6 +175,7 @@ impl MemoryEngine {
         request: &SearchRequest,
         query_text: &str,
         now: i64,
+        effective_mode: RetrievalMode,
     ) -> Result<Vec<RankedMemory>> {
         let mut ranked = Vec::with_capacity(candidates.len());
         let mut candidates = candidates.into_values().collect::<Vec<_>>();
@@ -187,14 +220,14 @@ impl MemoryEngine {
             let reciprocal_rank = normalized_reciprocal_rank(
                 candidate.dense_rank,
                 candidate.lexical_rank,
-                request.retrieval_mode,
+                effective_mode,
             );
             let channel_agreement =
                 f32::from(candidate.dense_rank.is_some() && candidate.lexical_rank.is_some());
             // Phase 1: per-candidate retrieval profile weights from taxonomy.
             let (w_dense, w_rr, w_lex, w_agree) = metadata.taxonomy.retrieval_profile().weights();
             let raw = mode_score(
-                request.retrieval_mode,
+                effective_mode,
                 dense,
                 reciprocal_rank,
                 lexical,
@@ -225,10 +258,110 @@ impl MemoryEngine {
                 calibrated,
                 retention,
                 feedback,
+                graph_rrf: None,
             });
             ranked.push(RankedMemory { memory, score });
         }
         Ok(ranked)
+    }
+
+    fn fuse_graph_channel(
+        &self,
+        mut ranked: Vec<RankedMemory>,
+        graph_ids: &[String],
+        request: &SearchRequest,
+        now: i64,
+    ) -> Result<Vec<RankedMemory>> {
+        if graph_ids.is_empty() {
+            return Ok(ranked);
+        }
+        let graph_ranks = graph_ids
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (id.as_str(), rank))
+            .collect::<HashMap<_, _>>();
+        let mut present = ranked
+            .iter()
+            .map(|candidate| candidate.memory.id.clone())
+            .collect::<HashSet<_>>();
+        for id in graph_ids {
+            if !present.insert(id.clone()) {
+                continue;
+            }
+            let Some(memory) = self.graph_memory_record(id, request, now)? else {
+                continue;
+            };
+            ranked.push(RankedMemory { memory, score: 0.0 });
+        }
+
+        let threshold = request.min_score.max(ABSTENTION_THRESHOLD);
+        ranked.retain_mut(|candidate| {
+            let Some(rank) = graph_ranks.get(candidate.memory.id.as_str()).copied() else {
+                return candidate.score >= threshold;
+            };
+            let graph_rrf = reciprocal_rank(rank);
+            let score = graph_fused_score(candidate.score, graph_rrf);
+            candidate.score = score;
+            candidate.memory.score = Some(score);
+            if let Some(breakdown) = candidate.memory.score_breakdown.as_mut() {
+                breakdown.graph_rrf = Some(graph_rrf);
+            } else {
+                candidate.memory.score_breakdown = Some(ScoreBreakdown {
+                    dense: 0.0,
+                    reciprocal_rank: 0.0,
+                    lexical: 0.0,
+                    channel_agreement: 0.0,
+                    calibrated: 0.0,
+                    retention: 1.0,
+                    feedback: 1.0,
+                    graph_rrf: Some(graph_rrf),
+                });
+            }
+            score >= threshold
+        });
+        Ok(ranked)
+    }
+
+    fn graph_memory_record(
+        &self,
+        id: &str,
+        request: &SearchRequest,
+        now: i64,
+    ) -> Result<Option<MemoryRecord>> {
+        if self.state.pending_deletes.contains(id) {
+            return Ok(None);
+        }
+        let Some(metadata) = self.state.records.get(id).cloned() else {
+            return Ok(None);
+        };
+        if !scope_visible(&metadata, request)
+            || is_expired(&metadata, now)
+            || (!request.include_superseded && metadata.is_superseded())
+            || (!request.taxonomies.is_empty() && !request.taxonomies.contains(&metadata.taxonomy))
+        {
+            return Ok(None);
+        }
+        let stale = crate::validation::anchors_stale(&self.config, &metadata.code_anchors);
+        if stale && !request.include_stale {
+            return Ok(None);
+        }
+        let Some(document) = self
+            .fetch_documents(std::slice::from_ref(&id.to_string()))?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let stored = stored_memory_from_doc(&document)?;
+        if !request.kinds.is_empty() && !request.kinds.contains(&stored.kind) {
+            return Ok(None);
+        }
+        let revision = self.state.record_revision(id, stored.updated_at_ms);
+        let mut memory = decorate_memory(stored, metadata, stale, revision);
+        memory.content = truncate_chars(&memory.content, MAX_EXCERPT_CHARS);
+        memory.score = None;
+        memory.score_breakdown = None;
+        Ok(Some(memory))
     }
 
     fn dense_query(
@@ -310,10 +443,7 @@ fn normalized_reciprocal_rank(
     mode: RetrievalMode,
 ) -> f32 {
     fn channel(rank: Option<usize>) -> f32 {
-        rank.map_or(0.0, |rank| {
-            let rank = f32::from(u16::try_from(rank).unwrap_or(u16::MAX));
-            61.0 / (61.0 + rank)
-        })
+        rank.map_or(0.0, reciprocal_rank)
     }
     match mode {
         RetrievalMode::Lexical => channel(lexical_rank),
@@ -321,6 +451,19 @@ fn normalized_reciprocal_rank(
         RetrievalMode::Hybrid => {
             (0.65 * channel(dense_rank) + 0.35 * channel(lexical_rank)).clamp(0.0, 1.0)
         }
+    }
+}
+
+fn reciprocal_rank(rank: usize) -> f32 {
+    let rank = f32::from(u16::try_from(rank).unwrap_or(u16::MAX));
+    61.0 / (61.0 + rank)
+}
+
+fn graph_fused_score(normal_score: f32, graph_rrf: f32) -> f32 {
+    if normal_score > 0.0 {
+        (normal_score * (1.0 - GRAPH_RRF_WEIGHT) + graph_rrf * GRAPH_RRF_WEIGHT).clamp(0.0, 1.0)
+    } else {
+        (graph_rrf * GRAPH_ONLY_RRF_WEIGHT).clamp(0.0, 1.0)
     }
 }
 
@@ -562,8 +705,8 @@ fn kind_filter(kinds: &[MemoryKind]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RankedMemory, deduplicate_layers, kind_filter, lexical_score, logistic, mode_score,
-        normalized_reciprocal_rank,
+        RankedMemory, deduplicate_layers, graph_fused_score, kind_filter, lexical_score, logistic,
+        mode_score, normalized_reciprocal_rank, reciprocal_rank,
     };
     use crate::contract::{
         FeedbackStats, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, RetrievalMode,
@@ -588,6 +731,16 @@ mod tests {
         assert!(both <= 1.0);
         assert!(logistic(-5.0) < logistic(0.0));
         assert!(logistic(0.0) < logistic(5.0));
+    }
+
+    #[test]
+    fn graph_fusion_uses_rank_without_mixing_raw_channel_scores() {
+        assert!(reciprocal_rank(0) > reciprocal_rank(1));
+        let graph_only = graph_fused_score(0.0, reciprocal_rank(0));
+        let fused = graph_fused_score(0.8, reciprocal_rank(0));
+        assert!(graph_only >= 0.42);
+        assert!(fused > 0.8);
+        assert!(fused <= 1.0);
     }
 
     #[test]
