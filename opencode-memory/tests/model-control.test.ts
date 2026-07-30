@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import type { NativeMemoryRequester } from "./daemon-client.js";
-import { listModelProfiles, preflightModelSwitch } from "./model-control.js";
-import type { MemoryMethod } from "./protocol.js";
+import type { NativeMemoryRequester } from "../src/daemon-client.js";
+import { listModelProfiles, preflightModelSwitch } from "../src/model-control.js";
+import type { MemoryMethod } from "../src/protocol.js";
 
 describe("model control", () => {
   test("profile listing is one side-effect-free native request", async () => {
@@ -40,6 +40,7 @@ describe("model control", () => {
           allow_dense_downtime: true,
           force_rebuild: true,
           expected_active_profile_id: "qwen3-text-4b-q4",
+          retain_previous: true,
           dry_run: true,
         },
       },

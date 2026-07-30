@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const DATA_SUBDIR: &str = "opencode/memory";
@@ -13,7 +14,8 @@ const DEFAULT_MODEL_REVISION: &str = "f4602530db1d980e16da9d7d3a70294cf5c190be";
 const DEFAULT_QUERY_TEMPLATE: &str = "Instruct: Given a code search query, retrieve relevant passages that answer the query\nQuery:{text}";
 
 /// Runtime configuration for a llama.cpp-compatible GGUF embedding model.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
     pub(crate) model_path: Option<PathBuf>,
     pub(crate) repo: String,
@@ -115,7 +117,6 @@ pub struct MemoryConfig {
     data_root: PathBuf,
     model_cache: PathBuf,
     embedding: EmbeddingConfig,
-    configuration_fingerprint: Option<String>,
 }
 
 impl MemoryConfig {
@@ -156,7 +157,6 @@ impl MemoryConfig {
             data_root,
             model_cache,
             embedding: EmbeddingConfig::default(),
-            configuration_fingerprint: None,
         }
     }
 
@@ -189,9 +189,8 @@ impl MemoryConfig {
         self
     }
 
-    pub(crate) fn with_configuration_fingerprint(mut self, fingerprint: String) -> Self {
-        self.configuration_fingerprint = Some(fingerprint);
-        self
+    pub(crate) fn set_embedding(&mut self, embedding: EmbeddingConfig) {
+        self.embedding = embedding;
     }
 
     #[must_use]
@@ -245,6 +244,36 @@ impl MemoryConfig {
     }
 
     #[must_use]
+    pub(crate) fn model_switch_path(&self) -> PathBuf {
+        self.project_data_dir().join("model-switch.json")
+    }
+
+    #[must_use]
+    pub(crate) fn embedding_generations_dir(&self) -> PathBuf {
+        self.project_data_dir().join("embedding-generations")
+    }
+
+    #[must_use]
+    pub(crate) fn embedding_generation_dir(&self, generation_id: &str) -> PathBuf {
+        self.embedding_generations_dir().join(generation_id)
+    }
+
+    pub(crate) fn actor_compatibility_fingerprint(&self) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hash_fingerprint_field(&mut hasher, self.project_root.to_string_lossy().as_bytes());
+        hash_fingerprint_field(&mut hasher, self.project_id.as_bytes());
+        hash_fingerprint_field(&mut hasher, b"memory-schema-v4");
+        hash_fingerprint_field(&mut hasher, b"single-writer-project-actor-v1");
+        if !self.active_embedding_path().is_file() {
+            hash_fingerprint_field(
+                &mut hasher,
+                self.embedding_profile_fingerprint()?.as_bytes(),
+            );
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    #[must_use]
     pub(crate) fn document_index_path(&self) -> PathBuf {
         self.project_data_dir().join("document-index.json")
     }
@@ -262,9 +291,6 @@ impl MemoryConfig {
     }
 
     pub(crate) fn configuration_fingerprint(&self) -> Result<String> {
-        if let Some(fingerprint) = &self.configuration_fingerprint {
-            return Ok(fingerprint.clone());
-        }
         let mut hasher = Sha256::new();
         hash_fingerprint_field(&mut hasher, self.project_root.to_string_lossy().as_bytes());
         hash_fingerprint_field(&mut hasher, self.project_id.as_bytes());
@@ -674,6 +700,33 @@ mod tests {
             changed_template
                 .configuration_fingerprint()
                 .expect("template fingerprint")
+        );
+    }
+
+    #[test]
+    fn actor_compatibility_fingerprint_separates_bootstrap_profiles() {
+        let temp = tempfile::tempdir().expect("temp");
+        let base = MemoryConfig::new(
+            temp.path().join("project"),
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        );
+        let different = base.clone().with_embedding(EmbeddingConfig {
+            repo: "Qwen/Qwen3-Embedding-0.6B-GGUF".to_string(),
+            filename: "Qwen3-Embedding-0.6B-Q8_0.gguf".to_string(),
+            revision: "370f27d7550e0def9b39c1f16d3fbaa13aa67728".to_string(),
+            dimension: Some(1024),
+            ..EmbeddingConfig::default()
+        });
+        assert_ne!(
+            base.actor_compatibility_fingerprint().expect("fingerprint"),
+            different
+                .actor_compatibility_fingerprint()
+                .expect("fingerprint")
+        );
+        assert_ne!(
+            base.configuration_fingerprint().expect("fingerprint"),
+            different.configuration_fingerprint().expect("fingerprint")
         );
     }
 

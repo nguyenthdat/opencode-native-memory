@@ -282,6 +282,19 @@ impl MemoryState {
         self.record_revisions.insert(id.into(), updated_at_ms);
     }
 
+    pub(crate) fn canonical_revision_digest(&self) -> Result<String> {
+        let mut records = Vec::with_capacity(self.records.len());
+        for (id, metadata) in &self.records {
+            let mut value = serde_json::to_value(metadata)?;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("feedback");
+            }
+            records.push((id.clone(), value, self.record_revisions.get(id).copied()));
+        }
+        records.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(hash_hex(&serde_json::to_vec(&records)?))
+    }
+
     pub(crate) fn is_tombstoned(&self, fingerprint: &str) -> bool {
         self.tombstones.contains_key(fingerprint)
     }
@@ -957,6 +970,32 @@ mod tests {
             }
         }
         assert_eq!(current, c);
+    }
+
+    #[test]
+    fn canonical_revision_digest_ignores_feedback_only_changes() {
+        let mut state = MemoryState::default();
+        state
+            .records
+            .insert("memory-a".to_string(), metadata_with_superseded_by(None));
+        let original = state.canonical_revision_digest().expect("initial digest");
+
+        state
+            .records
+            .get_mut("memory-a")
+            .expect("metadata")
+            .feedback
+            .used = 1;
+        assert_eq!(
+            state.canonical_revision_digest().expect("feedback digest"),
+            original
+        );
+
+        state.records.get_mut("memory-a").expect("metadata").pinned = true;
+        assert_ne!(
+            state.canonical_revision_digest().expect("semantic digest"),
+            original
+        );
     }
 
     fn metadata_with_superseded_by(superseded_by: Option<String>) -> MemoryMetadata {

@@ -22,6 +22,7 @@ const required = [
   "dist/server.d.ts",
   "dist/tui.js",
   "dist/tui.d.ts",
+  "dist/cli.js",
   "dist/generated/opencode/memory/v1/memory_pb.js",
   "dist/generated/opencode/memory/model/v1/model_pb.js",
   "dist/generated/opencode/memory/daemon/v1/daemon_pb.js",

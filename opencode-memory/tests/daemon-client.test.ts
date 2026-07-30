@@ -6,7 +6,7 @@ import {
   NativeMemoryClient,
   NativeMemoryClientPool,
   resolveDaemonEndpoint,
-} from "./daemon-client.js";
+} from "../src/daemon-client.js";
 
 class TrackingClient extends NativeMemoryClient {
   disposeCalls = 0;
@@ -55,12 +55,12 @@ describe("shared daemon client", () => {
         "/tmp/opencode-memory/daemon.sock",
       ),
     ).toThrow(
-      "Native memory daemon domain schema mismatch at /tmp/opencode-memory/daemon.sock: client 4, daemon 2 (plugin 0.6.0, daemon 0.6.0, pid 64346)",
+      "Native memory daemon domain schema mismatch at /tmp/opencode-memory/daemon.sock: client 5, daemon 2 (plugin 0.6.0, daemon 0.6.0, pid 64346). Close all OpenCode processes using memory and restart the native memory daemon.",
     );
     expect(() =>
       assertDaemonSchemaCompatible(
         "0.6.0",
-        { daemonVersion: "0.6.0", domainSchemaGeneration: 4, pid: 64346 },
+        { daemonVersion: "0.6.0", domainSchemaGeneration: 5, pid: 64346 },
         "/tmp/opencode-memory/daemon.sock",
       ),
     ).not.toThrow();

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { isSupportedDocumentPath, resolveMemoryPluginOptions } from "./plugin.js";
+import { isSupportedDocumentPath, resolveMemoryPluginOptions } from "../src/plugin.js";
 
 const ENVIRONMENT_KEYS = [
   "OPENCODE_MEMORY_WARMUP",

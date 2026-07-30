@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { MemoryRecord } from "./contracts.js";
-import { validateDeleteRecords } from "./validation.js";
+import type { MemoryRecord } from "../src/contracts.js";
+import { validateDeleteRecords } from "../src/validation.js";
 
 describe("validateDeleteRecords", () => {
   test("allows local memory scopes", () => {

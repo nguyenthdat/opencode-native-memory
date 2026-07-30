@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { DaemonOutcomeUnknownError, type NativeMemoryRequester } from "./daemon-client.js";
-import { MemoryMaintenanceScheduler } from "./maintenance.js";
-import { requestIdempotently } from "./outcome-reconciliation.js";
-import type { MemoryMethod } from "./protocol.js";
+import { DaemonOutcomeUnknownError, type NativeMemoryRequester } from "../src/daemon-client.js";
+import { MemoryMaintenanceScheduler } from "../src/maintenance.js";
+import { requestIdempotently } from "../src/outcome-reconciliation.js";
+import type { MemoryMethod } from "../src/protocol.js";
 
 describe("memory maintenance", () => {
   test("reconciles an idempotent maintenance mutation once", async () => {

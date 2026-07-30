@@ -476,6 +476,11 @@ export interface NativeMemoryStatus {
   embedding_dimension: number;
   active_profile_id: string;
   active_generation_id: string;
+  switch_state: ModelSwitchResponse["state"] | null;
+  switch_id: string | null;
+  target_profile_id: string | null;
+  switch_fraction: number | null;
+  dense_search_available: boolean;
   project_root: string;
   project_id: string;
   collection_path: string;
@@ -609,6 +614,12 @@ export interface ModelSwitchStatusResponse {
   target_generation_id: string | null;
   completed_records: number;
   total_records: number;
+  fraction: number;
+  cancel_requested: boolean;
+  dense_search_available: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  completed_at_ms: number | null;
   error: ModelProfileReason | null;
 }
 

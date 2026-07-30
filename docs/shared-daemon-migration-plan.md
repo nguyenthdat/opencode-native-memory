@@ -1365,8 +1365,8 @@ Protocol generation and verification:
 
 Tests and CI:
 
-- `opencode-memory/src/daemon-client.test.ts`: cover daemon connection and shared lease lifecycle.
-- `opencode-memory/src/protocol.test.ts`: add daemon envelopes and generated service tests.
+- `opencode-memory/tests/daemon-client.test.ts`: cover daemon connection and shared lease lifecycle.
+- `opencode-memory/tests/protocol.test.ts`: add daemon envelopes and generated service tests.
 - `tests/`: add Rust daemon integration tests.
 - `scripts/` or `tests/`: add multi-process black-box tests.
 - `.github/workflows/ci.yml`: run daemon startup, same-project concurrency, and packaging tests.

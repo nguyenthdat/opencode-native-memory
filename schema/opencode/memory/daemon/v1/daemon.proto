@@ -136,6 +136,8 @@ message AcquireProjectRequest {
   optional string data_dir = 5;
   EmbeddingIdentity embedding = 6;
   optional string model_cache = 7;
+  optional string initial_profile_id = 8;
+  optional string expected_profile_id = 9;
 }
 
 message AcquireProjectResponse {
@@ -143,6 +145,8 @@ message AcquireProjectResponse {
   string lease_id = 2;
   string canonical_project_id = 3;
   string store_key_hash = 4;
+  string active_profile_id = 5;
+  string active_generation_id = 6;
 }
 
 message ProjectCallRequest {

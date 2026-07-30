@@ -38,6 +38,10 @@ struct Manifest {
     configuration_fingerprint: Option<String>,
     zvec_version: String,
     created_at_ms: i64,
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    generation_id: Option<String>,
 }
 
 pub(crate) fn initialize() -> Result<()> {
@@ -53,9 +57,71 @@ pub(crate) fn open_collection(
     embedding_dimension: usize,
     now_ms: i64,
 ) -> Result<Collection> {
-    let collection_path = config.collection_dir();
-    let manifest_path = config.project_data_dir().join("manifest.json");
-    let collection_path_text = path_text(&collection_path)?;
+    open_collection_at(
+        config,
+        &config.collection_dir(),
+        &config.project_data_dir().join("manifest.json"),
+        embedding_model,
+        embedding_dimension,
+        &config.configuration_fingerprint()?,
+        None,
+        None,
+        now_ms,
+    )
+}
+
+pub(crate) fn open_existing_collection(
+    config: &MemoryConfig,
+    embedding_model: &str,
+    embedding_dimension: usize,
+    now_ms: i64,
+) -> Result<Collection> {
+    ensure!(
+        config.collection_dir().is_dir()
+            && config.project_data_dir().join("manifest.json").is_file(),
+        "legacy embedding generation collection is missing"
+    );
+    open_collection(config, embedding_model, embedding_dimension, now_ms)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_generation_collection(
+    config: &MemoryConfig,
+    generation_id: &str,
+    profile_id: &str,
+    profile_fingerprint: &str,
+    embedding_model: &str,
+    embedding_dimension: usize,
+    now_ms: i64,
+) -> Result<Collection> {
+    let generation_dir = config.embedding_generation_dir(generation_id);
+    secure_create_dir(&generation_dir)?;
+    open_collection_at(
+        config,
+        &generation_dir.join("zvec"),
+        &generation_dir.join("manifest.json"),
+        embedding_model,
+        embedding_dimension,
+        profile_fingerprint,
+        Some(profile_id),
+        Some(generation_id),
+        now_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_collection_at(
+    config: &MemoryConfig,
+    collection_path: &Path,
+    manifest_path: &Path,
+    embedding_model: &str,
+    embedding_dimension: usize,
+    expected_fingerprint: &str,
+    profile_id: Option<&str>,
+    generation_id: Option<&str>,
+    now_ms: i64,
+) -> Result<Collection> {
+    let collection_path_text = path_text(collection_path)?;
 
     if manifest_path.exists() {
         ensure!(
@@ -64,11 +130,19 @@ pub(crate) fn open_collection(
             collection_path.display()
         );
         let manifest: Manifest = serde_json::from_str(
-            &fs::read_to_string(&manifest_path)
+            &fs::read_to_string(manifest_path)
                 .with_context(|| format!("cannot read {}", manifest_path.display()))?,
         )
         .with_context(|| format!("invalid memory manifest: {}", manifest_path.display()))?;
-        validate_manifest(config, &manifest, embedding_model, embedding_dimension)?;
+        validate_manifest(
+            config,
+            &manifest,
+            embedding_model,
+            embedding_dimension,
+            expected_fingerprint,
+            profile_id,
+            generation_id,
+        )?;
         return Collection::open(&collection_path_text, None).map_err(Into::into);
     }
 
@@ -85,11 +159,13 @@ pub(crate) fn open_collection(
         project_id: config.project_id().to_string(),
         embedding_model: embedding_model.to_string(),
         embedding_dimension,
-        configuration_fingerprint: Some(config.configuration_fingerprint()?),
+        configuration_fingerprint: Some(expected_fingerprint.to_string()),
         zvec_version: zvec_rust::version().clone(),
         created_at_ms: now_ms,
+        profile_id: profile_id.map(str::to_string),
+        generation_id: generation_id.map(str::to_string),
     };
-    write_manifest(&manifest_path, &manifest)?;
+    write_manifest(manifest_path, &manifest)?;
     Ok(collection)
 }
 
@@ -185,6 +261,9 @@ fn validate_manifest(
     manifest: &Manifest,
     embedding_model: &str,
     embedding_dimension: usize,
+    expected_fingerprint: &str,
+    profile_id: Option<&str>,
+    generation_id: Option<&str>,
 ) -> Result<()> {
     ensure!(
         manifest.schema_version == COLLECTION_SCHEMA_VERSION,
@@ -206,10 +285,15 @@ fn validate_manifest(
     );
     if let Some(expected) = &manifest.configuration_fingerprint {
         ensure!(
-            expected == &config.configuration_fingerprint()?,
+            expected == expected_fingerprint,
             "memory configuration fingerprint mismatch; vector-affecting embedding settings changed and require re-indexing the project collection"
         );
     }
+    ensure!(
+        manifest.profile_id.as_deref() == profile_id
+            && manifest.generation_id.as_deref() == generation_id,
+        "memory collection generation identity mismatch"
+    );
     Ok(())
 }
 
@@ -278,10 +362,20 @@ mod tests {
             configuration_fingerprint: Some("different-fingerprint".to_string()),
             zvec_version: "test".to_string(),
             created_at_ms: 0,
+            profile_id: None,
+            generation_id: None,
         };
 
-        let error = validate_manifest(&config, &manifest, "model-a", 4)
-            .expect_err("reject fingerprint mismatch");
+        let error = validate_manifest(
+            &config,
+            &manifest,
+            "model-a",
+            4,
+            &config.configuration_fingerprint().expect("fingerprint"),
+            None,
+            None,
+        )
+        .expect_err("reject fingerprint mismatch");
         assert!(
             error
                 .to_string()

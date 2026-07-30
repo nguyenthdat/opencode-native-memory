@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import type { PendingRecall, SearchResponse } from "./contracts.js";
-import type { MemoryMethod } from "./protocol.js";
-import { SessionContext } from "./session-context.js";
-import type { NativeMemoryRequester } from "./daemon-client.js";
+import type { PendingRecall, SearchResponse } from "../src/contracts.js";
+import type { MemoryMethod } from "../src/protocol.js";
+import { SessionContext } from "../src/session-context.js";
+import type { NativeMemoryRequester } from "../src/daemon-client.js";
 
 class FeedbackClient implements NativeMemoryRequester {
   readonly requests: Array<{ method: MemoryMethod; params: unknown }> = [];

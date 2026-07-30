@@ -7,7 +7,7 @@ import {
   MEMORY_INSTRUCTIONS_MARKER,
   loadMemoryInstructions,
   registerMemoryInstructions,
-} from "./instructions.js";
+} from "../src/instructions.js";
 
 const roots: string[] = [];
 

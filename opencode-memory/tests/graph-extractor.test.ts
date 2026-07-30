@@ -8,7 +8,7 @@ import {
   type GraphSessionCreateParameters,
   type GraphSessionPromptParameters,
   type GraphSdkResponse,
-} from "./graph-extractor.js";
+} from "../src/graph-extractor.js";
 
 const validCandidates: GraphExtractionCandidates = {
   entities: [

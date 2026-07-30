@@ -6,7 +6,7 @@ import {
   ResponseSchema,
   ValueObjectSchema,
   ValueSchema,
-} from "./generated/opencode/memory/v1/memory_pb.js";
+} from "../src/generated/opencode/memory/v1/memory_pb.js";
 import {
   DaemonRequestSchema,
   DaemonResponseSchema,
@@ -14,7 +14,7 @@ import {
   CancelCallRequestSchema,
   GetDaemonInfoRequestSchema,
   ProjectCallRequestSchema,
-} from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
+} from "../src/generated/opencode/memory/daemon/v1/daemon_pb.js";
 import {
   EmbeddingMetric,
   EmbeddingModality,
@@ -34,7 +34,7 @@ import {
   ModelSwitchRebuildPolicy,
   ModelSwitchState,
   StartModelSwitchResponseSchema,
-} from "./generated/opencode/memory/model/v1/model_pb.js";
+} from "../src/generated/opencode/memory/model/v1/model_pb.js";
 import {
   GraphExtractCancelResponseSchema,
   GraphExtractClaimResponseSchema,
@@ -54,7 +54,7 @@ import {
   GraphStatusCode,
   GraphStatusResponseSchema,
   GraphUpsertCandidatesResponseSchema,
-} from "./generated/opencode/memory/graph/v1/graph_pb.js";
+} from "../src/generated/opencode/memory/graph/v1/graph_pb.js";
 import {
   createGraphRequest,
   createModelRequest,
@@ -65,9 +65,12 @@ import {
   DelimitedFrameDecoder,
   encodeDelimited,
   encodeRequest,
-} from "./protocol.js";
-import type { GraphMethod, ModelMethod } from "./protocol.js";
-import type { GraphRequest, GraphResponse } from "./generated/opencode/memory/graph/v1/graph_pb.js";
+} from "../src/protocol.js";
+import type { GraphMethod, ModelMethod } from "../src/protocol.js";
+import type {
+  GraphRequest,
+  GraphResponse,
+} from "../src/generated/opencode/memory/graph/v1/graph_pb.js";
 
 describe("Protobuf memory protocol", () => {
   test("encodes a typed request with length-delimited framing", () => {

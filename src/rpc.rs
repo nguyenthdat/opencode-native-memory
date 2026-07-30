@@ -5,7 +5,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
 use serde_json::{Map, Number, Value as JsonValue, json};
 
@@ -15,14 +15,15 @@ use crate::graph_proto::{
 use crate::memory_proto::{Method, Request, Response, Value, ValueList, ValueObject, value};
 use crate::model::{self, ModelSwitchRequest};
 use crate::model_proto::{
-    EmbeddingMetric, EmbeddingModality,
-    ListModelProfilesResponse as ProtoListModelProfilesResponse, ModelPreflightDecision,
-    ModelProfile as ProtoModelProfile, ModelProfileCapability, ModelProfileReason,
-    ModelProfileRole, ModelProfileSupportLevel, ModelRequest, ModelResponse, ModelStatus,
-    ModelStatusCode, ModelSwitchAvailability, ModelSwitchBlocker as ProtoModelSwitchBlocker,
-    ModelSwitchExecutionMode, ModelSwitchPreflight as ProtoModelSwitchPreflight,
-    ModelSwitchRebuildPolicy, ModelSwitchState, StartModelSwitchResponse, model_request,
-    model_response,
+    CancelModelSwitchResponse as ProtoCancelModelSwitchResponse, EmbeddingMetric,
+    EmbeddingModality, GetModelSwitchStatusResponse as ProtoGetModelSwitchStatusResponse,
+    ListModelProfilesResponse as ProtoListModelProfilesResponse, ModelCancelOutcome,
+    ModelPreflightDecision, ModelProfile as ProtoModelProfile, ModelProfileCapability,
+    ModelProfileReason, ModelProfileRole, ModelProfileSupportLevel, ModelRequest, ModelResponse,
+    ModelStatus, ModelStatusCode, ModelSwitchAvailability,
+    ModelSwitchBlocker as ProtoModelSwitchBlocker, ModelSwitchExecutionMode,
+    ModelSwitchPreflight as ProtoModelSwitchPreflight, ModelSwitchRebuildPolicy, ModelSwitchState,
+    StartModelSwitchResponse, model_request, model_response,
 };
 use crate::{
     CaptureRequest, DeleteRequest, DoctorRequest, DocumentIndexRequest, ExportRequest,
@@ -103,6 +104,31 @@ impl Service {
         Ok(true)
     }
 
+    pub(crate) fn run_model_switch_step(&mut self) -> Result<bool> {
+        if self.engine.is_none() {
+            self.engine()?;
+        }
+        let _model_load_guard = self
+            .model_load_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let engine = self
+            .engine
+            .as_mut()
+            .ok_or_else(|| anyhow!("memory engine did not initialize"))?;
+        engine.run_model_switch_step()
+    }
+
+    pub(crate) fn has_active_model_switch(&self) -> bool {
+        self.engine
+            .as_ref()
+            .is_some_and(MemoryEngine::has_active_model_switch)
+    }
+
+    pub(crate) fn engine_initialized(&self) -> bool {
+        self.engine.is_some()
+    }
+
     pub(crate) fn prepare_project_request(&mut self, request: &ProjectRequest) -> Result<()> {
         if matches!(
             request,
@@ -145,6 +171,30 @@ impl Service {
             .map(|value| decode_value(value, 0))
             .transpose()?
             .unwrap_or_else(|| json!({}));
+
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(MemoryEngine::model_switch_freezes_mutations)
+            && !matches!(
+                method,
+                Method::Search
+                    | Method::Export
+                    | Method::Get
+                    | Method::List
+                    | Method::Status
+                    | Method::Doctor
+                    | Method::Shutdown
+            )
+        {
+            return Ok((
+                failure(
+                    id,
+                    "SWITCH_IN_PROGRESS: vector-affecting memory mutations are frozen until the model switch completes",
+                ),
+                false,
+            ));
+        }
 
         let result = match method {
             Method::Search => serde_json::to_value(
@@ -335,21 +385,35 @@ impl Service {
                 }
             }
             model_request::Operation::StartSwitch(request) => self.handle_model_switch(id, request),
-            model_request::Operation::GetSwitchStatus(_) => model_error(
-                id,
-                ModelStatusCode::Unavailable,
-                "durable model switch status is not enabled in this phase",
-            ),
-            model_request::Operation::CancelSwitch(_) => model_error(
-                id,
-                ModelStatusCode::Unavailable,
-                "durable model switch cancellation is not enabled in this phase",
-            ),
+            model_request::Operation::GetSwitchStatus(request) => match self
+                .engine
+                .as_ref()
+                .map_or_else(
+                    || model::switch_status_from_disk(&self.config, &request.switch_id),
+                    |engine| engine.model_switch_status(&request.switch_id),
+                )
+                .and_then(model_switch_status_response)
+            {
+                Ok(response) => model_ok(id, model_response::Result::GetSwitchStatus(response)),
+                Err(error) => model_error(id, model_error_code(&error), error.to_string()),
+            },
+            model_request::Operation::CancelSwitch(request) => match self
+                .engine
+                .as_mut()
+                .map_or_else(
+                    || model::cancel_switch_from_disk(&self.config, &request.switch_id),
+                    |engine| engine.cancel_model_switch(&request.switch_id),
+                )
+                .and_then(model_switch_cancel_response)
+            {
+                Ok(response) => model_ok(id, model_response::Result::CancelSwitch(response)),
+                Err(error) => model_error(id, model_error_code(&error), error.to_string()),
+            },
         }
     }
 
     fn handle_model_switch(
-        &self,
+        &mut self,
         id: u64,
         request: crate::model_proto::StartModelSwitchRequest,
     ) -> ModelResponse {
@@ -369,27 +433,44 @@ impl Service {
                 return model_error(id, ModelStatusCode::InvalidArgument, error.to_string());
             }
         };
-        if execution_mode == ModelSwitchExecutionMode::Apply {
-            return model_error(
-                id,
-                ModelStatusCode::Unavailable,
-                "durable model generation migration is not enabled; use dry-run preflight",
-            );
-        }
-
-        match model::preflight(&self.config, &switch_request) {
+        let result = match execution_mode {
+            ModelSwitchExecutionMode::Apply => {
+                let replay = switch_request
+                    .switch_id
+                    .as_deref()
+                    .is_some_and(|switch_id| {
+                        model::switch_exists(&self.config, switch_id).unwrap_or(false)
+                    });
+                if replay {
+                    self.engine()
+                        .and_then(|engine| engine.start_model_switch(&switch_request))
+                } else {
+                    model::preflight(&self.config, &switch_request).and_then(|preflight| {
+                        if preflight.preflight.can_start {
+                            self.engine()
+                                .and_then(|engine| engine.start_model_switch(&switch_request))
+                        } else {
+                            let blocker = preflight
+                                .preflight
+                                .blockers
+                                .first()
+                                .ok_or_else(|| anyhow!("model switch preflight is blocked"))?;
+                            Err(anyhow!("{}: {}", blocker.code, blocker.message))
+                        }
+                    })
+                }
+            }
+            ModelSwitchExecutionMode::DryRun => model::preflight(&self.config, &switch_request),
+            ModelSwitchExecutionMode::Unspecified => {
+                unreachable!("validated model switch execution mode")
+            }
+        };
+        match result {
             Ok(response) => match model_switch_response(response) {
                 Ok(response) => model_ok(id, model_response::Result::StartSwitch(response)),
                 Err(error) => model_error(id, ModelStatusCode::Internal, error.to_string()),
             },
-            Err(error) => {
-                let code = if error.to_string().starts_with("PROFILE_NOT_FOUND:") {
-                    ModelStatusCode::NotFound
-                } else {
-                    ModelStatusCode::Internal
-                };
-                model_error(id, code, error.to_string())
-            }
+            Err(error) => model_error(id, model_error_code(&error), error.to_string()),
         }
     }
 }
@@ -603,10 +684,28 @@ fn validate_model_request(request: &ModelRequest) -> Result<()> {
                 execution_mode != ModelSwitchExecutionMode::Unspecified,
                 "model switch execution_mode is required"
             );
-            ModelSwitchAvailability::try_from(request.availability)
+            anyhow::ensure!(
+                execution_mode != ModelSwitchExecutionMode::Apply || request.switch_id.is_some(),
+                "model switch switch_id is required for apply"
+            );
+            let availability = ModelSwitchAvailability::try_from(request.availability)
                 .map_err(|_| anyhow!("model switch availability is unknown"))?;
-            ModelSwitchRebuildPolicy::try_from(request.rebuild_policy)
+            anyhow::ensure!(
+                availability != ModelSwitchAvailability::Unspecified,
+                "model switch availability is required"
+            );
+            let rebuild_policy = ModelSwitchRebuildPolicy::try_from(request.rebuild_policy)
                 .map_err(|_| anyhow!("model switch rebuild_policy is unknown"))?;
+            anyhow::ensure!(
+                rebuild_policy != ModelSwitchRebuildPolicy::Unspecified,
+                "model switch rebuild_policy is required"
+            );
+            if let Some(value) = request.expected_active_generation_id.as_deref() {
+                validate_generation_id("expected_active_generation_id", value, true)?;
+            }
+            if let Some(value) = request.target_generation_id.as_deref() {
+                validate_generation_id("target_generation_id", value, true)?;
+            }
             Ok(())
         }
         model_request::Operation::GetSwitchStatus(request) => {
@@ -631,6 +730,20 @@ fn validate_model_id(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_generation_id(name: &str, value: &str, allow_legacy: bool) -> Result<()> {
+    validate_model_id(name, value)?;
+    anyhow::ensure!(
+        allow_legacy && value == "legacy"
+            || value.len() > 4
+                && value.starts_with("gen_")
+                && value[4..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        "model {name} is not a valid embedding generation ID"
+    );
+    Ok(())
+}
+
 fn model_switch_request(
     request: crate::model_proto::StartModelSwitchRequest,
 ) -> Result<ModelSwitchRequest> {
@@ -644,9 +757,12 @@ fn model_switch_request(
         target_profile_id: request.target_profile_id,
         switch_id: request.switch_id,
         expected_active_profile_id: request.expected_active_profile_id,
+        expected_active_generation_id: request.expected_active_generation_id,
         allow_dense_downtime: matches!(availability, ModelSwitchAvailability::AllowDenseDowntime),
         dry_run: matches!(execution_mode, ModelSwitchExecutionMode::DryRun),
         force_rebuild: matches!(rebuild_policy, ModelSwitchRebuildPolicy::ForceRebuild),
+        retain_previous: request.retain_previous.unwrap_or(true),
+        target_generation_id: request.target_generation_id,
     })
 }
 
@@ -753,6 +869,17 @@ fn model_switch_response(response: model::ModelSwitchResponse) -> Result<StartMo
     };
     let state = match response.state.as_str() {
         "preflight" => ModelSwitchState::Preflight,
+        "queued" => ModelSwitchState::Queued,
+        "validating" => ModelSwitchState::Validating,
+        "downloading" => ModelSwitchState::Downloading,
+        "preparing" => ModelSwitchState::Preparing,
+        "reindexing" => ModelSwitchState::Reindexing,
+        "verifying" => ModelSwitchState::Verifying,
+        "committing" => ModelSwitchState::Committing,
+        "succeeded" => ModelSwitchState::Succeeded,
+        "cancel_requested" => ModelSwitchState::CancelRequested,
+        "cancelled" => ModelSwitchState::Cancelled,
+        "failed" => ModelSwitchState::Failed,
         value => return Err(anyhow!("unknown model switch state: {value}")),
     };
     Ok(StartModelSwitchResponse {
@@ -766,6 +893,87 @@ fn model_switch_response(response: model::ModelSwitchResponse) -> Result<StartMo
         dense_search_available: response.dense_search_available,
         preflight: Some(model_switch_preflight(response.preflight)?),
     })
+}
+
+fn model_switch_status_response(
+    response: model::ModelSwitchStatusResponse,
+) -> Result<ProtoGetModelSwitchStatusResponse> {
+    Ok(ProtoGetModelSwitchStatusResponse {
+        switch_id: response.switch_id,
+        state: model_switch_state(&response.state)? as i32,
+        active_profile_id: response.active_profile_id,
+        target_profile_id: response.target_profile_id,
+        active_generation_id: response.active_generation_id,
+        target_generation_id: response.target_generation_id,
+        completed_records: response.completed_records,
+        total_records: response.total_records,
+        error: response.error.map(|error| ModelProfileReason {
+            code: error.code,
+            message: error.message,
+        }),
+        fraction: response.fraction,
+        cancel_requested: response.cancel_requested,
+        dense_search_available: response.dense_search_available,
+        created_at_ms: response.created_at_ms,
+        updated_at_ms: response.updated_at_ms,
+        completed_at_ms: response.completed_at_ms,
+    })
+}
+
+fn model_switch_cancel_response(
+    response: model::ModelSwitchCancelResponse,
+) -> Result<ProtoCancelModelSwitchResponse> {
+    let outcome = match response.outcome.as_str() {
+        "cancel_requested" => ModelCancelOutcome::CancelRequested,
+        "cancelled_before_commit" => ModelCancelOutcome::CancelledBeforeCommit,
+        "already_committing" => ModelCancelOutcome::AlreadyCommitting,
+        "already_committed" => ModelCancelOutcome::AlreadyCommitted,
+        "already_terminal" => ModelCancelOutcome::AlreadyTerminal,
+        "not_found" => ModelCancelOutcome::NotFound,
+        value => return Err(anyhow!("unknown model cancellation outcome: {value}")),
+    };
+    Ok(ProtoCancelModelSwitchResponse {
+        switch_id: response.switch_id,
+        outcome: outcome as i32,
+    })
+}
+
+fn model_switch_state(value: &str) -> Result<ModelSwitchState> {
+    Ok(match value {
+        "preflight" => ModelSwitchState::Preflight,
+        "queued" => ModelSwitchState::Queued,
+        "validating" => ModelSwitchState::Validating,
+        "downloading" => ModelSwitchState::Downloading,
+        "preparing" => ModelSwitchState::Preparing,
+        "reindexing" => ModelSwitchState::Reindexing,
+        "verifying" => ModelSwitchState::Verifying,
+        "committing" => ModelSwitchState::Committing,
+        "succeeded" => ModelSwitchState::Succeeded,
+        "cancel_requested" => ModelSwitchState::CancelRequested,
+        "cancelled" => ModelSwitchState::Cancelled,
+        "failed" => ModelSwitchState::Failed,
+        _ => bail!("unknown model switch state: {value}"),
+    })
+}
+
+fn model_error_code(error: &anyhow::Error) -> ModelStatusCode {
+    let message = error.to_string();
+    if message.contains("PROFILE_NOT_FOUND") || message.contains("not found") {
+        ModelStatusCode::NotFound
+    } else if message.contains("TARGET_GENERATION_INVALID") {
+        ModelStatusCode::InvalidArgument
+    } else if message.contains("INSUFFICIENT") {
+        ModelStatusCode::ResourceExhausted
+    } else if message.contains("PROFILE_UNSUPPORTED")
+        || message.contains("MISMATCH")
+        || message.contains("SWITCH_IN_PROGRESS")
+        || message.contains("SOURCE_CHANGED")
+        || message.contains("TARGET_GENERATION_")
+    {
+        ModelStatusCode::FailedPrecondition
+    } else {
+        ModelStatusCode::Internal
+    }
 }
 
 fn model_switch_preflight(
@@ -1041,7 +1249,7 @@ mod tests {
 
     use super::{
         Method, ProjectRequest, ProjectResponse, RPC_PROTOCOL_VERSION, Request, Service,
-        decode_value, encode_value, read_frame, run_protocol_io,
+        decode_value, encode_value, model_switch_request, read_frame, run_protocol_io,
     };
     use crate::graph_proto::{
         GraphAuthorization, GraphRequest, GraphStatusCode, GraphStatusRequest, graph_request,
@@ -1203,6 +1411,24 @@ mod tests {
     }
 
     #[test]
+    fn omitted_retention_policy_keeps_the_previous_generation() {
+        let request = model_switch_request(StartModelSwitchRequest {
+            switch_id: Some("switch-a".to_string()),
+            target_profile_id: "qwen3-text-0.6b-q8".to_string(),
+            expected_active_profile_id: None,
+            expected_active_generation_id: None,
+            availability: ModelSwitchAvailability::KeepOldDense as i32,
+            execution_mode: ModelSwitchExecutionMode::Apply as i32,
+            rebuild_policy: ModelSwitchRebuildPolicy::RejectActiveProfile as i32,
+            retain_previous: None,
+            target_generation_id: None,
+        })
+        .expect("model switch request");
+
+        assert!(request.retain_previous);
+    }
+
+    #[test]
     fn typed_model_preflight_does_not_initialize_the_memory_engine() {
         let (_temp, config) = config();
         let mut service = Service::new(config);
@@ -1213,9 +1439,12 @@ mod tests {
                     switch_id: None,
                     target_profile_id: "qwen3-text-0.6b-q8".to_string(),
                     expected_active_profile_id: None,
+                    expected_active_generation_id: None,
                     availability: ModelSwitchAvailability::KeepOldDense as i32,
                     execution_mode: ModelSwitchExecutionMode::DryRun as i32,
                     rebuild_policy: ModelSwitchRebuildPolicy::RejectActiveProfile as i32,
+                    retain_previous: Some(true),
+                    target_generation_id: None,
                 },
             )),
         });
@@ -1230,7 +1459,7 @@ mod tests {
         assert_eq!(result.state, ModelSwitchState::Preflight as i32);
         assert_eq!(
             result.preflight.as_ref().map(|value| value.decision),
-            Some(ModelPreflightDecision::Blocked as i32)
+            Some(ModelPreflightDecision::Ready as i32)
         );
     }
 
@@ -1244,11 +1473,14 @@ mod tests {
                 operation: Some(model_request::Operation::StartSwitch(
                     StartModelSwitchRequest {
                         switch_id: Some("switch-a".to_string()),
-                        target_profile_id: "qwen3-text-0.6b-q8".to_string(),
+                        target_profile_id: "qwen3-vl-embedding-8b".to_string(),
                         expected_active_profile_id: None,
+                        expected_active_generation_id: None,
                         availability: ModelSwitchAvailability::KeepOldDense as i32,
                         execution_mode: ModelSwitchExecutionMode::Apply as i32,
                         rebuild_policy: ModelSwitchRebuildPolicy::RejectActiveProfile as i32,
+                        retain_previous: Some(true),
+                        target_generation_id: None,
                     },
                 )),
             },
@@ -1270,15 +1502,21 @@ mod tests {
             },
         ];
 
-        for request in requests {
+        for (index, request) in requests.into_iter().enumerate() {
             let expected_id = request.id;
             let response = service.handle_model(request);
             assert_eq!(response.id, expected_id);
             assert_eq!(
                 response.status.as_ref().map(|status| status.code),
-                Some(ModelStatusCode::Unavailable as i32)
+                if index == 0 {
+                    Some(ModelStatusCode::FailedPrecondition as i32)
+                } else if index == 1 {
+                    Some(ModelStatusCode::NotFound as i32)
+                } else {
+                    Some(ModelStatusCode::Ok as i32)
+                }
             );
-            assert!(response.result.is_none());
+            assert_eq!(response.result.is_some(), index == 2);
         }
         assert!(service.engine.is_none());
     }

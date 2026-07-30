@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { DocumentIndexResponse, NativeMemoryStatus } from "./contracts.js";
-import { buildMemoryStatusResponse } from "./plugin-health.js";
+import type { DocumentIndexResponse, NativeMemoryStatus } from "../src/contracts.js";
+import { buildMemoryStatusResponse } from "../src/plugin-health.js";
 
 const nativeStatus: NativeMemoryStatus = {
   ready: true,
@@ -11,6 +11,11 @@ const nativeStatus: NativeMemoryStatus = {
   embedding_dimension: 2560,
   active_profile_id: "qwen3-text-4b-q4",
   active_generation_id: "legacy",
+  switch_state: null,
+  switch_id: null,
+  target_profile_id: null,
+  switch_fraction: null,
+  dense_search_available: true,
   project_root: "/project",
   project_id: "project-id",
   collection_path: "/data/collection",

@@ -1,5 +1,6 @@
 //! Configurable local embedding inference through llama.cpp and GGUF models.
 
+use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -13,6 +14,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use self_cell::self_cell;
+use sha2::{Digest, Sha256};
 
 use crate::EmbeddingConfig;
 
@@ -52,7 +54,22 @@ pub(crate) struct LlamaCppEmbedder {
 
 impl LlamaCppEmbedder {
     pub(crate) fn load(config: &EmbeddingConfig, cache_dir: &Path) -> Result<Self> {
+        Self::load_verified(config, cache_dir, None)
+    }
+
+    pub(crate) fn load_verified(
+        config: &EmbeddingConfig,
+        cache_dir: &Path,
+        expected_sha256: Option<&str>,
+    ) -> Result<Self> {
         let model_path = resolve_model_path(config, cache_dir)?;
+        if let Some(expected) = expected_sha256 {
+            let actual = file_sha256(&model_path)?;
+            ensure!(
+                actual == expected,
+                "embedding artifact digest mismatch: expected {expected}, found {actual}"
+            );
+        }
         let backend = llama_backend()?;
         let gpu_layers = config.gpu_layers.unwrap_or_else(|| {
             if backend.supports_gpu_offload() {
@@ -182,6 +199,23 @@ impl LlamaCppEmbedder {
             Ok(output)
         })
     }
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open embedding artifact {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("cannot hash embedding artifact {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn llama_backend() -> Result<&'static LlamaBackend> {

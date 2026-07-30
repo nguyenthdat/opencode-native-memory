@@ -1,4 +1,5 @@
 mod knowledge_graph;
+mod model_switch;
 mod retrieval;
 
 use std::cmp::Reverse;
@@ -10,7 +11,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use zvec_rust::{Collection, Doc};
 
-use crate::MemoryConfig;
 use crate::capture::{CaptureDecision, CaptureGate, CaptureSignals, NoveltyDisposition};
 use crate::config::hash_hex;
 use crate::contract::{
@@ -29,7 +29,10 @@ use crate::document::{
 };
 use crate::document_index::{DocumentIndexManifest, IndexedDocument, discover_documents};
 use crate::embedding::{Embedder, LlamaCppEmbedder};
-use crate::embedding_generation::ActiveEmbedding;
+use crate::embedding_generation::{
+    ActiveEmbedding, EmbeddingGenerationManifest, GenerationState, ModelSwitchStore,
+    generation_manifest_path,
+};
 use crate::graph::GraphStore;
 use crate::lifecycle::{
     default_expiry, default_half_life_days, ensure_delete_allowed, ensure_store_overwrite_allowed,
@@ -47,6 +50,7 @@ use crate::validation::{
     resolve_confidence, truncate_chars, validate_ids, validate_retrieval_id,
     validate_shared_source, validate_store_request,
 };
+use crate::{EmbeddingConfig, MemoryConfig};
 
 const SESSION_DEFAULT_TTL_DAYS: u32 = 7;
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
@@ -55,13 +59,17 @@ const MAX_SNAPSHOT_RECORDS: usize = 1_000;
 pub struct MemoryEngine {
     config: MemoryConfig,
     collection: Collection,
-    embedder: LlamaCppEmbedder,
+    embedder: Option<LlamaCppEmbedder>,
     inference_lock: Arc<Mutex<()>>,
     state: MemoryState,
     document_index: DocumentIndexManifest,
     shared_sync_rejections: Vec<SharedMemoryRejection>,
     graph: GraphStore,
     active_embedding: ActiveEmbedding,
+    switch_store: ModelSwitchStore,
+    switch_target_collection: Option<Collection>,
+    switch_target_embedder: Option<LlamaCppEmbedder>,
+    switch_target_config: Option<EmbeddingConfig>,
     _writer_lock: File,
 }
 
@@ -82,7 +90,7 @@ impl MemoryEngine {
     }
 
     pub(crate) fn open_with_inference_lock(
-        config: MemoryConfig,
+        mut config: MemoryConfig,
         inference_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
         zvec::initialize()?;
@@ -93,31 +101,79 @@ impl MemoryEngine {
         let state = MemoryState::load(&config.state_path())?;
         let document_index = DocumentIndexManifest::load(&config.document_index_path())?;
         let graph = GraphStore::load(&config.graph_state_path(), &config.graph_pending_path())?;
+        let persisted_active =
+            ActiveEmbedding::load(&config.active_embedding_path(), config.project_id())?;
+        if let Some(active) = &persisted_active
+            && active.profile_id != "legacy-custom"
+        {
+            let embedding =
+                crate::model::embedding_config_for_profile(&active.profile_id, config.embedding())?;
+            config.set_embedding(embedding);
+        }
         let embedder = LlamaCppEmbedder::load(config.embedding(), config.model_cache())?;
-        let collection = zvec::open_collection(
-            &config,
-            embedder.model_id(),
-            embedder.dimension(),
-            now_ms()?,
-        )?;
-        let active_embedding = ActiveEmbedding::load_or_initialize(
-            &config,
-            &crate::model::configured_profile_id(config.embedding()),
-            embedder.dimension(),
-            state.generation,
-            now_ms()?,
-        )?;
+        let active_embedding = match persisted_active {
+            Some(active) => {
+                anyhow::ensure!(
+                    active.profile_fingerprint == config.embedding_profile_fingerprint()?
+                        && active.embedding_dimension == embedder.dimension(),
+                    "active embedding generation does not match its persisted profile"
+                );
+                active
+            }
+            None => ActiveEmbedding::load_or_initialize(
+                &config,
+                &crate::model::configured_profile_id(config.embedding()),
+                embedder.dimension(),
+                state.generation,
+                now_ms()?,
+            )?,
+        };
+        let collection = if active_embedding.generation_id == "legacy" {
+            zvec::open_collection(
+                &config,
+                embedder.model_id(),
+                embedder.dimension(),
+                now_ms()?,
+            )?
+        } else {
+            let manifest = EmbeddingGenerationManifest::load(
+                &generation_manifest_path(&config, &active_embedding.generation_id),
+                config.project_id(),
+            )?;
+            anyhow::ensure!(
+                matches!(
+                    manifest.state,
+                    GenerationState::Active | GenerationState::Complete
+                ),
+                "active pointer references an incomplete embedding generation"
+            );
+            zvec::open_generation_collection(
+                &config,
+                &active_embedding.generation_id,
+                &active_embedding.profile_id,
+                &active_embedding.profile_fingerprint,
+                embedder.model_id(),
+                embedder.dimension(),
+                now_ms()?,
+            )?
+        };
+        let switch_store =
+            ModelSwitchStore::load(&config.model_switch_path(), config.project_id())?;
 
         let mut engine = Self {
             config,
             collection,
-            embedder,
+            embedder: Some(embedder),
             inference_lock,
             state,
             document_index,
             shared_sync_rejections: Vec::new(),
             graph,
             active_embedding,
+            switch_store,
+            switch_target_collection: None,
+            switch_target_embedder: None,
+            switch_target_config: None,
             _writer_lock: writer_lock,
         };
         engine.recover_pending_upserts()?;
@@ -130,7 +186,10 @@ impl MemoryEngine {
             .inference_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.embedder.embed_query(text)
+        self.embedder
+            .as_mut()
+            .ok_or_else(|| anyhow!("dense embedding worker is unavailable during model switch"))?
+            .embed_query(text)
     }
 
     fn embed_passage(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -138,7 +197,10 @@ impl MemoryEngine {
             .inference_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.embedder.embed_passage(text)
+        self.embedder
+            .as_mut()
+            .ok_or_else(|| anyhow!("dense embedding worker is unavailable during model switch"))?
+            .embed_passage(text)
     }
 
     /// Validate, embed, deduplicate, and durably upsert one memory.
@@ -1591,18 +1653,42 @@ impl MemoryEngine {
     /// Returns an error when collection statistics cannot be read.
     pub fn status(&self) -> Result<StatusResponse> {
         let stats = self.collection.stats()?;
+        let switch = self.active_model_switch_status();
         Ok(StatusResponse {
             ready: true,
             rpc_protocol_version: crate::rpc::RPC_PROTOCOL_VERSION,
             backend: "zvec+llama.cpp".to_string(),
             zvec_version: zvec_rust::version().clone(),
-            embedding_model: self.embedder.model_id().to_string(),
-            embedding_dimension: self.embedder.dimension(),
+            embedding_model: self.embedder.as_ref().map_or_else(
+                || "unavailable-during-switch".to_string(),
+                |embedder| embedder.model_id().to_string(),
+            ),
+            embedding_dimension: self.embedder.as_ref().map_or(
+                self.active_embedding.embedding_dimension,
+                Embedder::dimension,
+            ),
             active_profile_id: self.active_embedding.profile_id.clone(),
             active_generation_id: self.active_embedding.generation_id.clone(),
+            switch_state: switch.as_ref().map(|status| status.state.clone()),
+            switch_id: switch.as_ref().map(|status| status.switch_id.clone()),
+            target_profile_id: switch
+                .as_ref()
+                .map(|status| status.target_profile_id.clone()),
+            switch_fraction: switch.as_ref().map(|status| status.fraction),
+            dense_search_available: switch
+                .as_ref()
+                .is_none_or(|status| status.dense_search_available),
             project_root: self.config.project_root().display().to_string(),
             project_id: self.config.project_id().to_string(),
-            collection_path: self.config.collection_dir().display().to_string(),
+            collection_path: if self.active_embedding.generation_id == "legacy" {
+                self.config.collection_dir()
+            } else {
+                self.config
+                    .embedding_generation_dir(&self.active_embedding.generation_id)
+                    .join("zvec")
+            }
+            .display()
+            .to_string(),
             document_count: stats.doc_count,
             indexed_document_count: self.document_index.files.len(),
             state_schema_version: STATE_SCHEMA_VERSION,
@@ -1633,6 +1719,9 @@ impl MemoryEngine {
                 "active_embedding_generation_v1",
                 "embedding_lexical_fallback_v1",
                 "periodic_actor_maintenance_v1",
+                "durable_model_switch_v1",
+                "embedding_generation_cutover_v1",
+                "graph_generation_consistency_v1",
             ],
         })
     }
@@ -1883,7 +1972,9 @@ impl MemoryEngine {
 
     fn build_pending_document(&self, pending: &PendingDocument) -> Result<Doc> {
         ensure!(
-            pending.embedding.len() == self.embedder.dimension(),
+            self.embedder
+                .as_ref()
+                .is_none_or(|embedder| pending.embedding.len() == embedder.dimension()),
             "pending embedding dimension does not match configured model"
         );
         let tags_json = serde_json::to_string(&pending.tags)?;

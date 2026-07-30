@@ -3,10 +3,10 @@ import { describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 import { testRender } from "@opentui/solid";
 import { createSignal as pluginCreateSignal } from "solid-js";
-import type { NativeMemoryStatus } from "./contracts.js";
-import type { NativeMemoryClientLease } from "./daemon-client.js";
-import type { MemoryMethod } from "./protocol.js";
-import memoryTui, { createMemoryTui, memoryHealthText, requestHealthStatus } from "./tui.js";
+import type { NativeMemoryStatus } from "../src/contracts.js";
+import type { NativeMemoryClientLease } from "../src/daemon-client.js";
+import type { MemoryMethod } from "../src/protocol.js";
+import memoryTui, { createMemoryTui, memoryHealthText, requestHealthStatus } from "../src/tui.js";
 
 interface TestCommand {
   name: string;
@@ -23,6 +23,11 @@ const nativeStatus: NativeMemoryStatus = {
   embedding_dimension: 2560,
   active_profile_id: "qwen3-text-4b-q4",
   active_generation_id: "legacy",
+  switch_state: null,
+  switch_id: null,
+  target_profile_id: null,
+  switch_fraction: null,
+  dense_search_available: true,
   project_root: "/project",
   project_id: "project-id",
   collection_path: "/data/collection",

@@ -10,6 +10,7 @@ use prost::Message;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::MemoryConfig;
+use crate::embedding_generation::ModelSwitchStore;
 use crate::rpc::{ProjectRequest, ProjectResponse};
 
 const PROJECT_QUEUE_CAPACITY: usize = 64;
@@ -63,10 +64,22 @@ struct MaintenancePermit {
     maintenance_queued: Arc<AtomicBool>,
 }
 
+struct SwitchPermit {
+    pending_commands: Arc<AtomicUsize>,
+    switch_queued: Arc<AtomicBool>,
+}
+
 impl Drop for MaintenancePermit {
     fn drop(&mut self) {
         self.pending_commands.fetch_sub(1, Ordering::AcqRel);
         self.maintenance_queued.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for SwitchPermit {
+    fn drop(&mut self) {
+        self.pending_commands.fetch_sub(1, Ordering::AcqRel);
+        self.switch_queued.store(false, Ordering::Release);
     }
 }
 
@@ -107,6 +120,9 @@ enum ActorCommand {
     Maintenance {
         permit: MaintenancePermit,
     },
+    SwitchStep {
+        permit: SwitchPermit,
+    },
     Stop,
 }
 
@@ -130,6 +146,8 @@ pub(crate) struct ProjectActor {
     pending_commands: Arc<AtomicUsize>,
     engine_initialized: AtomicBool,
     maintenance_queued: Arc<AtomicBool>,
+    switch_active: AtomicBool,
+    switch_queued: Arc<AtomicBool>,
     last_maintenance_attempt: Mutex<Option<Instant>>,
     failure: Mutex<Option<String>>,
     queued_bytes: Arc<AtomicUsize>,
@@ -149,6 +167,10 @@ impl ProjectActor {
         global_queued_bytes: Arc<AtomicUsize>,
         global_queue_limit: usize,
     ) -> Result<Arc<Self>> {
+        let switch_active =
+            ModelSwitchStore::load(&config.model_switch_path(), config.project_id())?
+                .current
+                .is_some_and(|job| !job.phase.is_terminal());
         let (sender, mut receiver) = mpsc::channel(PROJECT_QUEUE_CAPACITY);
         let (state_sender, state) = watch::channel(ActorState::Opening);
         let actor = Arc::new(Self {
@@ -163,6 +185,8 @@ impl ProjectActor {
             pending_commands: Arc::new(AtomicUsize::new(0)),
             engine_initialized: AtomicBool::new(false),
             maintenance_queued: Arc::new(AtomicBool::new(false)),
+            switch_active: AtomicBool::new(switch_active),
+            switch_queued: Arc::new(AtomicBool::new(false)),
             last_maintenance_attempt: Mutex::new(None),
             failure: Mutex::new(None),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
@@ -299,6 +323,14 @@ impl ProjectActor {
                                         Some(Instant::now());
                                 }
                             }
+                            actor_for_thread
+                                .engine_initialized
+                                .store(service.engine_initialized(), Ordering::Release);
+                            if service.engine_initialized() {
+                                actor_for_thread
+                                    .switch_active
+                                    .store(service.has_active_model_switch(), Ordering::Release);
+                            }
                             if is_optimize_request {
                                 *actor_for_thread
                                     .last_maintenance_attempt
@@ -346,6 +378,7 @@ impl ProjectActor {
                                 .fetch_add(1, Ordering::AcqRel);
                             let should_run = actor_for_thread.lease_count() > 0
                                 && actor_for_thread.engine_initialized.load(Ordering::Acquire)
+                                && !actor_for_thread.switch_active.load(Ordering::Acquire)
                                 && !actor_for_thread.is_draining();
                             let handled = should_run.then(|| {
                                 *actor_for_thread
@@ -377,6 +410,51 @@ impl ProjectActor {
                                 }
                                 Some(Ok(Ok(()))) | None => {}
                             }
+                        }
+                        ActorCommand::SwitchStep { permit } => {
+                            actor_for_thread
+                                .active_commands
+                                .fetch_add(1, Ordering::AcqRel);
+                            let handled = catch_unwind(AssertUnwindSafe(|| {
+                                service.run_model_switch_step()
+                            }));
+                            actor_for_thread
+                                .active_commands
+                                .fetch_sub(1, Ordering::AcqRel);
+                            drop(permit);
+                            match handled {
+                                Ok(Ok(active)) => {
+                                    actor_for_thread
+                                        .engine_initialized
+                                        .store(service.engine_initialized(), Ordering::Release);
+                                    actor_for_thread
+                                        .switch_active
+                                        .store(active, Ordering::Release);
+                                }
+                                Ok(Err(error)) => {
+                                    actor_for_thread
+                                        .engine_initialized
+                                        .store(service.engine_initialized(), Ordering::Release);
+                                    if service.engine_initialized() {
+                                        actor_for_thread
+                                            .switch_active
+                                            .store(service.has_active_model_switch(), Ordering::Release);
+                                    }
+                                    eprintln!(
+                                        "native memory model switch step failed for {}: {error:#}",
+                                        actor_for_thread.store_key.display()
+                                    );
+                                }
+                                Err(_) => {
+                                    let message =
+                                        "project actor panicked while executing model switch";
+                                    actor_for_thread.record_failure(message.to_string());
+                                    let _ = state_sender
+                                        .send(ActorState::Failed(message.to_string()));
+                                    break;
+                                }
+                            }
+                            actor_for_thread.touch();
                         }
                         ActorCommand::Stop => break,
                     }
@@ -417,12 +495,19 @@ impl ProjectActor {
     pub(crate) fn has_work(&self) -> bool {
         self.pending_commands.load(Ordering::Acquire) > 0
             || self.active_commands.load(Ordering::Acquire) > 0
+            || self.switch_active.load(Ordering::Acquire)
+    }
+
+    fn has_queued_work(&self) -> bool {
+        self.pending_commands.load(Ordering::Acquire) > 0
+            || self.active_commands.load(Ordering::Acquire) > 0
     }
 
     pub(crate) fn enqueue_maintenance(&self, interval: Duration) -> bool {
         if self.lease_count() == 0
             || !self.engine_initialized.load(Ordering::Acquire)
-            || self.has_work()
+            || self.switch_active.load(Ordering::Acquire)
+            || self.has_queued_work()
         {
             return false;
         }
@@ -433,7 +518,8 @@ impl ProjectActor {
         if !*accepting
             || self.lease_count() == 0
             || !self.engine_initialized.load(Ordering::Acquire)
-            || self.has_work()
+            || self.switch_active.load(Ordering::Acquire)
+            || self.has_queued_work()
             || self
                 .last_maintenance_attempt
                 .lock()
@@ -453,6 +539,30 @@ impl ProjectActor {
                 permit: MaintenancePermit {
                     pending_commands: Arc::clone(&self.pending_commands),
                     maintenance_queued: Arc::clone(&self.maintenance_queued),
+                },
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn enqueue_switch_step(&self) -> bool {
+        if !self.switch_active.load(Ordering::Acquire) || self.has_queued_work() {
+            return false;
+        }
+        if !self.switch_active.load(Ordering::Acquire)
+            || self.has_queued_work()
+            || self
+                .switch_queued
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        self.pending_commands.fetch_add(1, Ordering::AcqRel);
+        self.sender
+            .try_send(ActorCommand::SwitchStep {
+                permit: SwitchPermit {
+                    pending_commands: Arc::clone(&self.pending_commands),
+                    switch_queued: Arc::clone(&self.switch_queued),
                 },
             })
             .is_ok()
@@ -650,6 +760,8 @@ mod tests {
             pending_commands: Arc::new(AtomicUsize::new(0)),
             engine_initialized: AtomicBool::new(true),
             maintenance_queued: Arc::new(AtomicBool::new(false)),
+            switch_active: AtomicBool::new(false),
+            switch_queued: Arc::new(AtomicBool::new(false)),
             last_maintenance_attempt: Mutex::new(None),
             failure: Mutex::new(None),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
@@ -691,6 +803,8 @@ mod tests {
             pending_commands: Arc::new(AtomicUsize::new(0)),
             engine_initialized: AtomicBool::new(false),
             maintenance_queued: Arc::new(AtomicBool::new(false)),
+            switch_active: AtomicBool::new(false),
+            switch_queued: Arc::new(AtomicBool::new(false)),
             last_maintenance_attempt: Mutex::new(None),
             failure: Mutex::new(None),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
@@ -706,6 +820,42 @@ mod tests {
         actor.leases.store(1, Ordering::Release);
         assert!(!actor.enqueue_maintenance(Duration::ZERO));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn model_switch_step_is_internal_and_coalesced_without_a_client_lease() {
+        let (sender, mut receiver) = mpsc::channel(PROJECT_QUEUE_CAPACITY);
+        let (state_sender, state) = watch::channel(ActorState::Ready);
+        let actor = ProjectActor {
+            store_key: PathBuf::from("/tmp/model-switch-test"),
+            fingerprint: "model-switch-test".to_string(),
+            sender,
+            state,
+            state_sender,
+            accepting: Mutex::new(true),
+            leases: AtomicUsize::new(0),
+            active_commands: AtomicUsize::new(0),
+            pending_commands: Arc::new(AtomicUsize::new(0)),
+            engine_initialized: AtomicBool::new(true),
+            maintenance_queued: Arc::new(AtomicBool::new(false)),
+            switch_active: AtomicBool::new(true),
+            switch_queued: Arc::new(AtomicBool::new(false)),
+            last_maintenance_attempt: Mutex::new(None),
+            failure: Mutex::new(None),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            global_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            global_queue_limit: AGGREGATE_TEST_QUEUE_BYTES,
+            last_activity: Mutex::new(Instant::now()),
+            worker: Mutex::new(None),
+        };
+
+        assert!(actor.enqueue_switch_step());
+        assert!(!actor.enqueue_switch_step());
+        let command = receiver.try_recv().expect("switch command");
+        assert!(matches!(&command, ActorCommand::SwitchStep { .. }));
+        drop(command);
+        assert!(!actor.switch_queued.load(Ordering::Acquire));
+        assert!(actor.has_work());
     }
 
     const AGGREGATE_TEST_QUEUE_BYTES: usize = PROJECT_QUEUE_BYTES * 2;

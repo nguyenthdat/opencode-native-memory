@@ -33,7 +33,7 @@ use crate::rpc::{
 use crate::{EmbeddingConfig, MemoryConfig};
 
 pub const DAEMON_PROTOCOL_GENERATION: u32 = 1;
-pub const DOMAIN_SCHEMA_GENERATION: u32 = 4;
+pub const DOMAIN_SCHEMA_GENERATION: u32 = 5;
 const MAX_SESSIONS: usize = 64;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_OUTSTANDING_CALLS_PER_CONNECTION: usize = 32;
@@ -243,6 +243,7 @@ async fn run_async(endpoint: PathBuf) -> Result<()> {
             }
             _ = maintenance.tick() => {
                 state.expire_sessions();
+                state.registry.schedule_model_switches();
                 if !state.drain_requested.load(Ordering::Acquire) {
                     state.registry.schedule_maintenance(maintenance_interval);
                 }
@@ -695,13 +696,12 @@ async fn acquire_project(
     let (store_key, fingerprint) = tokio::task::spawn_blocking(move || {
         Ok::<_, anyhow::Error>((
             fingerprint_config.canonical_store_key()?,
-            fingerprint_config.configuration_fingerprint()?,
+            fingerprint_config.actor_compatibility_fingerprint()?,
         ))
     })
     .await
     .map_err(|error| internal_failure(anyhow!("configuration fingerprint task failed: {error}")))?
     .map_err(|error| DaemonFailure::new(DaemonStatusCode::InvalidArgument, format!("{error:#}")))?;
-    let config = config.with_configuration_fingerprint(fingerprint.clone());
     let existing = {
         let sessions = state
             .sessions
@@ -1102,7 +1102,11 @@ fn config_from_acquire(request: &AcquireProjectRequest) -> Result<MemoryConfig> 
         &request.project_root
     };
     anyhow::ensure!(!root.is_empty(), "project_root is required");
-    let mut embedding = EmbeddingConfig::default();
+    let mut embedding = if let Some(profile_id) = &request.initial_profile_id {
+        crate::model::embedding_config_for_profile(profile_id, &EmbeddingConfig::default())?
+    } else {
+        EmbeddingConfig::default()
+    };
     if let Some(input) = &request.embedding {
         embedding.model_path = input.local_model_path.as_deref().map(PathBuf::from);
         if let Some(value) = &input.repository {
@@ -1135,12 +1139,18 @@ fn config_from_acquire(request: &AcquireProjectRequest) -> Result<MemoryConfig> 
         if let Some(value) = input.normalize {
             embedding.normalize = value;
         }
-        embedding.dimension = input.dimension.map(|value| value as usize);
+        if let Some(value) = input.dimension {
+            embedding.dimension = Some(value as usize);
+        }
         if let Some(value) = input.context_size {
             embedding.context_size = value;
         }
-        embedding.threads = input.threads;
-        embedding.gpu_layers = input.gpu_layers;
+        if input.threads.is_some() {
+            embedding.threads = input.threads;
+        }
+        if input.gpu_layers.is_some() {
+            embedding.gpu_layers = input.gpu_layers;
+        }
     }
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let daemon_default = i32::try_from((available / 2).max(1)).unwrap_or(i32::MAX);
@@ -1161,12 +1171,41 @@ fn config_from_acquire(request: &AcquireProjectRequest) -> Result<MemoryConfig> 
         );
     }
     embedding.validate()?;
-    MemoryConfig::for_daemon(
+    let mut config = MemoryConfig::for_daemon(
         PathBuf::from(root),
         request.data_dir.as_deref().map(PathBuf::from),
         request.model_cache.as_deref().map(PathBuf::from),
         embedding,
-    )
+    )?;
+    if let Some(active) = crate::embedding_generation::ActiveEmbedding::load(
+        &config.active_embedding_path(),
+        config.project_id(),
+    )? {
+        if let Some(expected) = &request.expected_profile_id {
+            anyhow::ensure!(
+                expected == &active.profile_id,
+                "expected active profile {expected}, found {}",
+                active.profile_id
+            );
+        }
+        if active.profile_id != "legacy-custom" {
+            let persisted =
+                crate::model::embedding_config_for_profile(&active.profile_id, config.embedding())?;
+            config.set_embedding(persisted);
+        } else {
+            anyhow::ensure!(
+                active.profile_fingerprint == config.embedding_profile_fingerprint()?,
+                "requested custom embedding does not match the persisted active profile"
+            );
+        }
+    } else if let Some(expected) = &request.expected_profile_id {
+        anyhow::ensure!(
+            expected == &crate::model::configured_profile_id(config.embedding()),
+            "expected active profile {expected}, found {}",
+            crate::model::configured_profile_id(config.embedding())
+        );
+    }
+    Ok(config)
 }
 
 fn acquire_response(
@@ -1174,11 +1213,23 @@ fn acquire_response(
     config: &MemoryConfig,
     store_key: &Path,
 ) -> AcquireProjectResponse {
+    let active = crate::embedding_generation::ActiveEmbedding::load(
+        &config.active_embedding_path(),
+        config.project_id(),
+    )
+    .ok()
+    .flatten();
     AcquireProjectResponse {
         project_handle: lease.handle.clone(),
         lease_id: lease.lease_id.clone(),
         canonical_project_id: config.project_id().to_string(),
         store_key_hash: crate::config::hash_hex(store_key.as_os_str().as_encoded_bytes()),
+        active_profile_id: active.as_ref().map_or_else(
+            || crate::model::configured_profile_id(config.embedding()),
+            |value| value.profile_id.clone(),
+        ),
+        active_generation_id: active
+            .map_or_else(|| "legacy".to_string(), |value| value.generation_id),
     }
 }
 
@@ -1223,6 +1274,10 @@ fn capabilities() -> Vec<String> {
         "graph-rrf-fusion-v1".to_string(),
         "graph-durable-extraction-jobs-v1".to_string(),
         "daemon-periodic-optimize-v1".to_string(),
+        "durable-model-switch-v1".to_string(),
+        "embedding-generation-cutover-v1".to_string(),
+        "model-switch-cli-v1".to_string(),
+        "graph-shared-project-actor-v1".to_string(),
     ]
 }
 

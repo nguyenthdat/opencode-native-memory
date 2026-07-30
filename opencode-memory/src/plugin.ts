@@ -63,7 +63,12 @@ import { SessionContext } from "./session-context.js";
 import { validateDeleteRecords, validateUpdateArgs } from "./validation.js";
 import { BACKGROUND_JOB_ID_PATTERN, BackgroundJobQueue } from "./background-jobs.js";
 import { buildMemoryStatusResponse } from "./plugin-health.js";
-import { listModelProfiles, preflightModelSwitch } from "./model-control.js";
+import {
+  cancelModelSwitch,
+  getModelSwitchStatus,
+  listModelProfiles,
+  startModelSwitch,
+} from "./model-control.js";
 import { DEFAULT_OPTIMIZE_DEBOUNCE_MS, MemoryMaintenanceScheduler } from "./maintenance.js";
 import { requestIdempotently } from "./outcome-reconciliation.js";
 import { captureWithOutcomeReconciliation } from "./capture-reconciliation.js";
@@ -119,6 +124,8 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     let sharedSync: Promise<void> | undefined;
     let documentSync: Promise<DocumentIndexResponse> | undefined;
     let documentSyncTimer: ReturnType<typeof setTimeout> | undefined;
+    let deferredProjectSync = false;
+    let deferredSwitchDiscovery: Promise<void> | undefined;
     type IngestJobInput = {
       path: string;
       scope: (typeof WRITABLE_MEMORY_SCOPES)[number];
@@ -143,6 +150,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     const graphWork = new Map<string, GraphAuthorizationContract>();
     const graphDiscoveries = new Map<string, GraphAuthorizationContract>();
     const graphAttemptAborts = new Map<string, AbortController>();
+    const modelSwitchMonitors = new Set<string>();
     let graphWorker: Promise<void> | undefined;
 
     const graphJobStatus = async (
@@ -445,9 +453,17 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
         sharedSignature = loaded.signature;
         session.invalidateRecall();
         if (response.imported > 0 || response.removed > 0) maintenance.schedule();
-      })().finally(() => {
-        sharedSync = undefined;
-      });
+      })()
+        .catch((error: unknown) => {
+          if (isModelSwitchInProgressError(error)) {
+            deferredProjectSync = true;
+            scheduleDeferredSwitchMonitor();
+          }
+          throw error;
+        })
+        .finally(() => {
+          sharedSync = undefined;
+        });
       await sharedSync;
     };
 
@@ -471,6 +487,13 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
           }
           return response;
         })
+        .catch((error: unknown) => {
+          if (isModelSwitchInProgressError(error)) {
+            deferredProjectSync = true;
+            scheduleDeferredSwitchMonitor();
+          }
+          throw error;
+        })
         .finally(() => {
           documentSync = undefined;
         });
@@ -485,6 +508,72 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     const syncProjectIndexes = async (): Promise<void> => {
       await Promise.all([syncSharedMemories(), syncDocuments()]);
     };
+
+    const flushDeferredProjectSync = (): void => {
+      if (!deferredProjectSync) return;
+      deferredProjectSync = false;
+      void syncProjectIndexes().catch(session.warnOnce);
+    };
+
+    const monitorModelSwitch = (switchID: string): void => {
+      if (modelSwitchMonitors.has(switchID) || graphWorkerAbort.signal.aborted) return;
+      modelSwitchMonitors.add(switchID);
+      void (async () => {
+        while (!graphWorkerAbort.signal.aborted) {
+          let status: Awaited<ReturnType<typeof getModelSwitchStatus>>;
+          try {
+            status = await getModelSwitchStatus(native, switchID, graphWorkerAbort.signal);
+          } catch (error) {
+            if (graphWorkerAbort.signal.aborted) return;
+            session.warnOnce(error);
+            await graphWorkerDelay(1_000, graphWorkerAbort.signal);
+            continue;
+          }
+          if (["succeeded", "cancelled", "failed"].includes(status.state)) {
+            session.invalidateRecall();
+            flushDeferredProjectSync();
+            return;
+          }
+          await graphWorkerDelay(1_000, graphWorkerAbort.signal);
+        }
+      })()
+        .catch((error: unknown) => {
+          if (!graphWorkerAbort.signal.aborted) session.warnOnce(error);
+        })
+        .finally(() => modelSwitchMonitors.delete(switchID));
+    };
+
+    function scheduleDeferredSwitchMonitor(): void {
+      if (deferredSwitchDiscovery || graphWorkerAbort.signal.aborted) return;
+      deferredSwitchDiscovery = (async () => {
+        while (deferredProjectSync && !graphWorkerAbort.signal.aborted) {
+          try {
+            const status = await native.request<NativeMemoryStatus>(
+              "status",
+              {},
+              graphWorkerAbort.signal,
+            );
+            if (!status.switch_id || !status.switch_state) {
+              flushDeferredProjectSync();
+              return;
+            }
+            if (["succeeded", "cancelled", "failed"].includes(status.switch_state)) {
+              session.invalidateRecall();
+              flushDeferredProjectSync();
+              return;
+            }
+            monitorModelSwitch(status.switch_id);
+            return;
+          } catch (error) {
+            if (graphWorkerAbort.signal.aborted) return;
+            session.warnOnce(error);
+            await graphWorkerDelay(1_000, graphWorkerAbort.signal);
+          }
+        }
+      })().finally(() => {
+        deferredSwitchDiscovery = undefined;
+      });
+    }
 
     const scheduleDocumentSync = (): void => {
       if (!settings.automaticDocumentIndex) return;
@@ -511,10 +600,12 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
       dispose: async () => {
         if (documentSyncTimer) clearTimeout(documentSyncTimer);
         graphWorkerAbort.abort();
+        if (deferredSwitchDiscovery) await deferredSwitchDiscovery.catch(() => undefined);
         if (graphWorker) await graphWorker.catch(() => undefined);
         graphWork.clear();
         graphDiscoveries.clear();
         graphAttemptAborts.clear();
+        modelSwitchMonitors.clear();
         await maintenance.dispose();
         await ingestJobs.dispose();
         if (sharedSync) await sharedSync.catch(() => undefined);
@@ -542,9 +633,10 @@ Use memory_search for semantic lookup, memory_get for full records, memory_updat
 
 For model requests:
 - "model profiles": call memory_model_profiles exactly once and distinguish stable, preview, and unsupported profiles.
-- "model switch <profile>": call memory_model_switch with dry_run=true. This phase performs preflight only; do not claim that a model was switched.
-- "model switch <profile> --allow-dense-downtime": set allow_dense_downtime=true in the dry-run preflight.
-Never change embedding environment variables or restart the daemon to switch an existing project profile. A real switch becomes available only after generation migration is enabled.
+- "model switch <profile>": call memory_model_switch exactly once, report the durable switch ID, and do not wait unless requested.
+- "model status <switch-id>": call memory_model_switch_status.
+- "model cancel <switch-id>": call memory_model_switch_cancel.
+Never change embedding environment variables or restart the daemon to switch an existing project profile.
 
 Never modify repository-scoped memory through memory_update; edit its .opencode/memory Markdown source instead. Ask through the tool permission flow before destructive or sharing operations.`,
         };
@@ -771,20 +863,109 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         }),
         memory_model_switch: tool({
           description:
-            "Run a safe dry-run preflight for switching the current project's embedding model. Actual generation migration is not enabled in this phase, so never report a successful switch.",
+            "Start or preflight a durable project embedding-generation migration. Apply creates a new generation and returns immediately; it never changes environment variables or restarts the daemon.",
           args: {
             profile_id: tool.schema.string().min(1).max(128),
             allow_dense_downtime: tool.schema.boolean().default(false),
             force_rebuild: tool.schema.boolean().default(false),
             expected_active_profile_id: tool.schema.string().min(1).max(128).optional(),
+            expected_active_generation_id: tool.schema.string().min(1).max(128).optional(),
+            retain_previous: tool.schema.boolean().default(true),
+            target_generation_id: tool.schema
+              .string()
+              .regex(/^(?:legacy|gen_[A-Za-z0-9_]{1,60})$/)
+              .optional(),
+            dry_run: tool.schema.boolean().default(false),
           },
           async execute(args, context) {
-            const response = await preflightModelSwitch(native, args, context.abort);
-            return result("Embedding model switch preflight", response, {
-              target_profile_id: response.target_profile_id,
-              can_start: response.preflight.can_start,
-              blocker_count: response.preflight.blockers.length,
+            if (!args.dry_run) {
+              await context.ask({
+                permission: "memory_model_switch",
+                patterns: [args.profile_id],
+                always: [],
+                metadata: { operation: "model_switch", ...args },
+              });
+            }
+            const switchID = `switch_${randomUUID().replaceAll("-", "")}`;
+            let response: Awaited<ReturnType<typeof startModelSwitch>> | undefined;
+            let reconciledStatus: Awaited<ReturnType<typeof getModelSwitchStatus>> | undefined;
+            try {
+              response = await startModelSwitch(
+                native,
+                {
+                  ...args,
+                  switch_id: switchID,
+                },
+                context.abort,
+              );
+            } catch (error) {
+              if (!(error instanceof DaemonOutcomeUnknownError)) throw error;
+              reconciledStatus = await getModelSwitchStatus(native, switchID, context.abort);
+            }
+            session.invalidateRecall();
+            if (reconciledStatus) {
+              if (!["succeeded", "cancelled", "failed"].includes(reconciledStatus.state)) {
+                monitorModelSwitch(switchID);
+              }
+              return result(
+                "Embedding model switch status after outcome-unknown",
+                { ...reconciledStatus },
+                { ...reconciledStatus },
+              );
+            }
+            if (!response) throw new Error("Native memory omitted model switch response");
+            if (!args.dry_run && response.switch_id) monitorModelSwitch(response.switch_id);
+            return result(
+              args.dry_run ? "Embedding model switch preflight" : "Started embedding model switch",
+              response,
+              {
+                switch_id: response.switch_id,
+                target_profile_id: response.target_profile_id,
+                state: response.state,
+                ...(args.dry_run
+                  ? {
+                      can_start: response.preflight.can_start,
+                      blocker_count: response.preflight.blockers.length,
+                    }
+                  : {}),
+              },
+            );
+          },
+        }),
+        memory_model_switch_status: tool({
+          description:
+            "Read durable embedding model-switch progress without syncing documents or loading a model.",
+          args: {
+            switch_id: tool.schema.string().regex(/^switch_[A-Za-z0-9_-]{1,120}$/),
+          },
+          async execute(args, context) {
+            const response = await getModelSwitchStatus(native, args.switch_id, context.abort);
+            if (["succeeded", "cancelled", "failed"].includes(response.state)) {
+              session.invalidateRecall();
+              flushDeferredProjectSync();
+            }
+            return result("Embedding model switch status", { ...response }, { ...response });
+          },
+        }),
+        memory_model_switch_cancel: tool({
+          description:
+            "Request cooperative cancellation of a durable embedding model switch before cutover.",
+          args: {
+            switch_id: tool.schema.string().regex(/^switch_[A-Za-z0-9_-]{1,120}$/),
+          },
+          async execute(args, context) {
+            await context.ask({
+              permission: "memory_model_switch",
+              patterns: [args.switch_id],
+              always: [],
+              metadata: { operation: "model_switch_cancel", ...args },
             });
+            const response = await cancelModelSwitch(native, args.switch_id, context.abort);
+            if (["already_committed", "already_terminal"].includes(response.outcome)) {
+              session.invalidateRecall();
+              flushDeferredProjectSync();
+            }
+            return result("Cancelled embedding model switch", { ...response }, { ...response });
           },
         }),
         memory_graph_extract: tool({
@@ -1862,13 +2043,9 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             "Health-check the memory plugin and inspect its native backend, collection, embedding model, indexes, and document count.",
           args: {},
           async execute(_args, context) {
-            const [backend, sharedSyncResult, documentIndexResult] = await Promise.allSettled([
+            const backend = await Promise.allSettled([
               native.request<NativeMemoryStatus>("status", {}, context.abort),
-              syncSharedMemories(),
-              settings.automaticDocumentIndex
-                ? indexDocuments()
-                : Promise.resolve<DocumentIndexResponse | undefined>(undefined),
-            ]);
+            ]).then(([result]) => result);
             if (context.abort.aborted) {
               const reason = backend.status === "rejected" ? backend.reason : context.abort.reason;
               throw reason instanceof Error
@@ -1876,6 +2053,29 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 : new Error("Memory status check was cancelled");
             }
             if (backend.status === "fulfilled") maintenance.observeStatus(backend.value);
+            const switching =
+              backend.status === "fulfilled" &&
+              backend.value.switch_state !== null &&
+              !["succeeded", "cancelled", "failed"].includes(backend.value.switch_state);
+            if (switching) {
+              deferredProjectSync = true;
+              scheduleDeferredSwitchMonitor();
+            }
+            let sharedSyncResult: PromiseSettledResult<void>;
+            let documentIndexResult: PromiseSettledResult<DocumentIndexResponse | undefined>;
+            if (switching) {
+              sharedSyncResult = { status: "fulfilled", value: undefined };
+              documentIndexResult = { status: "fulfilled", value: undefined };
+            } else {
+              [sharedSyncResult, documentIndexResult] = await Promise.all([
+                Promise.allSettled([syncSharedMemories()]).then(([result]) => result),
+                Promise.allSettled([
+                  settings.automaticDocumentIndex
+                    ? indexDocuments()
+                    : Promise.resolve<DocumentIndexResponse | undefined>(undefined),
+                ]).then(([result]) => result),
+              ]);
+            }
             const response = buildMemoryStatusResponse(
               backend,
               sharedSyncResult,
@@ -1947,6 +2147,10 @@ export function resolveMemoryPluginOptions(
 
 export function isSupportedDocumentPath(path: string): boolean {
   return /\.(?:pdf|md|markdown|html|htm)$/i.test(path);
+}
+
+function isModelSwitchInProgressError(error: unknown): boolean {
+  return (error instanceof Error ? error.message : String(error)).includes("SWITCH_IN_PROGRESS");
 }
 
 function graphCandidatePayload(candidates: GraphExtractionCandidates) {

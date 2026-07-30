@@ -19,6 +19,8 @@
   "include": [
     "opencode-memory/src/**/*.ts",
     "opencode-memory/src/**/*.tsx",
+    "opencode-memory/tests/**/*.ts",
+    "opencode-memory/tests/**/*.tsx",
     "tests/ts/**/*.ts",
     "tests/benchmark/**/*.ts"
   ],

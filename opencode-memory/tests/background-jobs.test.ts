@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { BackgroundJobQueue } from "./background-jobs.js";
-import { DaemonOutcomeUnknownError } from "./daemon-client.js";
+import { BackgroundJobQueue } from "../src/background-jobs.js";
+import { DaemonOutcomeUnknownError } from "../src/daemon-client.js";
 
 const flush = async (): Promise<void> => {
   await Promise.resolve();

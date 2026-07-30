@@ -108,7 +108,11 @@ export type {
 export {
   listModelProfiles,
   preflightModelSwitch,
+  startModelSwitch,
+  getModelSwitchStatus,
+  cancelModelSwitch,
   type ModelSwitchPreflightOptions,
+  type ModelSwitchStartOptions,
 } from "./model-control.js";
 export {
   captureWithOutcomeReconciliation,

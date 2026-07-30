@@ -42,6 +42,14 @@ pub(crate) fn remove_file_durable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn remove_dir_all_durable(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_dir_all(path).with_context(|| format!("cannot remove {}", path.display()))?;
+        sync_parent(path)?;
+    }
+    Ok(())
+}
+
 fn sync_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;

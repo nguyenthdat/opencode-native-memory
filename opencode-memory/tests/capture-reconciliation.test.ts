@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import type { CaptureResponse } from "./contracts.js";
+import type { CaptureResponse } from "../src/contracts.js";
 import {
   captureWithOutcomeReconciliation,
   type ReconciledCaptureResponse,
-} from "./capture-reconciliation.js";
-import { DaemonOutcomeUnknownError, type NativeMemoryRequester } from "./daemon-client.js";
-import type { MemoryMethod } from "./protocol.js";
+} from "../src/capture-reconciliation.js";
+import { DaemonOutcomeUnknownError, type NativeMemoryRequester } from "../src/daemon-client.js";
+import type { MemoryMethod } from "../src/protocol.js";
 
 describe("automatic capture reconciliation", () => {
   test("does not replay a capture that returned normally", async () => {

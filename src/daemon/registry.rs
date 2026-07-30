@@ -130,6 +130,20 @@ impl ProjectRegistry {
             .count()
     }
 
+    pub(crate) fn schedule_model_switches(&self) -> usize {
+        let actors = self
+            .actors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        actors
+            .into_iter()
+            .filter(|actor| actor.enqueue_switch_step())
+            .count()
+    }
+
     pub(crate) fn has_activity(&self) -> bool {
         self.actors
             .lock()

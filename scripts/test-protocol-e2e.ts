@@ -1,8 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-const runtimeRoot = await mkdtemp(resolve(tmpdir(), "opencode-memory-protocol-"));
+const runtimeRoot = await mkdtemp("/tmp/om-proto-");
 process.env.TMPDIR = runtimeRoot;
 process.env.XDG_RUNTIME_DIR = runtimeRoot;
 process.env.OPENCODE_MEMORY_DAEMON_IDLE_SECONDS ??= "1";
@@ -29,6 +28,9 @@ try {
   }
   if (!info.capabilities.includes("daemon-periodic-optimize-v1")) {
     throw new Error("Daemon did not report periodic optimize support");
+  }
+  if (!info.capabilities.includes("durable-model-switch-v1")) {
+    throw new Error("Daemon did not report durable model switch support");
   }
   await Bun.sleep(2_000);
   try {

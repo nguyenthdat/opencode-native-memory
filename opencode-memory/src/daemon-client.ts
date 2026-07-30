@@ -59,7 +59,7 @@ const STARTUP_TIMEOUT_MS = 15_000;
 const START_LOCK_STALE_MS = 30_000;
 const START_LOCK_TIMEOUT_MS = START_LOCK_STALE_MS + STARTUP_TIMEOUT_MS;
 const DAEMON_PROTOCOL_GENERATION = 1;
-const DOMAIN_SCHEMA_GENERATION = 4;
+const DOMAIN_SCHEMA_GENERATION = 5;
 const require = createRequire(import.meta.url);
 const NATIVE_PACKAGES: Partial<Record<string, string>> = {
   "darwin-arm64": "@nguyenthdat/opencode-memory-darwin-arm64",
@@ -92,6 +92,7 @@ const RETRY_SAFE_METHODS = new Set<MemoryMethod>([
   "graph_export",
 ]);
 const OUTCOME_RECONCILABLE_METHODS = new Set<MemoryMethod>([
+  "model_switch_cancel",
   "graph_extract_enqueue",
   "graph_extract_claim",
   "graph_extract_renew",
@@ -503,6 +504,8 @@ class DaemonProjectClient implements NativeMemoryRequester {
       worktree: this.worktree,
       ...optionalEnv("OPENCODE_MEMORY_DATA_DIR", "dataDir"),
       ...optionalEnv("OPENCODE_MEMORY_MODEL_CACHE", "modelCache"),
+      ...optionalEnv("OPENCODE_MEMORY_INITIAL_PROFILE", "initialProfileId"),
+      ...optionalEnv("OPENCODE_MEMORY_EXPECTED_PROFILE", "expectedProfileId"),
       embedding: embeddingIdentity(),
     });
     const projectResponse = await this.send(

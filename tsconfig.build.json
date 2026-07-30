@@ -11,6 +11,8 @@
   "exclude": [
     "opencode-memory/src/**/*.test.ts",
     "opencode-memory/src/**/*.test.tsx",
+    "opencode-memory/tests",
+    "opencode-memory/tests/**/*",
     "tests",
     "dist",
     "node_modules"

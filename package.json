@@ -10,6 +10,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "opencode-memory": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -44,7 +47,7 @@
     "build": "bun run clean && bun run typecheck && bun run build:ts",
     "build:native": "cargo build --locked && bun scripts/stage-native.ts --profile debug --runtime --destination target/debug",
     "build:native:release": "cargo build --release --locked && bun scripts/stage-native.ts --profile release --runtime --destination target/release",
-    "test:ts": "bun test --conditions=browser opencode-memory/src tests/ts tests/benchmark",
+    "test:ts": "bun test --conditions=browser opencode-memory/tests tests/ts tests/benchmark",
     "benchmark:retrieval": "bun scripts/benchmark-retrieval.ts",
     "test:rust": "cargo test --locked --lib",
     "test:protocol": "bun scripts/test-protocol-e2e.ts",

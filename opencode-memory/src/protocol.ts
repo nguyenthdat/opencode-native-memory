@@ -163,12 +163,19 @@ export function createModelRequest(id: number, method: ModelMethod, params: unkn
         "expected_active_profile_id",
         method,
       );
+      const expectedActiveGenerationId = optionalStringParam(
+        values,
+        "expected_active_generation_id",
+        method,
+      );
+      const targetGenerationId = optionalStringParam(values, "target_generation_id", method);
       operation = {
         case: "startSwitch",
         value: create(StartModelSwitchRequestSchema, {
           ...(switchId === undefined ? {} : { switchId }),
           targetProfileId: requiredStringParam(values, "target_profile_id", method),
           ...(expectedActiveProfileId === undefined ? {} : { expectedActiveProfileId }),
+          ...(expectedActiveGenerationId === undefined ? {} : { expectedActiveGenerationId }),
           availability: booleanParam(values, "allow_dense_downtime", method)
             ? ModelSwitchAvailability.ALLOW_DENSE_DOWNTIME
             : ModelSwitchAvailability.KEEP_OLD_DENSE,
@@ -178,6 +185,11 @@ export function createModelRequest(id: number, method: ModelMethod, params: unkn
           rebuildPolicy: booleanParam(values, "force_rebuild", method)
             ? ModelSwitchRebuildPolicy.FORCE_REBUILD
             : ModelSwitchRebuildPolicy.REJECT_ACTIVE_PROFILE,
+          retainPrevious:
+            values.retain_previous === undefined
+              ? true
+              : booleanParam(values, "retain_previous", method),
+          ...(targetGenerationId === undefined ? {} : { targetGenerationId }),
         }),
       };
       break;
@@ -408,6 +420,15 @@ export function decodeModelResponse(response: ModelResponse, method: ModelMethod
               message: response.result.value.error.message,
             }
           : null,
+        fraction: response.result.value.fraction,
+        cancel_requested: response.result.value.cancelRequested,
+        dense_search_available: response.result.value.denseSearchAvailable,
+        created_at_ms: safeNumber(response.result.value.createdAtMs, "model switch created time"),
+        updated_at_ms: safeNumber(response.result.value.updatedAtMs, "model switch updated time"),
+        completed_at_ms:
+          response.result.value.completedAtMs === undefined
+            ? null
+            : safeNumber(response.result.value.completedAtMs, "model switch completion time"),
       } satisfies ModelSwitchStatusResponse;
       break;
     case "cancelSwitch":

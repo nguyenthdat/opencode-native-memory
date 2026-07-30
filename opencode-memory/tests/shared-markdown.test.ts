@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { isPathWithin, loadSharedMemories } from "./shared-markdown.js";
+import { isPathWithin, loadSharedMemories } from "../src/shared-markdown.js";
 
 const worktrees: string[] = [];
 

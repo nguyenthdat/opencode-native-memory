@@ -1,6 +1,6 @@
 # Project Embedding Model Switch Plan
 
-Status: Proposed
+Status: Implemented on 2026-07-30; large-model fault-injection E2E remains a release gate
 
 Research snapshot: 2026-07-28
 

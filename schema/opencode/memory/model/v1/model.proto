@@ -145,6 +145,9 @@ message StartModelSwitchRequest {
   ModelSwitchAvailability availability = 4;
   ModelSwitchExecutionMode execution_mode = 5;
   ModelSwitchRebuildPolicy rebuild_policy = 6;
+  optional string expected_active_generation_id = 7;
+  optional bool retain_previous = 8;
+  optional string target_generation_id = 9;
 }
 
 message ModelSwitchBlocker {
@@ -189,6 +192,12 @@ message GetModelSwitchStatusResponse {
   uint64 completed_records = 7;
   uint64 total_records = 8;
   optional ModelProfileReason error = 9;
+  double fraction = 10;
+  bool cancel_requested = 11;
+  bool dense_search_available = 12;
+  int64 created_at_ms = 13;
+  int64 updated_at_ms = 14;
+  optional int64 completed_at_ms = 15;
 }
 
 message CancelModelSwitchRequest {

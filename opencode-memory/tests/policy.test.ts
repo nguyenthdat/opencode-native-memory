@@ -7,7 +7,7 @@ import {
   extractDirectUserEvidence,
   hasDirectUserEvidence,
   parseCuratedCandidates,
-} from "./policy.js";
+} from "../src/policy.js";
 
 describe("deriveRecallQuery", () => {
   test("uses only eligible user text when text is present", () => {
