@@ -1193,6 +1193,23 @@ fn config_from_acquire(request: &AcquireProjectRequest) -> Result<MemoryConfig> 
                 crate::model::embedding_config_for_profile(&active.profile_id, config.embedding())?;
             config.set_embedding(persisted);
         } else {
+            let store = crate::embedding_generation::ModelSwitchStore::load(
+                &config.model_switch_path(),
+                config.project_id(),
+            )?;
+            if let Some(embedding) = store
+                .current
+                .iter()
+                .chain(store.history.iter().rev())
+                .find(|job| {
+                    job.phase == crate::embedding_generation::SwitchPhase::Succeeded
+                        && job.target_generation_id == active.generation_id
+                        && job.target_profile_id == active.profile_id
+                })
+                .and_then(|job| job.target_embedding.clone())
+            {
+                config.set_embedding(embedding);
+            }
             anyhow::ensure!(
                 active.profile_fingerprint == config.embedding_profile_fingerprint()?,
                 "requested custom embedding does not match the persisted active profile"

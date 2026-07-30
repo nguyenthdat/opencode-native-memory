@@ -101,14 +101,32 @@ impl MemoryEngine {
         let state = MemoryState::load(&config.state_path())?;
         let document_index = DocumentIndexManifest::load(&config.document_index_path())?;
         let graph = GraphStore::load(&config.graph_state_path(), &config.graph_pending_path())?;
+        let switch_store =
+            ModelSwitchStore::load(&config.model_switch_path(), config.project_id())?;
         let persisted_active =
             ActiveEmbedding::load(&config.active_embedding_path(), config.project_id())?;
-        if let Some(active) = &persisted_active
-            && active.profile_id != "legacy-custom"
-        {
-            let embedding =
-                crate::model::embedding_config_for_profile(&active.profile_id, config.embedding())?;
-            config.set_embedding(embedding);
+        if let Some(active) = &persisted_active {
+            if active.profile_id == "legacy-custom" {
+                if let Some(embedding) = switch_store
+                    .current
+                    .iter()
+                    .chain(switch_store.history.iter().rev())
+                    .find(|job| {
+                        job.phase == crate::embedding_generation::SwitchPhase::Succeeded
+                            && job.target_generation_id == active.generation_id
+                            && job.target_profile_id == active.profile_id
+                    })
+                    .and_then(|job| job.target_embedding.clone())
+                {
+                    config.set_embedding(embedding);
+                }
+            } else {
+                let embedding = crate::model::embedding_config_for_profile(
+                    &active.profile_id,
+                    config.embedding(),
+                )?;
+                config.set_embedding(embedding);
+            }
         }
         let embedder = LlamaCppEmbedder::load(config.embedding(), config.model_cache())?;
         let active_embedding = match persisted_active {
@@ -157,9 +175,6 @@ impl MemoryEngine {
                 now_ms()?,
             )?
         };
-        let switch_store =
-            ModelSwitchStore::load(&config.model_switch_path(), config.project_id())?;
-
         let mut engine = Self {
             config,
             collection,

@@ -37,16 +37,16 @@ pub(crate) fn write_json_atomic<T: Serialize>(
 pub(crate) fn remove_file_durable(path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()))?;
-        sync_parent(path)?;
     }
+    sync_parent(path)?;
     Ok(())
 }
 
 pub(crate) fn remove_dir_all_durable(path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_dir_all(path).with_context(|| format!("cannot remove {}", path.display()))?;
-        sync_parent(path)?;
     }
+    sync_parent(path)?;
     Ok(())
 }
 

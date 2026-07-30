@@ -280,6 +280,8 @@ pub(crate) struct ModelSwitchJournal {
     pub source_profile_id: String,
     #[serde(default)]
     pub source_embedding: Option<EmbeddingConfig>,
+    #[serde(default)]
+    pub target_embedding: Option<EmbeddingConfig>,
     pub target_generation_id: String,
     pub target_profile_id: String,
     pub phase: SwitchPhase,
@@ -442,6 +444,7 @@ mod tests {
             source_generation_id: "legacy".to_string(),
             source_profile_id: "profile-a".to_string(),
             source_embedding: Some(EmbeddingConfig::default()),
+            target_embedding: None,
             target_generation_id: format!("gen_{id}"),
             target_profile_id: "profile-b".to_string(),
             phase: SwitchPhase::Succeeded,

@@ -100,6 +100,12 @@ impl MemoryEngine {
         });
         validate_generation_id(&target_generation_id)?;
         let direct_rollback = request.target_generation_id.is_some();
+        let target_embedding = if direct_rollback && target_generation_id == "legacy" {
+            self.legacy_snapshot(&request.target_profile_id)
+                .and_then(|snapshot| snapshot.source_embedding.clone())
+        } else {
+            None
+        };
         if direct_rollback {
             if target_generation_id == "legacy" {
                 let snapshot = self
@@ -137,6 +143,7 @@ impl MemoryEngine {
             source_generation_id: self.active_embedding.generation_id.clone(),
             source_profile_id: self.active_embedding.profile_id.clone(),
             source_embedding: Some(self.config.embedding().clone()),
+            target_embedding,
             target_generation_id,
             target_profile_id: request.target_profile_id.clone(),
             phase: if direct_rollback {
@@ -656,8 +663,12 @@ impl MemoryEngine {
         }
         if self.switch_target_config.is_none() {
             self.switch_target_config = Some(if job.target_generation_id == "legacy" {
-                self.legacy_snapshot(&job.target_profile_id)
-                    .and_then(|snapshot| snapshot.source_embedding.clone())
+                job.target_embedding
+                    .clone()
+                    .or_else(|| {
+                        self.legacy_snapshot(&job.target_profile_id)
+                            .and_then(|snapshot| snapshot.source_embedding.clone())
+                    })
                     .ok_or_else(|| {
                         anyhow!("retained legacy embedding configuration is unavailable")
                     })?
