@@ -1,0 +1,269 @@
+//! Alphabet-based bitmask pre-filtering for ultra-fast chunk skipping.
+//!
+//! This provides a "Layer 0" screen that can discard non-matching chunks
+//! in O(N) with very low constant factors using bit-parallelism.
+
+#![deny(unsafe_op_in_unsafe_fn)]
+
+/// A 256-bit mask representing the presence of all ASCII characters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AlphabetMask {
+    mask: [u64; 4],
+}
+
+impl AlphabetMask {
+    /// Create a mask from a slice of bytes.
+    ///
+    /// Building a 256-bit presence histogram is a scatter (each byte sets one
+    /// bit in one of four `u64` lanes), which AVX2/SSE2 cannot express without
+    /// per-element gather/scatter. The previous `is_x86_feature_detected!`
+    /// dispatch here selected between `from_bytes_avx2` (a 4-byte-unrolled
+    /// scalar loop) and `from_bytes_sse2` (a byte-for-byte copy of the scalar
+    /// loop): all three bodies do identical scalar work, so the per-call CPUID
+    /// branch and `#[target_feature]` codegen bought zero throughput. We call
+    /// the scalar body directly; its 4-byte unroll already auto-vectorizes
+    /// under `-C target-cpu`. The `from_bytes_{avx2,sse2,neon}` variants are
+    /// retained for the prefilter-robustness differential proptest, which
+    /// asserts each SIMD-gated body matches the scalar fallback.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        Self::from_bytes_scalar(bytes)
+    }
+
+    pub(crate) fn from_bytes_scalar(bytes: &[u8]) -> Self {
+        let mut mask = [0u64; 4];
+        for &b in bytes {
+            mask[(b / 64) as usize] |= 1 << (b % 64);
+        }
+        Self { mask }
+    }
+
+    /// Build an [`AlphabetMask`] from `bytes` using the NEON-friendly
+    /// 16-byte-chunked loop. Public so the prefilter-robustness
+    /// proptest can compare SIMD output to the scalar fallback.
+    ///
+    /// # Safety
+    /// Caller must run on an aarch64 target with NEON available. The
+    /// `#[cfg(target_arch = "aarch64")]` gate guarantees the first;
+    /// NEON is baseline on every Rust-supported aarch64 target so the
+    /// second is trivially true. The body is otherwise safe Rust.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) unsafe fn from_bytes_neon(bytes: &[u8]) -> Self {
+        let mut mask = [0u64; 4];
+        let chunks = bytes.chunks_exact(16);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            for &b in chunk {
+                mask[(b / 64) as usize] |= 1 << (b % 64);
+            }
+        }
+
+        for &b in remainder {
+            mask[(b / 64) as usize] |= 1 << (b % 64);
+        }
+
+        Self { mask }
+    }
+
+    /// Build an [`AlphabetMask`] from `bytes` using the 4-byte unrolled
+    /// AVX2 body. Public so the prefilter-robustness proptest can
+    /// compare SIMD output to the scalar fallback.
+    ///
+    /// # Safety
+    /// Caller must run on an x86_64 CPU that supports AVX2. The
+    /// `#[target_feature(enable = "avx2")]` attribute makes this a
+    /// caller obligation; invoking on a non-AVX2 host is UB.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn from_bytes_avx2(bytes: &[u8]) -> Self {
+        let mut mask = [0u64; 4];
+
+        let chunks = bytes.chunks_exact(4);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            mask[(chunk[0] / 64) as usize] |= 1 << (chunk[0] % 64);
+            mask[(chunk[1] / 64) as usize] |= 1 << (chunk[1] % 64);
+            mask[(chunk[2] / 64) as usize] |= 1 << (chunk[2] % 64);
+            mask[(chunk[3] / 64) as usize] |= 1 << (chunk[3] % 64);
+        }
+
+        for &b in remainder {
+            mask[(b / 64) as usize] |= 1 << (b % 64);
+        }
+
+        Self { mask }
+    }
+
+    /// Build an [`AlphabetMask`] from `bytes` using the SSE2 baseline.
+    /// Public so the prefilter-robustness proptest can compare SIMD
+    /// output to the scalar fallback.
+    ///
+    /// # Safety
+    /// Caller must run on an x86_64 CPU. SSE2 is mandatory on x86_64
+    /// per the SysV ABI, so the safety requirement is trivially met on
+    /// any host the `#[cfg]` permits; the `#[target_feature]` attribute
+    /// formalizes the caller obligation.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse2")]
+    pub(crate) unsafe fn from_bytes_sse2(bytes: &[u8]) -> Self {
+        let mut mask = [0u64; 4];
+        for &b in bytes {
+            mask[(b / 64) as usize] |= 1 << (b % 64);
+        }
+        Self { mask }
+    }
+
+    /// Create a mask from a string.
+    pub(crate) fn from_text(s: &str) -> Self {
+        Self::from_bytes(s.as_bytes())
+    }
+
+    /// Check if two masks have any common bits set.
+    pub(crate) fn intersects(&self, other: &Self) -> bool {
+        (self.mask[0] & other.mask[0]) != 0
+            || (self.mask[1] & other.mask[1]) != 0
+            || (self.mask[2] & other.mask[2]) != 0
+            || (self.mask[3] & other.mask[3]) != 0
+    }
+
+    #[inline]
+    pub(crate) fn contains_byte(&self, byte: u8) -> bool {
+        (self.mask[(byte / 64) as usize] & (1 << (byte % 64))) != 0
+    }
+
+    /// Union two masks together.
+    pub(crate) fn union(&mut self, other: &Self) {
+        self.mask[0] |= other.mask[0];
+        self.mask[1] |= other.mask[1];
+        self.mask[2] |= other.mask[2];
+        self.mask[3] |= other.mask[3];
+    }
+}
+
+/// A pre-filter that uses an [`AlphabetMask`] to quickly skip chunks.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AlphabetScreen {
+    pub(crate) target_mask: AlphabetMask,
+}
+
+impl AlphabetScreen {
+    /// Create a new screen from a set of target strings (literals or keywords).
+    ///
+    /// Folds ASCII case directly into the mask without allocating
+    /// lowercase/uppercase `String`s. For every ASCII byte we set the
+    /// alphabet bit for both `b` and `b ^ 0x20` (the ASCII case-flip).
+    /// Non-ASCII bytes pass through unchanged because the screen never
+    /// claims Unicode case-folding correctness (`to_lowercase()` on the
+    /// String path didn't either: it operated on chars yet collected into
+    /// a String whose bytes were still scanned as bytes here).
+    pub(crate) fn new(targets: &[String]) -> Self {
+        let mut mask = [0u64; 4];
+        for target in targets {
+            for &b in target.as_bytes() {
+                mask[(b / 64) as usize] |= 1 << (b % 64);
+                if b.is_ascii_alphabetic() {
+                    let flipped = b ^ 0x20;
+                    mask[(flipped / 64) as usize] |= 1 << (flipped % 64);
+                }
+            }
+        }
+        Self {
+            target_mask: AlphabetMask { mask },
+        }
+    }
+
+    /// Quick screen of a data chunk.
+    pub(crate) fn screen(&self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                // SAFETY: We just checked for AVX2 support.
+                return unsafe { self.screen_avx2(data) };
+            }
+        }
+
+        // Scalar fallback: return as soon as a target byte appears instead
+        // of building a complete chunk mask when the first match is early.
+        data.iter()
+            .any(|&byte| self.target_mask.contains_byte(byte))
+    }
+
+    /// AVX2 implementation of [`screen`](Self::screen). Public so the
+    /// prefilter-robustness proptest can compare SIMD output to the
+    /// scalar fallback.
+    ///
+    /// # Safety
+    /// Caller must run on an x86_64 CPU that supports AVX2. The
+    /// `#[target_feature(enable = "avx2")]` attribute makes this a
+    /// caller obligation; invoking on a non-AVX2 host is UB.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn screen_avx2(&self, data: &[u8]) -> bool {
+        use std::arch::x86_64::*;
+
+        // SAFETY: `target_mask.mask` is `[u64; 4]` (32 bytes total). Slicing
+        // `[..2]` gives 16 bytes / `[2..]` gives 16 bytes - exactly what
+        // `_mm_loadu_si128` needs. Loadu permits unaligned pointers.
+        // AVX2 availability is enforced by the surrounding
+        // `#[target_feature(enable = "avx2")]`. kimi-wave1 finding 6.LOW.alphabet_filter.rs.162.
+        let (bitset_low, bitset_high, bit_selector) = unsafe {
+            let low_mask = _mm_loadu_si128(self.target_mask.mask[..2].as_ptr() as *const __m128i);
+            let high_mask = _mm_loadu_si128(self.target_mask.mask[2..].as_ptr() as *const __m128i);
+
+            (
+                _mm256_set_m128i(low_mask, low_mask),
+                _mm256_set_m128i(high_mask, high_mask),
+                _mm256_setr_epi8(
+                    1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32,
+                    64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+                ),
+            )
+        };
+
+        let chunks = data.chunks_exact(32);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            // SAFETY: `chunks_exact(32)` guarantees chunk.len() == 32, so
+            // `chunk.as_ptr()` is valid for a 32-byte AVX2 unaligned load.
+            // Subsequent intrinsics are pure register ops; AVX2 availability
+            // is enforced by the surrounding `#[target_feature(enable =
+            // "avx2")]`. kimi-wave1 finding 6.LOW.alphabet_filter.rs.180.
+            unsafe {
+                let v = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+
+                // bit_index = v & 7
+                let bit_indices = _mm256_and_si256(v, _mm256_set1_epi8(0x07));
+                let bits = _mm256_shuffle_epi8(bit_selector, bit_indices);
+
+                // byte_index = (v >> 3) & 0x0F
+                let byte_indices =
+                    _mm256_and_si256(_mm256_srli_epi16(v, 3), _mm256_set1_epi8(0x0F));
+
+                let is_128_255 = _mm256_cmpgt_epi8(_mm256_setzero_si256(), v); // Bit 7 set
+
+                let row_low = _mm256_shuffle_epi8(bitset_low, byte_indices);
+                let row_high = _mm256_shuffle_epi8(bitset_high, byte_indices);
+
+                let row = _mm256_blendv_epi8(row_low, row_high, is_128_255);
+
+                if _mm256_testz_si256(row, bits) == 0 {
+                    return true;
+                }
+            }
+        }
+
+        for &b in remainder {
+            if self.target_mask.contains_byte(b) {
+                return true;
+            }
+        }
+
+        false
+    }
+}

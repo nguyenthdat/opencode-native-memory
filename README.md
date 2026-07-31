@@ -66,37 +66,39 @@ The plugin automatically registers its packaged `rules/native-memory.md` as an O
 
 ## Memory Tools
 
-| Tool                          | Purpose                                                                   |
-| ----------------------------- | ------------------------------------------------------------------------- |
-| `memory_search`               | Retrieve relevant memories within a context budget                        |
-| `memory_store`                | Store a verified durable memory                                           |
-| `memory_ingest`               | Queue one local PDF, Markdown, or HTML document for background extraction |
-| `memory_ingest_status`        | Poll background document ingestion jobs                                   |
-| `memory_index_documents`      | Incrementally index all non-ignored project documents                     |
-| `memory_get`                  | Fetch complete records by ID                                              |
-| `memory_list`                 | Review/filter lifecycle-indexed memories                                  |
-| `memory_update`               | Correct semantic content or lifecycle metadata                            |
-| `memory_pin`                  | Pin or unpin without re-embedding                                         |
-| `memory_lock`                 | Lock or unlock without re-embedding                                       |
-| `memory_delete`               | Delete records, with tombstones by default                                |
-| `memory_promote`              | Promote reviewed local memory to repository Markdown                      |
-| `memory_export`               | Export records, lifecycle relations, and tombstones                       |
-| `memory_import`               | Validate and restore a portable JSON snapshot                             |
-| `memory_feedback`             | Record whether recalled memories were useful                              |
-| `memory_optimize`             | Prune expired records and optimize indexes                                |
-| `memory_status`               | Health-check the plugin and inspect backend, model, and schema status     |
-| `memory_doctor`               | Run shallow or deep integrity checks                                      |
-| `memory_purge`                | Confirm and logically purge project data while preserving the store       |
-| `memory_model_profiles`       | List stable, preview, and unsupported embedding model profiles            |
-| `memory_model_switch`         | Start or dry-run a durable embedding-generation migration                 |
-| `memory_model_switch_status`  | Read durable embedding-generation switch progress                         |
-| `memory_model_switch_cancel`  | Request cooperative cancellation before cutover                           |
-| `memory_graph_extract`        | Explicitly extract and persist source-backed entities and relations       |
-| `memory_graph_extract_status` | Inspect and resume a durable graph extraction job                         |
-| `memory_graph_extract_cancel` | Cooperatively cancel a durable graph extraction job                       |
-| `memory_graph_search`         | Search entities/relations through bounded graph traversal                 |
-| `memory_graph_status`         | Inspect source-visible graph counts and last extraction                   |
-| `memory_graph_export`         | Export one bounded page of graph facts and provenance                     |
+| Tool                              | Purpose                                                                   |
+| --------------------------------- | ------------------------------------------------------------------------- |
+| `memory_search`                   | Retrieve relevant memories within a context budget                        |
+| `memory_store`                    | Store a verified durable memory                                           |
+| `memory_ingest`                   | Queue one local PDF, Markdown, or HTML document for background extraction |
+| `memory_ingest_status`            | Poll background document ingestion jobs                                   |
+| `memory_index_documents`          | Incrementally index all non-ignored project documents                     |
+| `memory_get`                      | Fetch complete records by ID                                              |
+| `memory_list`                     | Review/filter lifecycle-indexed memories                                  |
+| `memory_update`                   | Correct semantic content or lifecycle metadata                            |
+| `memory_pin`                      | Pin or unpin without re-embedding                                         |
+| `memory_lock`                     | Lock or unlock without re-embedding                                       |
+| `memory_delete`                   | Delete records, with tombstones by default                                |
+| `memory_promote`                  | Promote reviewed local memory to repository Markdown                      |
+| `memory_export`                   | Export records, lifecycle relations, and tombstones                       |
+| `memory_import`                   | Validate and restore a portable JSON snapshot                             |
+| `memory_feedback`                 | Record whether recalled memories were useful                              |
+| `memory_optimize`                 | Prune expired records and optimize indexes                                |
+| `memory_status`                   | Health-check the plugin and inspect backend, model, and schema status     |
+| `memory_doctor`                   | Run shallow or deep integrity checks                                      |
+| `memory_purge`                    | Confirm and logically purge project data while preserving the store       |
+| `memory_model_profiles`           | List stable, preview, and unsupported embedding model profiles            |
+| `memory_model_switch`             | Start or dry-run a durable embedding-generation migration                 |
+| `memory_model_switch_status`      | Read durable embedding-generation switch progress                         |
+| `memory_model_switch_cancel`      | Request cooperative cancellation before cutover                           |
+| `memory_graph_extract`            | Explicitly extract source-backed entities, relations, facts, observations |
+| `memory_graph_extract_status`     | Inspect and resume a durable graph extraction job                         |
+| `memory_graph_extract_cancel`     | Cooperatively cancel a durable graph extraction job                       |
+| `memory_graph_search`             | Search entities/relations through bounded graph traversal                 |
+| `memory_reflect`                  | Build bounded citation-ready fact/observation evidence                    |
+| `memory_graph_status`             | Inspect source-visible graph counts and last extraction                   |
+| `memory_graph_export`             | Export one bounded page of graph facts and provenance                     |
+| `memory_graph_observation_action` | Review, edit, invalidate, or restore an observation                       |
 
 ### Knowledge Graph
 
@@ -104,9 +106,11 @@ Knowledge graph extraction is opt-in. `memory_graph_extract` first asks the nati
 
 Repository-scoped sources, sources with code anchors, fixed code-like source suffixes, secret-like content, and prompt-injection-shaped source content are blocked from remote extraction by default. The native daemon rechecks source visibility, hash, extraction revision, scope, policy revision, evidence quotes, candidate limits, and allowed predicates (`uses`, `depends_on`, `implements`, `causes`, `related_to`, `supports`, `contradicts`) immediately before commit. Native graph state stores provider/model identifiers but does not serialize credential values; the daemon inherits the plugin process environment.
 
-Accepted graph facts live under the project data root in `knowledge-graph.json`; `knowledge-graph.pending.json` journals one bounded transaction. The project actor and existing `writer.lock` remain the only writer. Store replacement, supersession, delete/forget, document replacement/removal, shared Markdown sync, import, expiry pruning, recovery, and purge all invalidate or erase source-owned evidence before the authoritative memory mutation. Graph reads independently revalidate current source visibility, expiry, supersession, stale anchors, and extraction revision.
+Accepted graph entities, relations, facts, and observations live under the project data root in `knowledge-graph.json`; `knowledge-graph.pending.json` journals one bounded transaction. Oxigraph materializes this authoritative actor state as an in-process RDF/ontology projection on load and commit, while Zvec owns immutable-generation semantic vectors. The project actor and existing `writer.lock` remain the only writer. Store replacement, supersession, delete/forget, document replacement/removal, shared Markdown sync, import, expiry pruning, recovery, and purge all invalidate or erase source-owned evidence before the authoritative memory mutation. Graph reads independently revalidate current source visibility, expiry, supersession, stale anchors, and extraction revision.
 
-`memory_graph_search` provides current or historical temporal queries over lexical seeds and depth-2 bounded traversal. Eligible graph results are projected back to source-memory IDs and can be fused into normal `memory_search` with rank-only RRF before the existing MMR and character-budget packing; automatic recall enables this local graph channel. Temporal assertion versions preserve invalidation history, and `supports`/`contradicts` stay separate from lifecycle relations.
+`memory_graph_search` provides current or historical temporal queries over lexical/semantic fact, entity, relation, and observation seeds plus depth-2 bounded traversal. Eligible graph results are projected back to source-memory IDs and can be fused into normal `memory_search` with rank-only RRF before the existing MMR and character-budget packing; automatic recall enables this local graph channel. Temporal assertion versions preserve invalidation history, and `supports`/`contradicts` stay separate from lifecycle relations.
+
+Provider-backed automatic retain is separate from deterministic compaction capture and defaults off. `OPENCODE_MEMORY_AUTO_RETAIN=true` allows an explicitly ingested document to enqueue a bounded durable fact-extraction job after the normal provider permission prompt; session compaction and completed tool outcomes may create bounded, 30-day session-scoped sources when the active model is known. Tool inputs, raw output, and raw errors are never copied into those outcome sources. Repository/code-backed sources remain blocked by the native egress policy.
 
 ### Embedding Profiles
 
@@ -137,6 +141,8 @@ restarting the daemon. The previous generation can be retained for an explicit
 rollback request.
 
 The 20 stable taxonomy values are `task_attempt`, `tool_call`, `session_summary`, `architecture_fact`, `codebase_fact`, `user_fact`, `user_identity`, `user_behavior`, `user_preference`, `user_goal`, `user_relationship`, `fix_pattern`, `code_template`, `tool_heuristic`, `code_style`, `library_pref`, `workflow_pref`, `decision`, `team_convention`, and `project_standard`.
+
+`gotcha` is a memory kind rather than a canonical taxonomy. New callers should store it with `kind: "gotcha"` and omit taxonomy (which infers `fix_pattern`), and filter it through `kinds`. The TypeScript tool boundary accepts `taxonomy: "gotcha"` as a compatibility alias without changing the persisted 20-value taxonomy schema.
 
 ### Personalization Policy
 
@@ -194,6 +200,8 @@ Changing model identity or vector-affecting preprocessing requires rebuilding th
 | `OPENCODE_MEMORY_WARMUP`                       | Enable model/shared-memory warmup; default `true`                                           |
 | `OPENCODE_MEMORY_AUTO_RECALL`                  | Enable automatic contextual recall; default `true`                                          |
 | `OPENCODE_MEMORY_AUTO_CAPTURE`                 | Evaluate compaction candidates through the capture gate; default `true`                     |
+| `OPENCODE_MEMORY_AUTO_RETAIN`                  | Enqueue bounded provider-backed document/compaction retain; default `false`                 |
+| `OPENCODE_MEMORY_AUTO_RETAIN_SOURCES`          | Comma-separated `document`, `compaction`, `tool_outcome`; all three by default              |
 | `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS`         | Incrementally index non-ignored project documents; default `true`                           |
 | `OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS`   | File-watcher re-index debounce; default `750`                                               |
 | `OPENCODE_MEMORY_AUTO_OPTIMIZE`                | Coalesced zvec compaction after writes/index drift; default `true`                          |
@@ -201,6 +209,9 @@ Changing model identity or vector-affecting preprocessing requires rebuilding th
 | `OPENCODE_MEMORY_SHARED_SYNC`                  | Synchronize `.opencode/memory/**/*.md`; default `true`                                      |
 | `OPENCODE_MEMORY_FEEDBACK_TRACKING`            | Track retrieval feedback; default `true`                                                    |
 | `OPENCODE_MEMORY_MIN_SCORE`                    | Default calibrated search threshold; default `0.42`                                         |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_MODEL`         | Optional local DeBERTa prompt-injection ONNX model path                                     |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_TOKENIZER`     | Optional matching Hugging Face tokenizer JSON path                                          |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_THRESHOLD`     | Semantic injection block threshold; default `0.85`                                          |
 
 Example local model:
 
@@ -215,7 +226,7 @@ export OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE="search_document: {text}"
 
 Private state uses the data directory under `opencode/memory/projects/<project-id>/`. `active-embedding.json` records the selected local profile and generation without storing credentials. `model-switch.json` journals durable model migration. Completed target generations live under `embedding-generations/<generation-id>/`. Downloaded models use OpenCode's data home under `opencode/memory/models/<model-revision>/`; versioning by immutable model revision avoids downloading the same multi-gigabyte GGUF again on plugin-only upgrades. Existing downloads under `~/.cache/opencode/memory/models/` are not moved automatically; point `OPENCODE_MEMORY_MODEL_CACHE` there to reuse them.
 
-The same private project directory contains `knowledge-graph.json` and its bounded pending journal. The graph stores normalized entities, relations, exact evidence quotes, source bindings, non-secret run receipts, and durable extraction job metadata; job records contain hashes/revisions but not source text. It never replaces zvec or becomes authoritative for source memory text.
+The same private project directory contains `knowledge-graph.json` and its bounded pending journal. The graph stores normalized entities, relations, world/experience facts, observations, exact evidence quotes, source bindings, non-secret run receipts, and durable extraction job metadata; job records contain hashes/revisions but not source text. Oxigraph is rebuilt as an RDF projection of this state; it never replaces Zvec or becomes authoritative for source memory text.
 
 Repository memory is canonical Markdown in:
 

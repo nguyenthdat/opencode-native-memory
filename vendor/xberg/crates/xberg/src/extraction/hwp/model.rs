@@ -1,0 +1,115 @@
+/// Minimal document model for HWP text extraction.
+///
+/// Only the types needed to walk body-text sections and collect plain text.
+use super::error::Result;
+use super::parser::Record;
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(alef, alef(skip))]
+/// An extracted HWP document, consisting of one or more body-text sections.
+#[derive(Debug, Default)]
+pub struct HwpDocument {
+    /// All sections from all BodyText/SectionN streams.
+    pub sections: Vec<Section>,
+    /// Global character shape table from DocInfo.
+    pub char_shapes: Vec<CharShape>,
+    /// Extracted images from BinData.
+    pub images: Vec<HwpImage>,
+}
+
+/// A body-text section containing a flat list of paragraphs.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Section {
+    /// All paragraphs in this body-text section.
+    pub paragraphs: Vec<Paragraph>,
+}
+
+#[cfg_attr(alef, alef(skip))]
+/// A single paragraph; may or may not carry a text payload.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Paragraph {
+    /// The decoded paragraph text, or `None` if this paragraph has no text record.
+    pub text: Option<ParaText>,
+    /// Outline level from the ParaShape record (0 = body text, 1–7 = headings).
+    pub outline_level: u8,
+    /// Mappings from character position to char_shape index.
+    pub char_shape_runs: Vec<(u32, u16)>,
+}
+
+/// Character formatting attributes from the HWP DocInfo CharShape table.
+#[cfg_attr(alef, alef(skip))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CharShape {
+    /// Bold formatting flag.
+    pub bold: bool,
+    /// Italic formatting flag.
+    pub italic: bool,
+    /// Underline formatting flag.
+    pub underline: bool,
+}
+
+/// A raw image blob extracted from a BinData stream in an HWP document.
+#[cfg_attr(alef, alef(skip))]
+#[derive(Debug, Clone, Default)]
+pub struct HwpImage {
+    /// Stream path used as a stable identifier (e.g. `"BinData/BIN0001.jpg"`).
+    pub name: String,
+    /// Raw image bytes as stored in the BinData stream.
+    pub data: Vec<u8>,
+}
+
+#[cfg_attr(alef, alef(skip))]
+/// Plain text content decoded from a ParaText record (tag 0x43).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ParaText {
+    /// Decoded UTF-8 text with HWP control characters mapped to whitespace or removed.
+    pub content: String,
+}
+
+impl ParaText {
+    /// Decode a ParaText record from raw bytes.
+    ///
+    /// The data field of a TAG_PARA_TEXT record is a sequence of UTF-16LE code
+    /// units.  Control characters < 0x0020 are mapped to whitespace or skipped;
+    /// characters in the private-use range 0xF020–0xF07F (HWP internal controls)
+    /// are discarded.
+    pub(crate) fn from_record(record: &Record) -> Result<Self> {
+        let mut reader = record.data_reader();
+        let mut chars: Vec<u16> = Vec::with_capacity(record.data.len() / 2);
+
+        while reader.remaining() >= 2 {
+            chars.push(reader.read_u16()?);
+        }
+
+        let mut content = String::with_capacity(chars.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let ch = chars[i];
+            match ch {
+                0x0000 => {}
+                0x0001..=0x0008 => {
+                    i += 7;
+                }
+                0x0009 => {
+                    content.push('\t');
+                    i += 7;
+                }
+                0x000A => content.push('\n'),
+                0x000D => {}
+                0x000B..=0x000C | 0x000E..=0x001F => {
+                    i += 7;
+                }
+                0xF020..=0xF07F => {}
+                _ => {
+                    if let Some(c) = char::from_u32(ch as u32) {
+                        content.push(c);
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        Ok(Self { content })
+    }
+}

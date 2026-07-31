@@ -39,6 +39,7 @@ pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_VALUE_DEPTH: usize = 64;
 const MAX_MODEL_ID_BYTES: usize = 128;
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ProjectRequest {
     Memory(Request),
     Model(ModelRequest),
@@ -357,6 +358,10 @@ impl Service {
                 .engine()
                 .and_then(|engine| engine.graph_extract_cancel(&request))
                 .map(graph_response::Result::ExtractCancel),
+            graph_request::Operation::ObservationAction(request) => self
+                .engine()
+                .and_then(|engine| engine.graph_observation_action(&request))
+                .map(graph_response::Result::ObservationAction),
         };
         match result {
             Ok(result) => graph_ok(id, result),
@@ -510,6 +515,7 @@ fn validate_graph_request(request: &GraphRequest) -> Result<()> {
         graph_request::Operation::ExtractFinish(request) => request.authorization.as_ref(),
         graph_request::Operation::ExtractJobStatus(request) => request.authorization.as_ref(),
         graph_request::Operation::ExtractCancel(request) => request.authorization.as_ref(),
+        graph_request::Operation::ObservationAction(request) => request.authorization.as_ref(),
     }
     .ok_or_else(|| anyhow!("graph authorization is required"))?;
     anyhow::ensure!(
@@ -595,7 +601,10 @@ fn validate_graph_request(request: &GraphRequest) -> Result<()> {
                 "graph extraction run ID is required"
             );
             anyhow::ensure!(
-                request.entities.len() <= 64 && request.relations.len() <= 64,
+                request.entities.len() <= 64
+                    && request.relations.len() <= 64
+                    && request.facts.len() <= 64
+                    && request.observations.len() <= 64,
                 "graph candidate count exceeds limit"
             );
         }
@@ -609,6 +618,27 @@ fn validate_graph_request(request: &GraphRequest) -> Result<()> {
             anyhow::ensure!(
                 !request.job_id.trim().is_empty(),
                 "graph job ID is required"
+            );
+        }
+        graph_request::Operation::ObservationAction(request) => {
+            anyhow::ensure!(
+                !request.observation_id.trim().is_empty(),
+                "graph observation ID is required"
+            );
+            anyhow::ensure!(
+                matches!(
+                    request.action.as_str(),
+                    "review" | "edit" | "invalidate" | "restore"
+                ),
+                "unknown graph observation action"
+            );
+            anyhow::ensure!(
+                request.action != "edit"
+                    || request
+                        .statement
+                        .as_deref()
+                        .is_some_and(|statement| !statement.trim().is_empty()),
+                "observation edit requires a statement"
             );
         }
     }

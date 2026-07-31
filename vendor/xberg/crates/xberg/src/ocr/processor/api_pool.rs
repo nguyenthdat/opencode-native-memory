@@ -1,0 +1,413 @@
+//! Bounded, keyed ownership pool for native Tesseract handles.
+
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex};
+
+use crate::ocr::error::OcrError;
+use xberg_tesseract::TesseractAPI;
+
+/// Empirical sweet spot: four workers delivered 8.43 docs/s while eight
+/// regressed to 6.08 docs/s and raised peak RSS to 3.65 GB.
+pub(crate) const MAX_TESSERACT_APIS: usize = 4;
+
+#[derive(Clone, PartialEq, Eq)]
+struct ApiKey {
+    tessdata_path: String,
+    language: String,
+}
+
+struct PoolState<K, V> {
+    checked_out: usize,
+    idle: Vec<(K, V)>,
+}
+
+struct ResourcePool<K, V> {
+    capacity: usize,
+    state: Mutex<PoolState<K, V>>,
+    available: Condvar,
+}
+
+impl<K: PartialEq, V> ResourcePool<K, V> {
+    fn new(capacity: usize) -> Arc<Self> {
+        assert!(capacity > 0, "resource pool capacity must be positive");
+        Arc::new(Self {
+            capacity,
+            state: Mutex::new(PoolState {
+                checked_out: 0,
+                idle: Vec::with_capacity(capacity),
+            }),
+            available: Condvar::new(),
+        })
+    }
+
+    fn checkout<E, F>(self: &Arc<Self>, key: K, constructor: F) -> Result<ResourceLease<K, V>, E>
+    where
+        F: FnOnce() -> Result<V, E>,
+    {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(index) = state.idle.iter().position(|(idle_key, _)| idle_key == &key) {
+                let value = state.idle.swap_remove(index).1;
+                state.checked_out += 1;
+                return Ok(ResourceLease::new(Arc::clone(self), key, value));
+            }
+
+            let total = state.checked_out + state.idle.len();
+            if total < self.capacity || !state.idle.is_empty() {
+                let stale = state.idle.pop();
+                state.checked_out += 1;
+                drop(state);
+                drop(stale);
+
+                let reservation = ConstructionReservation::new(Arc::clone(self));
+                let value = constructor()?;
+                return Ok(reservation.finish(key, value));
+            }
+
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self, key: K, value: Option<V>) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.checked_out > 0, "released resource was not checked out");
+        state.checked_out -= 1;
+        if let Some(value) = value {
+            state.idle.push((key, value));
+        }
+        drop(state);
+        self.available.notify_one();
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.checked_out, state.idle.len())
+    }
+}
+
+struct ConstructionReservation<K: PartialEq, V> {
+    pool: Arc<ResourcePool<K, V>>,
+    active: bool,
+}
+
+impl<K: PartialEq, V> ConstructionReservation<K, V> {
+    fn new(pool: Arc<ResourcePool<K, V>>) -> Self {
+        Self { pool, active: true }
+    }
+
+    fn finish(mut self, key: K, value: V) -> ResourceLease<K, V> {
+        self.active = false;
+        ResourceLease::new(Arc::clone(&self.pool), key, value)
+    }
+}
+
+impl<K: PartialEq, V> Drop for ConstructionReservation<K, V> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self
+                .pool
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            debug_assert!(state.checked_out > 0, "construction reservation was not active");
+            state.checked_out -= 1;
+            drop(state);
+            self.pool.available.notify_one();
+        }
+    }
+}
+
+struct ResourceLease<K: PartialEq, V> {
+    pool: Arc<ResourcePool<K, V>>,
+    key: Option<K>,
+    value: Option<V>,
+}
+
+impl<K: PartialEq, V> ResourceLease<K, V> {
+    fn new(pool: Arc<ResourcePool<K, V>>, key: K, value: V) -> Self {
+        Self {
+            pool,
+            key: Some(key),
+            value: Some(value),
+        }
+    }
+
+    #[cfg(test)]
+    fn discard(mut self) {
+        self.release_with(|_| false);
+    }
+
+    fn release_with<F>(&mut self, reset: F)
+    where
+        F: FnOnce(&V) -> bool,
+    {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let value = self.value.take().expect("resource lease consumed prematurely");
+        let mut reservation = ReleaseReservation::new(Arc::clone(&self.pool), key, value);
+        let retain = reset(reservation.value());
+        reservation.finish(retain);
+    }
+}
+
+impl<K: PartialEq, V> Deref for ResourceLease<K, V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        self.value.as_ref().expect("resource lease consumed prematurely")
+    }
+}
+
+impl<K: PartialEq, V> Drop for ResourceLease<K, V> {
+    fn drop(&mut self) {
+        self.release_with(|_| true);
+    }
+}
+
+struct ReleaseReservation<K: PartialEq, V> {
+    pool: Arc<ResourcePool<K, V>>,
+    key: Option<K>,
+    value: Option<V>,
+}
+
+impl<K: PartialEq, V> ReleaseReservation<K, V> {
+    fn new(pool: Arc<ResourcePool<K, V>>, key: K, value: V) -> Self {
+        Self {
+            pool,
+            key: Some(key),
+            value: Some(value),
+        }
+    }
+
+    fn value(&self) -> &V {
+        self.value.as_ref().expect("release reservation consumed prematurely")
+    }
+
+    fn finish(&mut self, retain: bool) {
+        let key = self.key.take().expect("release reservation key consumed prematurely");
+        let value = if retain {
+            self.value.take()
+        } else {
+            drop(self.value.take());
+            None
+        };
+        self.pool.release(key, value);
+    }
+}
+
+impl<K: PartialEq, V> Drop for ReleaseReservation<K, V> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            drop(self.value.take());
+            self.pool.release(key, None);
+        }
+    }
+}
+
+pub(super) struct TesseractApiPool {
+    resources: Arc<ResourcePool<ApiKey, TesseractAPI>>,
+}
+
+impl TesseractApiPool {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            resources: ResourcePool::new(MAX_TESSERACT_APIS),
+        })
+    }
+
+    pub(super) fn checkout(
+        self: &Arc<Self>,
+        tessdata_path: &str,
+        language: &str,
+    ) -> Result<TesseractApiLease, OcrError> {
+        let key = ApiKey {
+            tessdata_path: tessdata_path.to_string(),
+            language: language.to_string(),
+        };
+        let lease = self.resources.checkout(key, || {
+            let api = TesseractAPI::new().map_err(|error| {
+                OcrError::TesseractInitializationFailed(format!("Failed to allocate Tesseract engine: {error}"))
+            })?;
+            api.init(tessdata_path, language).map_err(|error| {
+                OcrError::TesseractInitializationFailed(format!("Failed to initialize language '{language}': {error}"))
+            })?;
+            api.clear().map_err(|error| {
+                OcrError::ProcessingFailed(format!("Failed to clear newly initialized Tesseract API: {error}"))
+            })?;
+            Ok(api)
+        })?;
+        Ok(TesseractApiLease { inner: lease })
+    }
+}
+
+pub(super) struct TesseractApiLease {
+    inner: ResourceLease<ApiKey, TesseractAPI>,
+}
+
+impl Deref for TesseractApiLease {
+    type Target = TesseractAPI;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for TesseractApiLease {
+    fn drop(&mut self) {
+        self.inner.release_with(|api| match api.clear() {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Failed to clear Tesseract API before returning it to the idle pool; discarding handle"
+                );
+                false
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    #[test]
+    fn total_checked_out_and_idle_never_exceeds_capacity() {
+        let pool = ResourcePool::new(4);
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for key in 0..12 {
+            let pool = Arc::clone(&pool);
+            let peak = Arc::clone(&peak);
+            threads.push(thread::spawn(move || {
+                let lease = pool.checkout::<(), _>(key, || Ok(key)).unwrap();
+                let (checked_out, idle) = pool.counts();
+                peak.fetch_max(checked_out + idle, Ordering::SeqCst);
+                thread::yield_now();
+                drop(lease);
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 4);
+        let (checked_out, idle) = pool.counts();
+        assert_eq!(checked_out, 0);
+        assert!(idle <= 4);
+    }
+
+    #[test]
+    fn key_switch_evicts_an_idle_mismatch() {
+        let pool = ResourcePool::new(1);
+        drop(pool.checkout::<(), _>("eng", || Ok(1)).unwrap());
+        let german = pool.checkout::<(), _>("deu", || Ok(2)).unwrap();
+        assert_eq!(*german, 2);
+        let (checked_out, idle) = pool.counts();
+        assert_eq!((checked_out, idle), (1, 0));
+    }
+
+    #[test]
+    fn constructor_failure_releases_reservation() {
+        let pool = ResourcePool::<&str, usize>::new(1);
+        assert!(pool.checkout("eng", || Err::<usize, _>("failed")).is_err());
+        assert_eq!(pool.counts(), (0, 0));
+        assert!(pool.checkout::<(), _>("eng", || Ok(1)).is_ok());
+    }
+
+    #[test]
+    fn discarded_resource_releases_capacity_without_reuse() {
+        let pool = ResourcePool::new(1);
+        let lease = pool.checkout::<(), _>("eng", || Ok(1)).unwrap();
+        lease.discard();
+        assert_eq!(pool.counts(), (0, 0));
+
+        let replacement = pool.checkout::<(), _>("eng", || Ok(2)).unwrap();
+        assert_eq!(*replacement, 2);
+    }
+
+    #[test]
+    fn constructor_panic_releases_reservation() {
+        let pool = ResourcePool::<&str, usize>::new(1);
+        let result = std::panic::catch_unwind({
+            let pool = Arc::clone(&pool);
+            move || {
+                let _ = pool.checkout::<(), _>("eng", || panic!("constructor panic"));
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(pool.counts(), (0, 0));
+        assert!(pool.checkout::<(), _>("eng", || Ok(1)).is_ok());
+    }
+
+    #[test]
+    fn successful_release_reset_retains_resource() {
+        let pool = ResourcePool::new(1);
+        let reset_count = AtomicUsize::new(0);
+        let mut lease = pool.checkout::<(), _>("eng", || Ok(1)).unwrap();
+        lease.release_with(|value| {
+            assert_eq!(*value, 1);
+            reset_count.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+
+        assert_eq!(reset_count.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.counts(), (0, 1));
+        let reused = pool.checkout::<(), _>("eng", || Ok(2)).unwrap();
+        assert_eq!(*reused, 1);
+    }
+
+    #[test]
+    fn failed_release_reset_discards_resource() {
+        let pool = ResourcePool::new(1);
+        let mut lease = pool.checkout::<(), _>("eng", || Ok(1)).unwrap();
+        lease.release_with(|_| false);
+
+        assert_eq!(pool.counts(), (0, 0));
+        let replacement = pool.checkout::<(), _>("eng", || Ok(2)).unwrap();
+        assert_eq!(*replacement, 2);
+    }
+
+    #[test]
+    fn failed_release_reset_drops_resource_before_reopening_capacity() {
+        struct DropCounter(Arc<AtomicUsize>);
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let pool = ResourcePool::new(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut lease = pool
+            .checkout::<(), _>("eng", || Ok(DropCounter(Arc::clone(&drops))))
+            .unwrap();
+        lease.release_with(|_| false);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.counts(), (0, 0));
+    }
+
+    #[test]
+    fn release_reset_panic_discards_resource_and_releases_capacity() {
+        let pool = ResourcePool::new(1);
+        let result = std::panic::catch_unwind({
+            let pool = Arc::clone(&pool);
+            move || {
+                let mut lease = pool.checkout::<(), _>("eng", || Ok(1)).unwrap();
+                lease.release_with(|_| panic!("reset panic"));
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(pool.counts(), (0, 0));
+        assert!(pool.checkout::<(), _>("eng", || Ok(2)).is_ok());
+    }
+}

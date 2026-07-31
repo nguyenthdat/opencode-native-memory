@@ -1,0 +1,81 @@
+# Tier-B data: documentation / placeholder words that mark a value as a sample,
+# not a production secret.
+#
+# Schema:
+#   [placeholder_words]
+#   words = ["lowercase-ascii-word", ...]
+#
+# Semantics:
+# - The list is consumed by the scanner's surface-form, decoded-form, and
+#   doc-marker suppression paths through one loader.
+# - Entries must be lowercase ASCII alphanumeric words. Do not add ambiguous
+#   operational words such as "test", "password", "admin", "root", or "qwerty":
+#   those can appear in real credentials and need context-specific handling.
+# - "example" is part of the shared vocabulary, but URL domains under
+#   example.com / example.org remain guarded by the doc-marker path so reserved
+#   documentation domains do not suppress unrelated URL-shaped findings.
+#
+#   [doc_markers]
+#   instructional_fragments = ["lowercase-marker", ...]
+#   marker_substrings       = ["lowercase-marker", ...]
+#
+# - `[doc_markers]` holds two doc/placeholder marker vocabularies consumed by the
+#   suppression decision tree. Stored lowercase (uniform with `words`); the loader
+#   uppercases each entry because the scanner matches them against the uppercased
+#   credential. Unlike `words`, marker entries may contain `_` and `-`. Extend
+#   these lists to add your own placeholder conventions without recompiling.
+
+[placeholder_words]
+words = [
+  "example",
+  "dummy",
+  "fake",
+  "mock",
+  "sample",
+  "placeholder",
+  "changeme",
+]
+
+[doc_markers]
+# Leading-word-boundary fragments (matched as `YOUR_API`, `CHANGEME`, ...): a word
+# boundary is required BEFORE the fragment so real base64 containing the substring
+# is not suppressed.
+instructional_fragments = ["your_", "your-", "insert", "change", "replace"]
+# Plain-substring markers, matched anywhere in the value, they appear buried
+# inside service-prefixed tokens (`ghp_EXAMPLE_TOKEN`, camel/snake-cased) where a
+# word-boundary match would miss them. Real secrets do not contain these literals.
+marker_substrings = [
+  "example",
+  "placeholder",
+  "not_a_real",
+  "notareal",
+  "insert_token_here",
+  "insert-token-here",
+  "change-me",
+  "changeme",
+  "replace_me",
+  "replaceme",
+  "redacted",
+  "fake_key",
+  "fakekey",
+  "test_key",
+  "testkey",
+  "sample_key",
+  "samplekey",
+]
+
+# Second marker vocabulary consumed by the entropy-plausibility gate
+# (`bytes_contain_entropy_placeholder_marker`, entropy/plausibility.rs). Kept in
+# two lists because it carries two uniform match semantics; the gate's remaining
+# THREE clauses are bespoke rules that stay in code (they are not lists): the
+# length-gated `secret_key` substring (< 20 bytes), the compound `AKIA…` prefix
+# with an `EXAMPLE` suffix or `1234567890` run, and the structural `<`/`>`
+# angle-bracket presence check.
+[entropy_markers]
+# Case-insensitive substring markers (matched via ascii_ci over raw bytes). Stored
+# lowercase; may carry `_`/`-` separators.
+ci_substrings = ["your_", "replace_me", "change_me", "insert_here", "fake_", "dummy_", "mock_"]
+# Whole-value EXACT markers, matched case-sensitively against the raw bytes. Stored
+# lowercase, so, preserving current behavior, only the lowercase whole value
+# suppresses (an uppercase `NULL` is NOT caught by this arm).
+exact_values = ["null", "none", "undefined", "empty", "default", "secret", "password"]

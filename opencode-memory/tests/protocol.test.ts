@@ -303,6 +303,11 @@ describe("Protobuf memory protocol", () => {
       ["graph_extract_job_status", { authorization, job_id: "job-1" }, "extractJobStatus"],
       ["graph_extract_cancel", { authorization, job_id: "job-1" }, "extractCancel"],
       [
+        "graph_observation_action",
+        { authorization, observation_id: "obs_1", action: "invalidate" },
+        "observationAction",
+      ],
+      [
         "graph_search",
         {
           authorization,
@@ -858,6 +863,8 @@ describe("Protobuf memory protocol", () => {
       schema_version: "",
       entities: [],
       relations: [],
+      facts: [],
+      observations: [],
       provenance: [],
       complete: false,
     });

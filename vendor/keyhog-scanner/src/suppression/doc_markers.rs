@@ -1,0 +1,208 @@
+//! Doc / placeholder / instructional marker substring scans. Extracted
+//! from `suppression_stage_inner` so documentation-marker handling has one
+//! focused boundary. Returns a tri-state verdict that the decision tree consumes
+//! verbatim - `Suppress(reason)` means "suppress with this exact stage reason";
+//! `Allow` means "this is a known
+//! service-prefixed token, do NOT suppress and skip the shape gates";
+//! `KeepChecking` means "fall through to the rest of the decision tree".
+
+use super::shape::{looks_like_prefixed_masked_sequence, RFC7519_EXAMPLE_JWT_PREFIX};
+
+/// Outcome of the doc/placeholder/marker pre-checks.
+pub(super) enum MarkerVerdict {
+    /// The credential matched a documentation marker or known FP shape -
+    /// the caller should suppress immediately with this exact reason.
+    Suppress(&'static str),
+    /// The credential is a known service-prefixed token (e.g. `ghp_…`,
+    /// `AKIA…`) whose body does NOT match a masked-sequence shape. The
+    /// caller should return `false` immediately - the prefix is positive
+    /// evidence and downstream shape gates would generate FPs.
+    Allow,
+    /// No marker matched. The caller should continue with the remaining
+    /// suppression checks (PEM, repetitive masking, hash/UUID, etc.).
+    KeepChecking,
+}
+
+/// True when `upper` (an already-uppercased credential) mentions an RFC 2606
+/// reserved example domain (`example.com` / `example.org`). Both the
+/// `contains_EXAMPLE_token` carve-out and the doc-marker substring carve-out
+/// need this exact test to avoid over-suppressing a real secret sitting beside
+/// an `Example.com` mention; keeping the two `EXAMPLE.COM` / `EXAMPLE.ORG`
+/// literals in one owner stops the pair drifting apart (DEDUP).
+fn upper_mentions_reserved_example_domain(upper: &str) -> bool {
+    upper.contains("EXAMPLE.COM") || upper.contains("EXAMPLE.ORG")
+}
+
+/// Case-insensitive word-boundary token-contains. Reads the boundary chars on
+/// BYTE offsets (`upper[..idx].chars().next_back()`); an earlier implementation
+/// mixed byte- and char-indexing (`upper.chars().nth(byte_idx - 1)`) and, for
+/// any credential containing non-ASCII bytes before the match, returned the
+/// wrong character and silently let placeholder tokens slip past (ASCII inputs
+/// happened to work because `byte_idx == char_idx` for pure ASCII).
+pub(super) fn upper_contains_token(upper: &str, token: &str) -> bool {
+    upper.match_indices(token).any(|(idx, _)| {
+        let before = upper[..idx].chars().next_back();
+        let after = upper[idx + token.len()..].chars().next();
+        before.is_none_or(|c| !c.is_alphanumeric()) && after.is_none_or(|c| !c.is_alphanumeric())
+    })
+}
+
+/// Run the doc/placeholder/marker pre-checks against `credential`. Caller
+/// passes `upper` (already uppercased credential) to avoid re-allocating
+/// and `from_evasion_decoder` so EXAMPLE-suppression can be skipped when
+/// the value arrived through `/reverse` or `/caesar` (those are
+/// adversarial decoders - an EXAMPLE marker in their output IS evidence
+/// of a real leak, not a documentation specimen).
+pub(super) fn check_markers(
+    credential: &str,
+    upper: &str,
+    from_evasion_decoder: bool,
+    _path: Option<&str>,
+    entropy_hint: Option<f64>,
+) -> MarkerVerdict {
+    // ── 1. Universal placeholder keywords (case-insensitive) ──
+    if crate::placeholder_words::contains_non_example_placeholder_word_with_entropy_hint(
+        credential,
+        upper,
+        entropy_hint,
+    ) {
+        return MarkerVerdict::Suppress("placeholder_word");
+    }
+    // EXAMPLE is special: only suppress if it is in the credential value itself,
+    // not in a URL domain (example.com is a reserved domain per RFC 2606).
+    // Skip entirely when the credential arrived through an evasion decoder
+    // (see fn-doc): an attacker reversing/ROTating an EXAMPLE-suffixed AWS
+    // test key is exactly the kind of leak the engine should report.
+    if let Some(example) = crate::placeholder_words::example_word() {
+        if !from_evasion_decoder
+            && (upper_contains_token(upper, example.upper())
+                || upper.ends_with(example.upper())
+                || upper_contains_token(upper, "EXAMPLEKEY")
+                || upper.ends_with("EXAMPLEKEY"))
+            // Reserved-domain carve-out, case-INSENSITIVE to match the marker
+            // detection above (which runs on `upper`). Domains are
+            // case-insensitive, so a title-case `Example.com` or upper
+            // `EXAMPLE.COM` is the same RFC 2606 reserved domain as the lower
+            // form; matching `credential` case-sensitively let those mentions
+            // slip past the carve-out and over-suppressed real secrets sitting
+            // beside them. Reuse the already-computed `upper` (no allocation).
+            && !upper_mentions_reserved_example_domain(upper)
+        {
+            return MarkerVerdict::Suppress("contains_EXAMPLE_token");
+        }
+    }
+
+    // ── 2. Common instructional fragments (Tier-B `[doc_markers]`) ──
+    for frag in crate::placeholder_words::instructional_fragments() {
+        let frag = frag.as_str();
+        if upper.contains(frag) {
+            // Require a word boundary before the fragment to avoid substring
+            // false-positions in real secrets (e.g. "CHANGE" inside base64).
+            // `match_indices` yields BYTE offsets, so the preceding character
+            // must be read on a byte boundary (`upper[..idx].chars().next_back()`)
+            // rather than via `chars().nth(idx - 1)` (a CHAR index): mixing the
+            // two mis-reads the boundary char for any credential with a
+            // multibyte char before the match - the same bug the module header
+            // documents and `upper_contains_token` already avoids. Only the
+            // *leading* boundary is checked here (instructional fragments like
+            // `YOUR_API`, `CHANGEME`, `INSERTKEY` are normally followed by
+            // alphanumerics, so a trailing-boundary requirement would miss them).
+            let mut positions = upper.match_indices(frag);
+            if positions.any(|(idx, _)| {
+                upper[..idx]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric())
+            }) {
+                return MarkerVerdict::Suppress("instructional_fragment");
+            }
+        }
+    }
+
+    // Developer markers override provider-prefix trust.
+    if upper_contains_token(upper, "TODO") || upper_contains_token(upper, "FIXME") {
+        return MarkerVerdict::Suppress("dev_marker_todo_fixme");
+    }
+
+    // The RFC 7519 specimen JWT must be checked BEFORE the
+    // known-prefix bypass below - the specimen starts with `eyJ`
+    // which IS a known-prefix (JWT header marker), so the
+    // bypass would otherwise return Allow and let the
+    // textbook-example token through as a real finding.
+    // SecretBench-medium 15k seed-0: 142 leaked FPs on this
+    // exact specimen pre-fix.
+    // Prefix-or-substring match on the 61-char RFC7519 specimen JWT
+    // (literal base64url encoding of
+    // `{"alg":"HS256","typ":"JWT"}.{"sub":"1234567890`). Any token
+    // containing those exact bytes IS the documentation specimen -
+    // no production JWT in the wild uses the literal
+    // `"sub":"1234567890` claim except cargo-culted from the spec.
+    // `contains` (not just `starts_with`) is required because some
+    // extractor paths capture surrounding context such as
+    // `auth_token=eyJhbGci...` - `starts_with` misses every one of
+    // those; `contains` catches them. SecretBench-medium 15k seed-0:
+    // 349 leaked FPs in `jwt-rfc-example` category were the
+    // `auth_token=…` log-line + `api.key=…` properties shape.
+    if credential.contains(RFC7519_EXAMPLE_JWT_PREFIX) {
+        return MarkerVerdict::Suppress("rfc7519_example_jwt");
+    }
+
+    // Documentation/placeholder markers embedded *inside* a
+    // known-prefix token (e.g. `ghp_EXAMPLE_TOKEN_FROM_DOCS`,
+    // `AKIAEXAMPLEEXAMPLE12`, `sk_live_PLACEHOLDER_NOT_A_REAL_KEY`,
+    // `xoxb-…-EXAMPLE-TOKEN`). The general EXAMPLE check at the
+    // top requires a *word-boundary* token match, which misses
+    // these because the marker is surrounded by alphanumerics
+    // (camelCase or snake_case). This substring scan MUST run
+    // BEFORE the known-prefix Allow fast-path below: otherwise a
+    // doc marker buried inside a service-prefixed token would gain
+    // immunity from the substring scan and leak through as a real
+    // finding. SecretBench-medium 15k seed-0: 234 leaked FPs from
+    // docs-example-marker pre-fix (145 of them this exact ordering
+    // bug). Substring match is safe here because real secrets do
+    // not contain these literal strings.
+    //
+    // `TESTKEY_*` adversarial fixtures carry the marker as their
+    // prefix, so the `TESTKEY`/`TEST_KEY` markers are skipped for
+    // them - they fall through to repetitive-mask gates instead.
+    // The marker vocabulary is the Tier-B `[doc_markers].marker_substrings` list
+    // (UPPERCASE at load), consumed through the one placeholder/marker loader.
+    //
+    // Case-INSENSITIVE reserved-domain carve-out (the marker scan below runs on
+    // `upper`); see the `contains_EXAMPLE_token` site for why matching
+    // `credential` case-sensitively over-suppressed secrets beside an
+    // `Example.com` / `EXAMPLE.COM` mention.
+    if !from_evasion_decoder && !upper_mentions_reserved_example_domain(upper) {
+        for marker in crate::placeholder_words::doc_marker_substrings() {
+            let marker = marker.as_str();
+            if upper.contains(marker) {
+                if credential.starts_with("TESTKEY_")
+                    && (marker == "TESTKEY" || marker == "TEST_KEY")
+                {
+                    continue;
+                }
+                return MarkerVerdict::Suppress("doc_marker_substring");
+            }
+        }
+    }
+
+    // Known-prefix Allow fast-path. Runs AFTER the doc-marker substring
+    // scan above so a marker buried inside a service-prefixed token
+    // (`AKIAEXAMPLEEXAMPLE12`, `ghp_EXAMPLE_TOKEN_FROM_DOCS`) suppresses
+    // first and never reaches this Allow. A clean known-prefix token whose
+    // body does NOT match a masked-sequence shape is positive evidence -
+    // downstream shape gates would only generate FPs, so we return early.
+    // `TESTKEY_*` adversarial fixtures must not take this fast path; they
+    // fall through to the repetitive-mask gates in the decision tree.
+    let known_prefix_body = crate::confidence::known_prefix_body(credential);
+    if let Some(body) = known_prefix_body {
+        if looks_like_prefixed_masked_sequence(body) {
+            return MarkerVerdict::Suppress("prefixed_masked_sequence");
+        }
+        if !credential.starts_with("TESTKEY_") {
+            return MarkerVerdict::Allow;
+        }
+    }
+
+    MarkerVerdict::KeepChecking
+}

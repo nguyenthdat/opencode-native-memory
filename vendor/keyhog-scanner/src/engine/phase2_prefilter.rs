@@ -1,0 +1,948 @@
+//! Always-active phase-2 prefilter construction and marking.
+use super::phase2::*;
+#[cfg(feature = "simd")]
+use super::phase2_hs::Phase2HsEngine;
+use super::phase2_truncate::truncate_for_prefilter;
+use super::*;
+use crate::scanner_config::ResolvedRuntimeTuningConfig;
+use aho_corasick::AhoCorasick;
+use std::sync::atomic::Ordering::Relaxed;
+
+#[derive(Clone, Copy)]
+enum PrefilterScope {
+    Full,
+    AnchorResidual,
+    LocalizedResidual,
+}
+
+/// ONE PLACE for the always-active prefilter's HS-vs-RegexSet engine gate (the
+/// hot-path decision in [`Phase2AlwaysActivePrefilter::mark_matches`]). HS engages
+/// when it is enabled AND the chunk is EITHER within the size gate OR pure ASCII of
+/// any size. On ASCII the RegexSet ASCII-fold is match-equivalent so HS is
+/// findings-IDENTICAL and ~2× faster (measured: 16 MB ASCII 1.55s→0.75s); large
+/// NON-ASCII chunks stay on the RegexSet because HS is NOT a win there, forcing
+/// HS on non-ASCII (with a supplemental unicode host set for the divergent
+/// `.`/`\w`/`\s` patterns) held recall but cost 2.75× more CPU than the RegexSet
+/// (its prefix-AC gating skips most patterns; the dot-heavy divergent set can't be
+/// gated). So the RegexSet is strictly faster on non-ASCII (Law 7). Kept pure +
+/// separate so the gate is unit-tested without a scanner (`hs_gate_tests`).
+#[cfg(any(test, feature = "simd"))]
+fn hs_prefilter_engages(
+    fallback_hs: bool,
+    chunk_len: usize,
+    hs_prefilter_max_len: usize,
+    chunk_is_ascii: bool,
+) -> bool {
+    fallback_hs && (chunk_len <= hs_prefilter_max_len || chunk_is_ascii)
+}
+
+impl Phase2AlwaysActivePrefilter {
+    /// Patterns per RegexSet batch. A single set over all ~2.7k always-active
+    /// patterns blows the compiled-program size limit; batching keeps each
+    /// set's NFA bounded while still collapsing thousands of full-chunk regex
+    /// walks into a handful of linear set passes.
+    const BATCH_SIZE: usize = 512;
+    /// Generous per-batch compiled-program + lazy-DFA budget. Larger than the
+    /// per-pattern `REGEX_SIZE_LIMIT_BYTES` because a batch holds many patterns;
+    /// size/DFA limits only affect compile success and cache size, never which
+    /// matches are reported, so a larger limit here stays match-equivalent.
+    const BATCH_SIZE_LIMIT_BYTES: usize = 64 << 20;
+
+    /// Build from the always-active phase-2 indices. Always returns `Some` for
+    /// a non-empty input: patterns in batches that fail to compile fall into
+    /// `ungated_indices` and run unconditionally, so the result is always
+    /// recall-equivalent to running every always-active pattern.
+    pub(crate) fn build(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        always_active_indices: &[usize],
+        anchor_index: Option<&super::phase2_anchor::Phase2AnchorIndex>,
+    ) -> Option<Self> {
+        if always_active_indices.is_empty() {
+            return None;
+        }
+        debug_assert!(
+            always_active_indices
+                .iter()
+                .all(|&index| index < phase2_patterns.len()),
+            "compiled scanner invariant violation: phase-2 always-active index out of range"
+        );
+        let anchor_residual_indices = always_active_indices
+            .iter()
+            .copied()
+            .filter(|&index| {
+                !anchor_index.is_some_and(|anchors| anchors.is_always_active_eligible(index))
+            })
+            .collect::<Vec<_>>();
+        let localized_residual_indices = anchor_residual_indices
+            .iter()
+            .copied()
+            .filter(|&index| phase2_patterns[index].0.regex.is_case_insensitive())
+            .collect::<Vec<_>>();
+        Some(Self {
+            valid_always_active_indices: always_active_indices.to_vec(),
+            anchor_residual_indices,
+            localized_residual_indices,
+            portable: std::sync::OnceLock::new(),
+            portable_anchor_residual: std::sync::OnceLock::new(),
+            portable_localized_residual: std::sync::OnceLock::new(),
+            combined_gate: std::sync::OnceLock::new(),
+            #[cfg(feature = "simd")]
+            hs: std::sync::OnceLock::new(),
+            #[cfg(feature = "simd")]
+            hs_anchor_residual: std::sync::OnceLock::new(),
+            #[cfg(feature = "simd")]
+            hs_localized_residual: std::sync::OnceLock::new(),
+        })
+    }
+
+    #[cfg(feature = "simd")]
+    pub(crate) fn hyperscan_initialized(&self) -> bool {
+        [
+            &self.hs,
+            &self.hs_anchor_residual,
+            &self.hs_localized_residual,
+        ]
+        .into_iter()
+        .any(|slot| slot.get().is_some_and(Option::is_some))
+    }
+
+    fn combined_gate<'a>(
+        &'a self,
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+    ) -> Option<&'a CombinedNoCandidateGate> {
+        self.combined_gate
+            .get_or_init(|| {
+                Self::build_combined_gate(phase2_patterns, &self.valid_always_active_indices)
+            })
+            .as_ref()
+    }
+
+    fn indices_for(&self, scope: PrefilterScope) -> &[usize] {
+        match scope {
+            PrefilterScope::Full => &self.valid_always_active_indices,
+            PrefilterScope::AnchorResidual => &self.anchor_residual_indices,
+            PrefilterScope::LocalizedResidual => &self.localized_residual_indices,
+        }
+    }
+
+    fn portable_for<'a>(
+        &'a self,
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        scope: PrefilterScope,
+    ) -> &'a PortablePrefilter {
+        let slot = match scope {
+            PrefilterScope::Full => &self.portable,
+            PrefilterScope::AnchorResidual => &self.portable_anchor_residual,
+            PrefilterScope::LocalizedResidual => &self.portable_localized_residual,
+        };
+        slot.get_or_init(|| Self::compile_portable(phase2_patterns, self.indices_for(scope)))
+    }
+
+    #[cfg(feature = "simd")]
+    fn hs_for<'a>(
+        &'a self,
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        scope: PrefilterScope,
+    ) -> Option<&'a Phase2HsEngine> {
+        let slot = match scope {
+            PrefilterScope::Full => &self.hs,
+            PrefilterScope::AnchorResidual => &self.hs_anchor_residual,
+            PrefilterScope::LocalizedResidual => &self.hs_localized_residual,
+        };
+        slot.get_or_init(|| Phase2HsEngine::build(phase2_patterns, self.indices_for(scope)))
+            .as_ref()
+    }
+
+    fn compile_portable(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        indices: &[usize],
+    ) -> PortablePrefilter {
+        // Keep batches homogeneous by case flags and homoglyph-variant status.
+        let mut ci: Vec<usize> = Vec::new();
+        let mut plain_homoglyph: Vec<usize> = Vec::new();
+        let mut plain_other: Vec<usize> = Vec::new();
+        for &index in indices {
+            let (pattern, _) = &phase2_patterns[index];
+            if pattern.regex.is_case_insensitive() {
+                ci.push(index);
+            } else if pattern.homoglyph_variant {
+                plain_homoglyph.push(index);
+            } else {
+                plain_other.push(index);
+            }
+        }
+        let mut batches = Vec::new();
+        let mut ungated_indices = Vec::new();
+        let mut ci_gate_lits: Vec<Vec<u8>> = Vec::new();
+        let mut plain_gate_lits: Vec<Vec<u8>> = Vec::new();
+        Self::build_partition(
+            phase2_patterns,
+            &ci,
+            true,
+            false,
+            &mut batches,
+            &mut ungated_indices,
+            &mut ci_gate_lits,
+        );
+        Self::build_partition(
+            phase2_patterns,
+            &plain_other,
+            false,
+            false,
+            &mut batches,
+            &mut ungated_indices,
+            &mut plain_gate_lits,
+        );
+        Self::build_partition(
+            phase2_patterns,
+            &plain_homoglyph,
+            false,
+            true,
+            &mut batches,
+            &mut ungated_indices,
+            &mut plain_gate_lits,
+        );
+        PortablePrefilter {
+            batches,
+            ungated_indices,
+            ci_gate: Self::build_gate_ac(&ci_gate_lits, true),
+            plain_gate: Self::build_gate_ac(&plain_gate_lits, false),
+        }
+    }
+
+    /// The gate's skip path checks each non-anchorable always-active pattern with
+    /// its own regex. That is recall-safe and cheap when the set is small, but if
+    /// MOST always-active patterns were non-anchorable the skip path would run
+    /// hundreds of individual regexes, worse than the one batched HS scan it
+    /// replaces. So the builder declines the gate (`None`, full body runs) only in
+    /// that degenerate case: when the non-anchorable set is BOTH a large fraction
+    /// (> 1/2) of the always-active set AND large in absolute terms (> the absolute
+    /// ceiling). In practice almost every credential detector carries a required
+    /// prefix (and every homoglyph variant folds to one), so the non-anchorable set
+    /// is a small minority and the gate engages.
+    const MAX_NON_ANCHORABLE_FRACTION_NUM: usize = 1;
+    const MAX_NON_ANCHORABLE_FRACTION_DEN: usize = 2;
+    /// Absolute ceiling on the non-anchorable skip-path regex count before the
+    /// fraction test can decline the gate (below this, the per-pattern checks are
+    /// cheap enough that the gate is always worth keeping).
+    const MAX_NON_ANCHORABLE_ABS: usize = 256;
+
+    /// Build the combined no-candidate gate. `None` means the full body runs.
+    fn build_combined_gate(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        always_active_indices: &[usize],
+    ) -> Option<CombinedNoCandidateGate> {
+        if always_active_indices.is_empty() {
+            return None;
+        }
+        let mut lits: Vec<Vec<u8>> = Vec::new();
+        // The non-anchorable always-active patterns (no required prefix literal),
+        // carried as `(index, own-compiled-regex)` so the skip path checks each
+        // with its EXACT runtime matcher, byte-for-byte match-equivalent to the
+        // full body, no over- or under-marking.
+        let mut non_anchorable: Vec<(usize, LazyRegex)> = Vec::new();
+        for &index in always_active_indices {
+            let (pattern, _) = phase2_patterns.get(index)?;
+            let case_insensitive = pattern.regex.is_case_insensitive();
+            match Self::pattern_gate_literals(phase2_patterns, index, case_insensitive) {
+                Some(pat_lits) => {
+                    for lit in pat_lits {
+                        lits.push(lit.to_ascii_lowercase());
+                    }
+                }
+                // Clone the `LazyRegex` (Arc-shared compile cache, so this shares
+                // the already-compiled regex (no recompile, no extra memory)).
+                None => non_anchorable.push((index, pattern.regex.clone())),
+            }
+        }
+        if lits.is_empty() {
+            return None;
+        }
+        if non_anchorable.len() > Self::MAX_NON_ANCHORABLE_ABS
+            && non_anchorable.len() * Self::MAX_NON_ANCHORABLE_FRACTION_DEN
+                > always_active_indices.len() * Self::MAX_NON_ANCHORABLE_FRACTION_NUM
+        {
+            // Disables the optimization (recall-safe: the full body runs), but
+            // Law 10 forbids a SILENT degrade and the speed cost is far more than a
+            // rounding error (every chunk now runs the full phase-2 body), so
+            // surface it LOUDLY, exactly like the Aho-Corasick build-failure twin below.
+            tracing::warn!(
+                non_anchorable = non_anchorable.len(),
+                always_active = always_active_indices.len(),
+                "phase-2 combined no-candidate gate declined: non-anchorable \
+                 always-active set too large to gate efficiently; gate disabled, \
+                 prefilter runs unconditionally (recall preserved, SWE-101 fast path off)"
+            );
+            return None;
+        }
+        lits.sort_unstable();
+        lits.dedup();
+        // Build the first-bigram prescreen before moving `lits` into the AC builder.
+        let anchor_first_bigram =
+            FirstBigramSet::from_literals(lits.iter().map(Vec::as_slice), true);
+        match AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(&lits)
+        {
+            Ok(anchor_ac) => Some(CombinedNoCandidateGate {
+                anchor_ac,
+                non_anchorable,
+                anchor_first_bigram,
+            }),
+            Err(error) => {
+                // Build failure disables the optimization (recall-safe: the full
+                // body runs), but Law 10 forbids a SILENT degrade (surface it).
+                tracing::warn!(
+                    literals = lits.len(),
+                    %error,
+                    "phase-2 combined no-candidate gate Aho-Corasick build failed; \
+                     gate disabled, prefilter runs unconditionally (recall preserved, \
+                     SWE-101 fast path off)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Compute a pattern's gate-eligible required-prefix literals for the given
+    /// case partition. Plain (homoglyph) patterns are matched on the ASCII path
+    /// via their ASCII-FOLDED form, so their prefix literals must be extracted
+    /// from that folded source, extracting from the unicode form would yield
+    /// non-ASCII members that never appear in folded matching. `None` => the
+    /// pattern is NOT gate-eligible and must run unconditionally.
+    fn pattern_gate_literals(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        index: usize,
+        case_insensitive: bool,
+    ) -> Option<Vec<Vec<u8>>> {
+        let (pattern, _) = phase2_patterns.get(index)?;
+        if case_insensitive {
+            gate_prefix_literals(pattern.regex.as_str())
+        } else {
+            // Plain batch: gate on the ASCII-folded form (the matcher used on
+            // ASCII chunks). The fold MUST equal what `build_ascii_alternate`
+            // compiles so the gate describes the running matcher, hence the one
+            // shared `ascii_fold_regex_src`.
+            let folded = ascii_fold_regex_src(pattern.regex.as_str());
+            gate_prefix_literals(&folded)
+        }
+    }
+
+    fn build_partition(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        indices: &[usize],
+        case_insensitive: bool,
+        homoglyph: bool,
+        batches: &mut Vec<PrefilterBatch>,
+        ungated_indices: &mut Vec<usize>,
+        gate_lits: &mut Vec<Vec<u8>>,
+    ) {
+        // Split the partition into gate-eligible vs not so each compiled batch is
+        // homogeneous: a `gateable` batch contains ONLY patterns that provably
+        // require one of their prefix literals, making the combined-AC no-hit a
+        // sound skip oracle for the whole batch.
+        let mut eligible: Vec<usize> = Vec::new();
+        let mut other: Vec<usize> = Vec::new();
+        for &i in indices {
+            if Self::pattern_gate_literals(phase2_patterns, i, case_insensitive).is_some() {
+                eligible.push(i);
+            } else {
+                other.push(i);
+            }
+        }
+        // Ungateable patterns: always-run batches (gateable = false).
+        Self::build_batches(
+            phase2_patterns,
+            &other,
+            case_insensitive,
+            false,
+            homoglyph,
+            batches,
+            ungated_indices,
+        );
+        // Eligible patterns: gateable batches. Only contribute their literals to
+        // the combined gate when the batch was actually built as `gateable` (a
+        // plain batch missing its `ascii_set`, or a compile failure, downgrades
+        // to always-run, and then its literals must NOT gate anything).
+        let first_new = batches.len();
+        Self::build_batches(
+            phase2_patterns,
+            &eligible,
+            case_insensitive,
+            true,
+            homoglyph,
+            batches,
+            ungated_indices,
+        );
+        // Re-derive contributed literals from the batches that ended up gateable,
+        // so a downgraded batch (ascii_set None / compile failure) is excluded.
+        for batch in &batches[first_new..] {
+            if !batch.gateable {
+                continue;
+            }
+            for &idx in &batch.phase2_indices {
+                if let Some(lits) =
+                    Self::pattern_gate_literals(phase2_patterns, idx, case_insensitive)
+                {
+                    gate_lits.extend(lits);
+                }
+            }
+        }
+    }
+
+    /// Compile `indices` into RegexSet batches with the given `gateable` intent.
+    /// A plain batch is only marked gateable when its `ascii_set` compiles (the
+    /// folded matcher the gate describes); otherwise it downgrades to always-run.
+    fn build_batches(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        indices: &[usize],
+        case_insensitive: bool,
+        gateable: bool,
+        homoglyph: bool,
+        batches: &mut Vec<PrefilterBatch>,
+        ungated_indices: &mut Vec<usize>,
+    ) {
+        for chunk in indices.chunks(Self::BATCH_SIZE) {
+            let mut srcs = Vec::with_capacity(chunk.len());
+            for &index in chunk {
+                let (pattern, _) = &phase2_patterns[index];
+                srcs.push(pattern.regex.as_str());
+            }
+            if srcs.is_empty() {
+                continue;
+            }
+            let built = Self::compile_set(&srcs, case_insensitive);
+            match built {
+                Ok(set) => {
+                    let ascii_set = if case_insensitive {
+                        None
+                    } else {
+                        Self::build_ascii_alternate(phase2_patterns, chunk)
+                    };
+                    let trunc_srcs: Vec<String> = srcs
+                        .iter()
+                        .map(|s| truncate_for_prefilter(s).unwrap_or_else(|| (*s).to_string())) // LAW10: truncation is a prefilter perf-opt over a SUPERSET; un-truncatable => full form, recall-safe (never under-matches)
+                        .collect();
+                    let set_trunc = match Self::compile_truncated_or_full_set(
+                        &srcs,
+                        &trunc_srcs,
+                        case_insensitive,
+                    ) {
+                        Ok(set) => set,
+                        Err(error) => {
+                            tracing::warn!(
+                                batch_size = chunk.len(),
+                                case_insensitive,
+                                %error,
+                                "phase-2 RegexSet batch recompile failed; batch will run ungated (recall preserved)"
+                            );
+                            ungated_indices.extend_from_slice(chunk);
+                            continue;
+                        }
+                    };
+                    let ascii_set_trunc = ascii_set
+                        .as_ref()
+                        .and_then(|_| Self::build_ascii_alternate_trunc(phase2_patterns, chunk))
+                        .or_else(|| ascii_set.clone());
+                    // A plain gateable batch needs its folded matcher present for
+                    // the (ASCII-path) gate to describe what actually runs. If the
+                    // fold failed to compile, the unicode `set` runs on ASCII text
+                    // and the folded-literal gate would be unsound -> downgrade.
+                    let batch_gateable = gateable && (case_insensitive || ascii_set.is_some());
+                    batches.push(PrefilterBatch {
+                        set,
+                        ascii_set,
+                        set_trunc,
+                        ascii_set_trunc,
+                        phase2_indices: chunk.to_vec(),
+                        gateable: batch_gateable,
+                        homoglyph_skippable: homoglyph,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        batch_size = chunk.len(),
+                        case_insensitive,
+                        %error,
+                        "phase-2 RegexSet batch compile failed; batch will run ungated (recall preserved)"
+                    );
+                    ungated_indices.extend_from_slice(chunk);
+                }
+            }
+        }
+    }
+
+    fn compile_set(
+        srcs: &[&str],
+        case_insensitive: bool,
+    ) -> std::result::Result<regex::RegexSet, regex::Error> {
+        regex::RegexSetBuilder::new(srcs)
+            .case_insensitive(case_insensitive)
+            .size_limit(Self::BATCH_SIZE_LIMIT_BYTES)
+            .dfa_size_limit(Self::BATCH_SIZE_LIMIT_BYTES)
+            .crlf(case_insensitive)
+            .build()
+    }
+
+    pub(crate) fn compile_truncated_or_full_set(
+        srcs: &[&str],
+        trunc_srcs: &[String],
+        case_insensitive: bool,
+    ) -> std::result::Result<regex::RegexSet, regex::Error> {
+        regex::RegexSetBuilder::new(trunc_srcs)
+            .case_insensitive(case_insensitive)
+            .size_limit(Self::BATCH_SIZE_LIMIT_BYTES)
+            .dfa_size_limit(Self::BATCH_SIZE_LIMIT_BYTES)
+            .crlf(case_insensitive)
+            .build()
+            .or_else(|_| {
+                // LAW10: truncated RegexSet compile failure reuses the full set; recall-preserving
+                tracing::warn!(
+                    batch_size = trunc_srcs.len(),
+                    case_insensitive,
+                    "truncated phase-2 RegexSet batch failed to compile; using full set (perf-only impact)"
+                );
+                Self::compile_set(srcs, case_insensitive)
+            })
+    }
+
+    /// Build the combined skip-gate Aho-Corasick over `literals`. `ci` selects
+    /// ASCII case-insensitive matching (for the detector-regex partition).
+    /// `None` when there are no literals to gate on.
+    fn build_gate_ac(literals: &[Vec<u8>], ci: bool) -> Option<AhoCorasick> {
+        if literals.is_empty() {
+            return None;
+        }
+        match AhoCorasick::builder()
+            .ascii_case_insensitive(ci)
+            .build(literals)
+        {
+            Ok(ac) => Some(ac),
+            Err(error) => {
+                tracing::warn!(
+                    literals = literals.len(),
+                    ci,
+                    %error,
+                    "phase-2 prefix-gate Aho-Corasick build failed; prefix-gate optimization disabled (recall preserved)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Build the ASCII-folded alternate RegexSet for a plain (homoglyph) batch:
+    /// each homoglyph regex with every non-ASCII codepoint removed, in the SAME
+    /// entry order. Match-equivalent to the unicode form on pure-ASCII text.
+    /// `None` if any fold fails to compile (the unicode set is used instead).
+    fn build_ascii_alternate(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        indices: &[usize],
+    ) -> Option<regex::RegexSet> {
+        let folded = Self::ascii_folded_sources(phase2_patterns, indices, false)?;
+        match regex::RegexSetBuilder::new(&folded)
+            .case_insensitive(false)
+            .size_limit(Self::BATCH_SIZE_LIMIT_BYTES)
+            .dfa_size_limit(Self::BATCH_SIZE_LIMIT_BYTES)
+            .build()
+        {
+            Ok(set) => Some(set),
+            Err(error) => {
+                tracing::warn!(
+                    batch_size = indices.len(),
+                    %error,
+                    "ASCII-folded phase-2 RegexSet failed to compile; plain batch runs unicode form (perf-only impact)"
+                );
+                None
+            }
+        }
+    }
+
+    /// As `build_ascii_alternate`, but each folded source is additionally passed
+    /// through `truncate_for_prefilter` (truncate the FOLDED form so the matcher
+    /// that runs on ASCII text stays on the lazy-DFA). SAME entry order; `None`
+    /// if any fold or the truncated set fails to compile.
+    fn build_ascii_alternate_trunc(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        indices: &[usize],
+    ) -> Option<regex::RegexSet> {
+        let folded = Self::ascii_folded_sources(phase2_patterns, indices, true)?;
+        match regex::RegexSetBuilder::new(&folded)
+            .case_insensitive(false)
+            .size_limit(Self::BATCH_SIZE_LIMIT_BYTES)
+            .dfa_size_limit(Self::BATCH_SIZE_LIMIT_BYTES)
+            .build()
+        {
+            Ok(set) => Some(set),
+            Err(error) => {
+                tracing::warn!(
+                    batch_size = indices.len(),
+                    %error,
+                    "ASCII-folded truncated phase-2 RegexSet failed to compile; using unicode full set (perf-only impact)"
+                );
+                None
+            }
+        }
+    }
+
+    fn ascii_folded_sources(
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        indices: &[usize],
+        truncate: bool,
+    ) -> Option<Vec<String>> {
+        let mut folded = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let (pattern, _) = &phase2_patterns[index];
+            let source = ascii_fold_regex_src(pattern.regex.as_str());
+            if truncate {
+                folded.push(truncate_for_prefilter(&source).unwrap_or(source)); // LAW10: truncation is a prefilter perf-opt over a SUPERSET; un-truncatable => full form, recall-safe (never under-matches)
+            } else {
+                folded.push(source);
+            }
+        }
+        Some(folded)
+    }
+
+    /// Mark every always-active phase-2 pattern whose regex can match `match_text`.
+    /// `match_text` MUST be the text the per-pattern extraction runs on
+    /// (`preprocessed.text`) for the prefilter to stay sound under unicode
+    /// normalization.
+    /// `anchor_mode`: the main required-prefix localizer owns its eligible
+    /// always-active patterns, so this prefilter marks only its residual set.
+    /// `localize_plain`: the caller (the shared-anchor path) handles the plain
+    /// (homoglyph) patterns on pure-ASCII chunks via the localized AC, so they
+    /// are SKIPPED here (no whole-chunk RegexSet pass). When false, plain
+    /// batches run their ASCII-folded alternate (the order-preserving fold)
+    /// the safety-net path that is always recall-correct.
+    pub(crate) fn mark_matches(
+        &self,
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        match_text: &str,
+        scratch: &mut ActivePatternsScratch,
+        anchor_mode: bool,
+        localize_plain: bool,
+        tuning: &ResolvedRuntimeTuningConfig,
+        allow_hyperscan: bool,
+    ) {
+        #[cfg(not(feature = "simd"))]
+        // LAW10: no runtime effect; without SIMD the parameter cannot affect execution and the CPU matcher below remains exact.
+        let _ = allow_hyperscan;
+        record_mark_call();
+        let ascii = match_text.is_ascii();
+        let scope = if !anchor_mode {
+            PrefilterScope::Full
+        } else if localize_plain && tuning.homoglyph_gate && ascii {
+            PrefilterScope::LocalizedResidual
+        } else {
+            PrefilterScope::AnchorResidual
+        };
+        // SWE-101 no-candidate gate (the user's #1 issue: "phase-2 must NEVER
+        // eat runtime, not 0.000000001s"). The per-pattern body below, the HS
+        // `scan_each` enumeration + its HS-incompatible whole-chunk-regex loop, or
+        // the `regex::RegexSet` batch loop, ran UNCONDITIONALLY on every chunk
+        // (~10µs/chunk × 518k chunks ≈ 5.3s of pure no-candidate overhead).
+        // `combined_gate.anchor_present` is the ONE fast combined prefilter: an
+        // exact first-bigram prescreen before one `ascii_case_insensitive`
+        // Aho-Corasick over the ANCHORABLE always-active patterns'
+        // required-prefix literals. On a PURE-ASCII chunk where it finds none, no
+        // anchorable pattern can fire, so the whole body is skipped; only the small
+        // NON-anchorable set (patterns that can match with no required literal) is
+        // checked, each with its OWN regex, marking exactly those that match, the
+        // same active set the full body would produce for them. Findings are
+        // unchanged (recall-neutral), pinned by `phase2_no_candidate_zero_work` +
+        // the HS/RegexSet findings-parity gates. ASCII-only: the folded plain literals
+        // describe the homoglyph matcher only on ASCII text. A non-ASCII chunk, a
+        // degraded build (`None`), or a real candidate fall through to the full
+        // body (never a silent skip (Law 10)).
+        if tuning.no_candidate_gate {
+            if let Some(gate) = self.combined_gate(phase2_patterns) {
+                if ascii && !gate.anchor_present(match_text) {
+                    // No anchorable pattern can fire; mark only the non-anchorable
+                    // patterns that actually match (precise, recall-identical).
+                    gate.mark_non_anchorable(match_text, scratch, self.indices_for(scope));
+                    record_mark_gate_skip();
+                    return;
+                }
+            }
+        }
+        // Past the gate: a candidate is possible, so the per-pattern marking body
+        // below is real work, not no-candidate overhead.
+        record_mark_perpattern_work();
+        // SIMD fast path: one Hyperscan scan replaces the whole-chunk RegexSet
+        // batch loop below. The selected scope excludes every pattern already
+        // owned by the active anchor localizers, so no HS database rescans work
+        // that anchored verification will execute.
+        #[cfg(feature = "simd")]
+        let hs_owns_marking = hs_prefilter_engages(
+            allow_hyperscan && tuning.fallback_hs,
+            match_text.len(),
+            tuning.hs_prefilter_max_len,
+            ascii,
+        );
+        #[cfg(feature = "simd")]
+        if hs_owns_marking {
+            // HS engages on (chunks ≤ the size gate) OR (ASCII chunks of ANY size).
+            // On ASCII the RegexSet ASCII-fold is match-equivalent, so HS is
+            // findings-IDENTICAL and ~2× faster on large chunks (the >8MB ASCII
+            // win). Large NON-ASCII chunks stay on the RegexSet: HS byte-mode
+            // under-marks the unicode `.`/`\w`/`\s` patterns there, and forcing HS
+            // + a supplemental unicode set was recall-safe but 2.75× slower than the
+            // RegexSet (see hs_prefilter_engages / HS_PREFILTER_MAX_LEN_DEFAULT).
+            if let Some(hs) = self.hs_for(phase2_patterns, scope) {
+                // Homoglyph skip for the HS path: the homoglyph variants are inert on
+                // a pure-ASCII chunk (base AC covers the ASCII original) AND on any
+                // decoded sub-chunk (a homoglyph in decoded binary is a non-credential),
+                // so the lean sub-DB marks the identical CREDENTIAL set ~100× cheaper.
+                // SAME `homoglyph_skip_applies` owner the RegexSet path below uses, so
+                // both engines stay findings-consistent (backend_parity_matrix).
+                let skip_homoglyph = homoglyph_skip_applies(ascii, tuning.homoglyph_ascii_skip);
+                match hs.mark(match_text, scratch, skip_homoglyph) {
+                    Ok(()) => {
+                        // Per-pattern work served by the HS SIMD fast path.
+                        record_mark_hs_served();
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "HS always-active prefilter failed; using RegexSet path for this chunk"
+                        );
+                    }
+                }
+            }
+        }
+        // Reaching here, this per-pattern call is served by the portable
+        // RegexSet batches: HS was unavailable, errored, the chunk exceeded the
+        // size gate, or this is a non-`simd` build. The profiler reads this split
+        // to attribute the `phase2:prefilter` cost between the two paths.
+        record_mark_regexset_served();
+        let portable = self.portable_for(phase2_patterns, scope);
+        let use_ascii = tuning.homoglyph_gate && ascii;
+
+        // Prefix-literal skip gate (KH decode-recursion lever). A `gateable`
+        // batch's patterns ALL provably require one of their prefix literals; if
+        // the combined Aho-Corasick over those literals finds NONE in the chunk,
+        // the batch cannot produce a single match and its whole-chunk RegexSet
+        // pass is skipped. `is_match` early-exits at the first literal, so the
+        // full O(text) scan only happens on chunks that have none, exactly the
+        // skip case (the dominant decode-recursion sub-chunk shape, and most
+        // low-density source). `present == true` means "run gateable batches as
+        // before" (recall is identical, only dead work is removed).
+        let gate_on = tuning.fallback_prefix_gate;
+        // ci batches run `set` on every chunk, but the combined AC gate is an
+        // ASCII case-insensitive automaton. On non-ASCII chunks the regex crate's
+        // Unicode case folding is broader, so the ci batches must run.
+        let ci_present = !gate_on
+            || !ascii
+            || portable
+                .ci_gate
+                .as_ref()
+                .is_none_or(|ac| ac.is_match(match_text));
+        // plain batches are gated only on the ASCII path (the folded-literal gate
+        // describes the folded matcher); on a non-ASCII chunk the unicode `set`
+        // runs unconditionally, so `plain_present` is forced true there.
+        let plain_present = !gate_on
+            || !use_ascii
+            || portable
+                .plain_gate
+                .as_ref()
+                .is_none_or(|ac| ac.is_match(match_text));
+
+        let prof = phase2_pattern_prof_enabled();
+        if prof {
+            GATE_CALLS.fetch_add(1, Relaxed);
+        }
+        // Truncated (lazy-DFA) marking sets: a sound SUPERSET, over-marks at
+        // most, extraction with the full pattern filters. The win is keeping the
+        // RegexSet off PikeVM on `{N,}` bodies.
+        let truncate = tuning.prefilter_truncate;
+        for batch in &portable.batches {
+            let is_plain = batch.ascii_set.is_some();
+            // A HOMOGLYPH-variant batch on a pure-ASCII chunk: skip entirely. Each
+            // variant's base ASCII prefix is in the AC/confirmed path
+            // (compiler_build.rs pushes both) AND that path now CONFIRMS it even
+            // when the literal is shadowed by a longer one, because phase-1 marks
+            // triggers with OVERLAPPING AC matching (collect_triggered_patterns_cpu)
+            // the missing half that previously let the always-active variant be
+            // the sole matcher for e.g. generic-password on `client_secret="…"`. A
+            // chunk with no non-ASCII bytes has no homoglyph for the variant to
+            // catch, so on ASCII it adds nothing the base AC doesn't. This removes
+            // the dominant `phase2:prefilter` cost on all-ASCII source (~13% of scan).
+            // Proven recall-neutral by `homoglyph_ascii_skip_parity_default` (now a
+            // live gate, not `#[ignore]`). Generic/case-sensitive plain fallbacks
+            // (no base AC) are in non-skippable batches and are unaffected.
+            // `homoglyph_skip_applies` also skips the batch on decoded sub-chunks
+            // (binary noise → homoglyph hits are non-credentials), matching the HS path.
+            if batch.homoglyph_skippable
+                && homoglyph_skip_applies(ascii, tuning.homoglyph_ascii_skip)
+            {
+                continue;
+            }
+            // Skip a gateable batch whose required prefix literals are all absent.
+            if batch.gateable {
+                let present = if is_plain { plain_present } else { ci_present };
+                if !present {
+                    if prof {
+                        GATE_BATCH_SKIPS.fetch_add(1, Relaxed);
+                    }
+                    continue;
+                }
+                if prof {
+                    GATE_BATCH_RUNS.fetch_add(1, Relaxed);
+                }
+            }
+            let set = match (
+                truncate,
+                use_ascii,
+                &batch.ascii_set,
+                &batch.ascii_set_trunc,
+            ) {
+                (true, true, Some(_), Some(ascii_trunc)) => ascii_trunc,
+                (false, true, Some(ascii), _) => ascii,
+                (true, _, _, _) => &batch.set_trunc,
+                (false, _, _, _) => &batch.set,
+            };
+            for set_idx in set.matches(match_text).iter() {
+                scratch.mark(batch.phase2_indices[set_idx]);
+            }
+        }
+        for &index in &portable.ungated_indices {
+            scratch.mark(index);
+        }
+    }
+
+    /// True iff ANY always-active pattern can fire on `match_text`: the BOOLEAN
+    /// companion to [`mark_matches`](Self::mark_matches) for the no-phase-1-hit
+    /// admission gate (`has_active_phase2_patterns_for_chunk`), which needs only
+    /// "is the active set non-empty?", not the full marked set. Early-exits at the
+    /// first active pattern; the marked set is the measured #1 scan cost and the
+    /// gate would otherwise build it in full only to call `.is_empty()` (then have
+    /// extraction build it AGAIN). Mirrors `mark_matches`'s engine dispatch with
+    /// `localize_plain = false` (the gate runs `anchor_mode = false`): in the
+    /// default config this computes EXACTLY the same active-set membership (HS marks
+    /// the full set; no prune applies), so admission and extraction share one
+    /// contract. It never applies the optional measurement-only prunes
+    /// (`phase2_prefix_gate` / `homoglyph_ascii_skip`), so it answers over the
+    /// marking SUPERSET except for the proven homoglyph ASCII skip, sound (it can
+    /// never reject a chunk the scan would mark, so no finding is lost), at most
+    /// over-admitting an inert chunk to the extraction that already filters it.
+    ///
+    /// Like `mark_matches`, it consults the cheap SWE-101 `combined_gate` first: on
+    /// a pure-ASCII chunk where the combined required-literal AC finds nothing, NO
+    /// always-active pattern can fire, so it returns `false` at AC-`is_match` cost
+    /// instead of running the HS / RegexSet body, the admission gate then pays ~ns
+    /// on the no-candidate chunks it is built to reject.
+    ///
+    /// Called by `has_active_phase2_patterns_for_chunk` for every backend's
+    /// shared no-hit admission proof.
+    pub(crate) fn any_active_match(
+        &self,
+        phase2_patterns: &[(CompiledPattern, Vec<String>)],
+        match_text: &str,
+        tuning: &ResolvedRuntimeTuningConfig,
+        allow_hyperscan: bool,
+    ) -> bool {
+        #[cfg(not(feature = "simd"))]
+        // LAW10: no runtime effect; without SIMD the parameter cannot affect execution and the CPU matcher below remains exact.
+        let _ = allow_hyperscan;
+        let ascii = match_text.is_ascii();
+        // Same no-candidate gate as `mark_matches`: on a pure-ASCII no-anchor chunk
+        // no anchorable pattern can fire, so the active set is non-empty iff some
+        // non-anchorable pattern matches, checked precisely with each pattern's
+        // OWN regex, so the admission gate never over- or under-admits. The whole
+        // check costs one exact first-bigram prescreen, one possible AC
+        // `is_match`, and a handful of per-pattern `is_match` calls instead of
+        // the full ~2,700-pattern HS/RegexSet scan.
+        if tuning.no_candidate_gate {
+            if let Some(gate) = self.combined_gate(phase2_patterns) {
+                if ascii && !gate.anchor_present(match_text) {
+                    return gate.any_non_anchorable_match(match_text);
+                }
+            }
+        }
+        #[cfg(feature = "simd")]
+        if allow_hyperscan && tuning.fallback_hs && match_text.len() <= tuning.hs_prefilter_max_len
+        {
+            if let Some(hs) = self.hs_for(phase2_patterns, PrefilterScope::Full) {
+                // Same `homoglyph_skip_applies` owner as `mark_matches` and the
+                // RegexSet admission path below: on ASCII (and on decoded sub-chunks)
+                // the lean sub-DB answers the identical "any always-active credential
+                // match?" question ~100× cheaper.
+                let skip_homoglyph = homoglyph_skip_applies(ascii, tuning.homoglyph_ascii_skip);
+                match hs.any_match(match_text, skip_homoglyph) {
+                    Ok(hit) => return hit,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "HS always-active admission gate failed; using RegexSet path for this chunk"
+                        );
+                    }
+                }
+            }
+        }
+        let portable = self.portable_for(phase2_patterns, PrefilterScope::Full);
+        // Patterns whose batch failed to compile run unconditionally on the full
+        // marking path, so a chunk that reaches this point must be admitted.
+        // Keep this AFTER the combined no-candidate gate and the successful HS
+        // exact path: a pure-ASCII no-anchor chunk can still be rejected exactly,
+        // and HS success does not need the portable RegexSet fallback state.
+        if !portable.ungated_indices.is_empty() {
+            return true;
+        }
+        // RegexSet reference path (HS absent / over the size gate): the active
+        // set is non-empty iff some batch's set matches. `is_match` early-exits
+        // at the first matching pattern within the batch.
+        let truncate = tuning.prefilter_truncate;
+        let use_ascii = tuning.homoglyph_gate && ascii;
+        for batch in &portable.batches {
+            if batch.homoglyph_skippable
+                && homoglyph_skip_applies(ascii, tuning.homoglyph_ascii_skip)
+            {
+                continue;
+            }
+            let set = match (
+                truncate,
+                use_ascii,
+                &batch.ascii_set,
+                &batch.ascii_set_trunc,
+            ) {
+                (true, true, Some(_), Some(ascii_trunc)) => ascii_trunc,
+                (false, true, Some(ascii), _) => ascii,
+                (true, _, _, _) => &batch.set_trunc,
+                (false, _, _, _) => &batch.set,
+            };
+            if set.is_match(match_text) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod hs_gate_tests {
+    use super::hs_prefilter_engages;
+
+    // Locks the always-active prefilter engine gate, in particular the
+    // `|| is_ascii` clause that makes HS run on large ASCII chunks (the ~2× >8MB
+    // speedup) while keeping large NON-ASCII chunks on the RegexSet, which is both
+    // recall-safe AND faster there. A regression that drops the ASCII clause
+    // (re-capping HS at 4096) or widens it to non-ASCII (2.75× slower CPU, see
+    // HS_PREFILTER_MAX_LEN_DEFAULT) fails here.
+    #[test]
+    fn engine_gate_hs_on_ascii_any_size_regexset_on_large_nonascii() {
+        const CAP: usize = 4096;
+        // Small chunk (≤ cap): HS regardless of ASCII-ness.
+        assert!(hs_prefilter_engages(true, 100, CAP, true));
+        assert!(hs_prefilter_engages(true, 100, CAP, false));
+        // Large ASCII: HS engages (findings-identical AND ~2× faster (the >8MB win)).
+        assert!(hs_prefilter_engages(true, 5_000_000, CAP, true));
+        // Large NON-ASCII: MUST stay on the RegexSet (HS is 2.75× slower there).
+        assert!(!hs_prefilter_engages(true, 5_000_000, CAP, false));
+        // Cap boundary is inclusive (≤).
+        assert!(hs_prefilter_engages(true, CAP, CAP, false));
+        assert!(!hs_prefilter_engages(true, CAP + 1, CAP, false));
+        // Disabled: never HS, at any size or ASCII-ness.
+        assert!(!hs_prefilter_engages(false, 100, CAP, true));
+        assert!(!hs_prefilter_engages(false, 5_000_000, CAP, true));
+    }
+}

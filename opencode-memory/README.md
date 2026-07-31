@@ -189,14 +189,16 @@ project is rejected instead of mixing incompatible vectors.
 
 ### Knowledge Graph
 
-| Tool                          | Purpose                                                         |
-| ----------------------------- | --------------------------------------------------------------- |
-| `memory_graph_extract`        | Permission-gated extraction using the active OpenCode provider  |
-| `memory_graph_extract_status` | Inspect and resume a durable extraction job                     |
-| `memory_graph_extract_cancel` | Cooperatively cancel queued or running graph work               |
-| `memory_graph_search`         | Search visible entities and relations through bounded traversal |
-| `memory_graph_status`         | Inspect source-visible counts and the latest extraction         |
-| `memory_graph_export`         | Export one bounded page of facts and provenance                 |
+| Tool                              | Purpose                                                         |
+| --------------------------------- | --------------------------------------------------------------- |
+| `memory_graph_extract`            | Permission-gated extraction using the active OpenCode provider  |
+| `memory_graph_extract_status`     | Inspect and resume a durable extraction job                     |
+| `memory_graph_extract_cancel`     | Cooperatively cancel queued or running graph work               |
+| `memory_graph_search`             | Search visible entities and relations through bounded traversal |
+| `memory_reflect`                  | Build a bounded citation-ready reflection evidence packet       |
+| `memory_graph_status`             | Inspect source-visible counts and the latest extraction         |
+| `memory_graph_export`             | Export one bounded page of facts and provenance                 |
+| `memory_graph_observation_action` | Review, edit, invalidate, or restore an observation             |
 
 Graph extraction is explicit provider egress through the first-party tool. It
 requests permission only when eligible source units exist, including for
@@ -207,7 +209,9 @@ code anchors, fixed code-like source suffixes, secret-like content,
 prompt-injection-shaped content, stale, expired, superseded, or otherwise
 ineligible sources are blocked before dispatch. The daemon revalidates source
 scope, visibility, hash, revision, evidence, and policy before committing graph
-facts. Arbitrary native protocol callers are not covered by the first-party
+entities, relations, world/experience facts, and observations. Oxigraph keeps
+an in-process RDF projection while Zvec supplies generation-safe semantic
+vectors. Arbitrary native protocol callers are not covered by the first-party
 permission receipt flow.
 
 ## Memory Semantics
@@ -217,6 +221,11 @@ Memory kinds:
 ```text
 decision, preference, fact, pattern, gotcha, summary
 ```
+
+`gotcha` is not a taxonomy. Canonical writes use `kind: "gotcha"` and infer
+`fix_pattern`; canonical search/list filters use `kinds: ["gotcha"]`. The
+plugin accepts `taxonomy: "gotcha"` as a compatibility alias and normalizes it
+before sending the native request.
 
 Memory scopes:
 
@@ -238,7 +247,17 @@ Automatic recall performs a bounded hybrid search before model execution,
 filters stale and superseded records, and inserts selected results as historical
 context. Automatic capture evaluates at most three curated candidates after
 session compaction and does not store the raw conversation or compaction
-summary.
+summary. Opt-in automatic retain may separately store a bounded, expiring
+session-summary source for source-backed fact extraction.
+
+Provider-backed automatic retain is a separate opt-in. When
+`automaticRetain=true`, successful explicit document ingestion may enqueue a
+bounded durable graph/fact extraction job after the normal provider permission
+prompt, and session compaction may enqueue a bounded session-scoped source when
+the active model is known. Completed tool outcomes can retain only the tool
+name, outcome class, bounded title, and duration; raw input/output/error logs
+are excluded. It remains disabled by default and does not relax repository/code
+egress guards.
 
 ## Configuration
 
@@ -252,6 +271,8 @@ over their environment-variable equivalents.
 | `warmup`                  |                `true` | `OPENCODE_MEMORY_WARMUP`                     |
 | `automaticRecall`         |                `true` | `OPENCODE_MEMORY_AUTO_RECALL`                |
 | `automaticCapture`        |                `true` | `OPENCODE_MEMORY_AUTO_CAPTURE`               |
+| `automaticRetain`         |               `false` | `OPENCODE_MEMORY_AUTO_RETAIN`                |
+| `automaticRetainSources`  |           all classes | `OPENCODE_MEMORY_AUTO_RETAIN_SOURCES`        |
 | `automaticDocumentIndex`  |                `true` | `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS`       |
 | `documentIndexDebounceMs` |                 `750` | `OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS` |
 | `automaticOptimize`       |                `true` | `OPENCODE_MEMORY_AUTO_OPTIMIZE`              |

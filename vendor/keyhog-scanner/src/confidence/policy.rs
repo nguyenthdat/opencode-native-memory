@@ -1,0 +1,629 @@
+use crate::context;
+
+#[cfg(feature = "entropy")]
+const MAX_BYTE_SHANNON_ENTROPY: f64 = u8::BITS as f64;
+
+/// Hot-path form of one detector's complete regex-match confidence policy.
+/// The reciprocal normalization denominator is compiled once so candidate
+/// scoring performs a multiply instead of rediscovering or dividing by the
+/// detector's maximum signal weight.
+#[derive(Debug)]
+pub(crate) struct CompiledMatchConfidencePolicy {
+    spec: keyhog_core::DetectorMatchConfidenceSpec,
+    inverse_max_signal_weight: f64,
+}
+
+impl CompiledMatchConfidencePolicy {
+    pub(crate) fn compile(detector: &keyhog_core::DetectorSpec) -> Result<Self, String> {
+        let spec = detector.match_confidence.ok_or_else(|| {
+            format!(
+                "detector {:?} omits match_confidence; declare the complete scoring policy in its TOML",
+                detector.id
+            )
+        })?;
+        spec.validate().map_err(|error| {
+            format!(
+                "detector {:?} match_confidence is invalid: {error}",
+                detector.id
+            )
+        })?;
+        if detector.owns_entropy_policy() {
+            if spec.named_anchor_floor.is_some() || spec.low_promise_confidence.is_none() {
+                return Err(format!(
+                    "detector {:?} owns generic entropy policy, so match_confidence must omit named_anchor_floor and declare low_promise_confidence",
+                    detector.id
+                ));
+            }
+        } else if spec.named_anchor_floor.is_none() || spec.low_promise_confidence.is_some() {
+            return Err(format!(
+                "detector {:?} is named, so match_confidence must declare named_anchor_floor and omit low_promise_confidence",
+                detector.id
+            ));
+        }
+        let max_signal_weight = spec.literal_prefix_weight
+            + spec.context_anchor_weight
+            + spec.entropy_weight
+            + spec.keyword_nearby_weight
+            + spec.sensitive_file_weight
+            + spec.companion_weight;
+        Ok(Self {
+            spec,
+            inverse_max_signal_weight: max_signal_weight.recip(),
+        })
+    }
+
+    #[inline]
+    pub(crate) fn score(
+        &self,
+        signals: &crate::confidence::ConfidenceSignals,
+        entropy_threshold: f64,
+    ) -> f64 {
+        let mut score = 0.0;
+        if signals.has_literal_prefix {
+            score += self.spec.literal_prefix_weight;
+        }
+        if signals.has_context_anchor {
+            score += self.spec.context_anchor_weight;
+        }
+        if signals.entropy >= entropy_threshold + self.spec.very_high_entropy_margin {
+            score += self.spec.entropy_weight;
+        } else if signals.entropy >= entropy_threshold {
+            score += self.spec.high_entropy_partial_weight;
+        } else if signals.entropy >= self.spec.moderate_entropy_threshold {
+            score += self.spec.moderate_entropy_weight;
+        }
+        if signals.keyword_nearby {
+            score += self.spec.keyword_nearby_weight;
+        }
+        if signals.sensitive_file {
+            score += self.spec.sensitive_file_weight;
+        }
+        if signals.has_companion {
+            score += self.spec.companion_weight;
+        }
+        let penalty = if signals.entropy < self.spec.low_entropy_penalty_floor
+            && signals.match_length > self.spec.low_entropy_min_match_length
+        {
+            self.spec.low_entropy_penalty_multiplier
+        } else {
+            1.0
+        };
+        (score * self.inverse_max_signal_weight * penalty).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    pub(crate) fn named_anchor_floor(&self) -> Option<f64> {
+        self.spec.named_anchor_floor
+    }
+
+    #[inline]
+    #[cfg(feature = "ml")]
+    pub(crate) fn low_promise_confidence(&self) -> Option<f64> {
+        self.spec.low_promise_confidence
+    }
+
+    #[inline]
+    pub(crate) fn context_multiplier(&self, context: context::CodeContext) -> f64 {
+        match context {
+            context::CodeContext::Assignment => self.spec.assignment_context_multiplier,
+            context::CodeContext::StringLiteral => self.spec.string_literal_context_multiplier,
+            context::CodeContext::Unknown => self.spec.unknown_context_multiplier,
+            context::CodeContext::Documentation => self.spec.documentation_context_multiplier,
+            context::CodeContext::Comment => self.spec.comment_context_multiplier,
+            context::CodeContext::TestCode => self.spec.test_context_multiplier,
+            context::CodeContext::Encrypted => self.spec.encrypted_context_multiplier,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn context_suppression_threshold(
+        &self,
+        context: context::CodeContext,
+    ) -> Option<f64> {
+        match context {
+            context::CodeContext::Comment
+            | context::CodeContext::TestCode
+            | context::CodeContext::Documentation => {
+                Some(self.spec.soft_context_suppression_threshold)
+            }
+            context::CodeContext::Encrypted => {
+                Some(self.spec.encrypted_context_suppression_threshold)
+            }
+            context::CodeContext::Assignment
+            | context::CodeContext::StringLiteral
+            | context::CodeContext::Unknown => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn post_match(&self) -> keyhog_core::DetectorPostMatchConfidenceSpec {
+        self.spec.post_match
+    }
+}
+
+pub(crate) enum MlScoreResult {
+    /// Score is final and the match can be pushed immediately.
+    Final(f64),
+    #[cfg(feature = "ml")]
+    /// ML scoring is batched at the end of the scan.
+    Pending {
+        heuristic_conf: f64,
+        code_context: crate::context::CodeContext,
+        context_multiplier: f64,
+        mode: crate::detector_ml_policy::ActiveMlMode,
+    },
+}
+
+pub(crate) type CredentialChecksumPolicy = crate::checksum::ChecksumConfidenceDecision;
+
+#[inline]
+pub(crate) fn checksum_policy_for(credential: &str) -> CredentialChecksumPolicy {
+    crate::checksum::ChecksumConfidenceDecision::for_credential(credential)
+}
+
+#[inline]
+pub(crate) fn apply_checksum_confidence(confidence: f64, credential: &str) -> Option<f64> {
+    apply_checksum_decision_confidence(confidence, checksum_policy_for(credential))
+}
+
+#[inline]
+pub(crate) fn apply_checksum_decision_confidence(
+    confidence: f64,
+    decision: CredentialChecksumPolicy,
+) -> Option<f64> {
+    match decision.result() {
+        crate::checksum::ChecksumResult::Invalid => None,
+        crate::checksum::ChecksumResult::Valid => Some(
+            confidence.max(
+                decision
+                    .valid_confidence_floor()
+                    .unwrap_or(crate::checksum::CHECKSUM_VALID_FLOOR), // LAW10: canonical default for the compatibility API; compiled detector decisions carry their TOML floor
+            ),
+        ),
+        crate::checksum::ChecksumResult::StructurallyValid => Some(confidence),
+        crate::checksum::ChecksumResult::NotApplicable => Some(confidence),
+    }
+}
+
+pub(crate) fn apply_known_prefix_floor(
+    confidence: f64,
+    credential: &str,
+    degenerate_run_min_length: usize,
+) -> f64 {
+    if let Some(floor) =
+        crate::confidence::known_prefix_confidence_floor(credential, degenerate_run_min_length)
+    {
+        confidence.max(floor)
+    } else {
+        confidence
+    }
+}
+
+pub(crate) fn pre_ml_heuristic_confidence(
+    raw_confidence: f64,
+    code_context: context::CodeContext,
+    penalize_test_paths: bool,
+    confidence: &CompiledMatchConfidencePolicy,
+) -> f64 {
+    let context_multiplier = match code_context {
+        context::CodeContext::TestCode | context::CodeContext::Documentation
+            if !penalize_test_paths =>
+        {
+            1.0
+        }
+        _ => confidence.context_multiplier(code_context),
+    };
+    raw_confidence * context_multiplier
+}
+
+pub(crate) struct MatchHeuristicConfidencePolicy<'a> {
+    pub(crate) has_literal_prefix: bool,
+    pub(crate) has_context_anchor: bool,
+    pub(crate) entropy: f64,
+    pub(crate) entropy_threshold: f64,
+    pub(crate) keyword_nearby: bool,
+    pub(crate) sensitive_file: bool,
+    pub(crate) match_length: usize,
+    pub(crate) has_companion: bool,
+    pub(crate) code_context: context::CodeContext,
+    pub(crate) penalize_test_paths: bool,
+    pub(crate) confidence: &'a CompiledMatchConfidencePolicy,
+}
+
+pub(crate) struct CandidateMatchScorePolicy<'a> {
+    pub(crate) has_literal_prefix: bool,
+    pub(crate) has_context_anchor: bool,
+    pub(crate) entropy: f64,
+    pub(crate) entropy_threshold: f64,
+    pub(crate) keyword_nearby: bool,
+    pub(crate) sensitive_file: bool,
+    pub(crate) match_length: usize,
+    pub(crate) has_companion: bool,
+    pub(crate) code_context: context::CodeContext,
+    pub(crate) penalize_test_paths: bool,
+    pub(crate) confidence: &'a CompiledMatchConfidencePolicy,
+    /// Whether this pattern is allowed to receive the detector-owned anchor
+    /// floor. Weak-anchor patterns keep the full generic gate stack.
+    pub(crate) named_anchor_floor_eligible: bool,
+    #[cfg(feature = "ml")]
+    pub(crate) ml_mode: Option<crate::detector_ml_policy::ActiveMlMode>,
+    #[cfg(not(feature = "ml"))]
+    pub(crate) ml_enabled: bool,
+    pub(crate) credential: &'a str,
+    /// The matched pattern requires a distinctive literal infix (terraform
+    /// `\.atlasv1\.`), a third anchor form alongside the keyword context anchor
+    /// and the literal prefix, for named detectors that carry neither.
+    pub(crate) has_distinctive_inner_literal: bool,
+}
+
+pub(crate) fn match_heuristic_confidence(policy: MatchHeuristicConfidencePolicy<'_>) -> f64 {
+    let raw_confidence = policy.confidence.score(
+        &crate::confidence::ConfidenceSignals {
+            has_literal_prefix: policy.has_literal_prefix,
+            has_context_anchor: policy.has_context_anchor,
+            entropy: policy.entropy,
+            keyword_nearby: policy.keyword_nearby,
+            sensitive_file: policy.sensitive_file,
+            match_length: policy.match_length,
+            has_companion: policy.has_companion,
+        },
+        policy.entropy_threshold,
+    );
+    pre_ml_heuristic_confidence(
+        raw_confidence,
+        policy.code_context,
+        policy.penalize_test_paths,
+        policy.confidence,
+    )
+}
+
+/// Lift the heuristic confidence of a service-anchored detector match to
+/// its compiled detector floor when the match carried a strong anchor, a
+/// required keyword **context anchor** (capture group), a distinctive **literal
+/// prefix** (`cs_`, `pl_`, `tk_`, `sk-`, `ghp_`), or a distinctive **required
+/// literal infix** (terraform `\.atlasv1\.`, whose regex opens with a class and
+/// captures the whole match so it carries neither of the other two), or an
+/// independently matched companion. These signals are folded into the single
+/// `has_anchor` argument by the caller.
+///
+/// Match confidence is a *normalized* weighted sum: it divides the earned
+/// signal weight by the full signal set (literal prefix, context anchor,
+/// entropy, sensitive file, companion, keyword-nearby). A service detector that
+/// earns only the anchor weight, such as `CROWDIN_API_TOKEN = <40hex>` (context
+/// anchor) or a bare `cs_<34 alnum>` Cloudsmith token (literal prefix), cannot
+/// earn the others. Its normalized score lands below the `0.40` floor
+/// and the match is dropped as `below_min_confidence`, even though the match
+/// *only fired because the service-specific anchor was present next to a value
+/// of the contracted shape*. That anchor is itself positive evidence. This is
+/// the single trust signal the previously-scattered shape / entropy / confidence
+/// gates each failed to credit consistently.
+///
+/// Generic detectors omit the floor, and collision-prone weak-anchor patterns
+/// are ineligible at the call site. Both keep the full gate stack. `has_anchor`
+/// requires a real keyword group, an extractable literal prefix (not a bare-value
+/// match), a distinctive required infix, or a companion. The lift is a floor
+/// (`max`), never a cap, so stronger matches keep their higher score.
+pub(crate) fn apply_named_detector_anchor_floor(
+    confidence: f64,
+    floor: Option<f64>,
+    has_anchor: bool,
+) -> f64 {
+    // A NaN confidence is a broken upstream signal, never a real score. `f64::max`
+    // IGNORES NaN, so `NaN.max(FLOOR)` would silently manufacture the anchor floor
+    // from garbage, and an un-floored NaN would propagate to poison every
+    // downstream `>=` gate (every comparison against NaN is false). Collapse NaN to
+    // 0.0 first, loud in debug, fail-closed in release (Law 10), so a broken
+    // score is never laundered into a mid-tier confidence nor leaked as NaN.
+    debug_assert!(
+        !confidence.is_nan(),
+        "apply_named_detector_anchor_floor received NaN confidence, broken upstream score"
+    );
+    let confidence = if confidence.is_nan() { 0.0 } else { confidence };
+    if let (Some(floor), true) = (floor, has_anchor) {
+        confidence.max(floor)
+    } else {
+        confidence
+    }
+}
+
+pub(crate) fn candidate_match_score(policy: CandidateMatchScorePolicy<'_>) -> MlScoreResult {
+    let heuristic_conf = match_heuristic_confidence(MatchHeuristicConfidencePolicy {
+        has_literal_prefix: policy.has_literal_prefix,
+        has_context_anchor: policy.has_context_anchor,
+        entropy: policy.entropy,
+        entropy_threshold: policy.entropy_threshold,
+        keyword_nearby: policy.keyword_nearby,
+        sensitive_file: policy.sensitive_file,
+        match_length: policy.match_length,
+        has_companion: policy.has_companion,
+        code_context: policy.code_context,
+        penalize_test_paths: policy.penalize_test_paths,
+        confidence: policy.confidence,
+    });
+    // An anchored service-detector match is positive evidence the normalized
+    // signal sum structurally under-credits; lift it to clear the floor. The
+    // anchor is a required keyword group (`has_context_anchor`), a distinctive
+    // literal prefix (`has_literal_prefix`: `cs_`, `pl_`, `tk_`, bare service
+    // tokens with no surrounding keyword), OR a distinctive required literal
+    // infix (`has_distinctive_inner_literal`: terraform `\.atlasv1\.`, whose
+    // regex opens with a class and captures the whole match so it carries
+    // neither of the other two), OR a matched companion. Applied before the ML branch so it propagates
+    // through both the heuristic-only `Final` path and the `Pending` path,
+    // where the compiled detector-owned model mode determines its contribution.
+    let heuristic_conf = apply_named_detector_anchor_floor(
+        heuristic_conf,
+        policy.confidence.named_anchor_floor(),
+        policy.named_anchor_floor_eligible
+            && (policy.has_context_anchor
+                || policy.has_literal_prefix
+                || policy.has_distinctive_inner_literal
+                || policy.has_companion),
+    );
+
+    #[cfg(not(feature = "ml"))]
+    let score_result = {
+        // LAW10: no runtime effect; builds without ML execute the complete heuristic policy, and this read keeps the compiled field contract uniform.
+        let _ = policy.ml_enabled;
+        MlScoreResult::Final(heuristic_conf)
+    };
+
+    #[cfg(feature = "ml")]
+    let score_result = {
+        let Some(mode) = policy.ml_mode else {
+            return MlScoreResult::Final(heuristic_conf);
+        };
+        if let Some(confidence) = probabilistic_promise_confidence_override(
+            policy.credential,
+            policy.has_companion,
+            policy.confidence.low_promise_confidence(),
+        ) {
+            MlScoreResult::Final(confidence)
+        } else {
+            MlScoreResult::Pending {
+                heuristic_conf,
+                code_context: policy.code_context,
+                context_multiplier: policy.confidence.context_multiplier(policy.code_context),
+                mode,
+            }
+        }
+    };
+
+    match score_result {
+        MlScoreResult::Final(confidence) => MlScoreResult::Final(apply_known_prefix_floor(
+            confidence,
+            policy.credential,
+            policy.confidence.post_match().degenerate_run_min_length,
+        )),
+        #[cfg(feature = "ml")]
+        MlScoreResult::Pending { .. } => score_result,
+    }
+}
+
+pub(crate) struct ReportConfidencePolicy<'a> {
+    pub(crate) credential: &'a str,
+    pub(crate) detector_id: &'a str,
+    pub(crate) file_path: Option<&'a str>,
+    pub(crate) is_named_detector: bool,
+    pub(crate) penalize_test_paths: bool,
+    pub(crate) allow_encoded_text_lift: bool,
+    pub(crate) allow_canonical_hex_key: bool,
+    pub(crate) checksum: CredentialChecksumPolicy,
+    pub(crate) calibration: Option<&'a keyhog_core::Calibration>,
+    pub(crate) post_match: keyhog_core::DetectorPostMatchConfidenceSpec,
+}
+
+/// Canonical precision for the public confidence contract. GPU MoE kernels
+/// accumulate `f32` values while the CPU reference promotes the same inputs to
+/// `f64`; their mathematically equivalent scores can differ by a few ULPs.
+/// Three decimal places preserve 1e-3 policy resolution while making serialized
+/// confidence and the final threshold decision backend-invariant.
+const REPORT_CONFIDENCE_SCALE: f64 = 1_000.0;
+
+#[inline]
+fn canonicalize_report_confidence(confidence: f64) -> f64 {
+    (confidence * REPORT_CONFIDENCE_SCALE).round() / REPORT_CONFIDENCE_SCALE
+}
+
+pub(crate) fn finalize_report_confidence(
+    confidence: f64,
+    policy: ReportConfidencePolicy<'_>,
+) -> Option<f64> {
+    let confidence = crate::confidence::apply_post_ml_penalties_with_encoded_text_lift(
+        confidence,
+        policy.credential,
+        policy.is_named_detector,
+        policy.allow_encoded_text_lift,
+        policy.allow_canonical_hex_key,
+        policy.post_match,
+    );
+    let confidence = crate::confidence::apply_path_confidence_penalties(
+        confidence,
+        policy.file_path,
+        policy.penalize_test_paths,
+        policy.post_match.fixture_path_multiplier,
+    );
+    let confidence = apply_known_prefix_floor(
+        confidence,
+        policy.credential,
+        policy.post_match.degenerate_run_min_length,
+    );
+    let confidence = crate::confidence::apply_calibration_multiplier(
+        confidence,
+        policy.detector_id,
+        policy.calibration,
+    );
+    apply_checksum_decision_confidence(confidence, policy.checksum)
+        .map(canonicalize_report_confidence)
+}
+
+#[cfg(feature = "ml")]
+#[derive(Clone, Copy)]
+pub(crate) struct MlConfidencePolicy {
+    pub(crate) heuristic_confidence: f64,
+    pub(crate) model_confidence: f64,
+    pub(crate) ml_weight: f64,
+    pub(crate) mode: crate::detector_ml_policy::ActiveMlMode,
+    pub(crate) code_context: context::CodeContext,
+    pub(crate) context_multiplier: f64,
+    pub(crate) scan_comments: bool,
+    pub(crate) penalize_test_paths: bool,
+    pub(crate) context_reapply_below: f64,
+}
+
+#[cfg(feature = "ml")]
+pub(crate) fn ml_pending_confidence(policy: MlConfidencePolicy) -> f64 {
+    let mut confidence = match policy.mode {
+        crate::detector_ml_policy::ActiveMlMode::Lift => {
+            policy.heuristic_confidence
+                + policy.ml_weight
+                    * (policy.model_confidence - policy.heuristic_confidence).max(0.0)
+        }
+        crate::detector_ml_policy::ActiveMlMode::Blend => {
+            (policy.ml_weight * policy.model_confidence)
+                + ((1.0 - policy.ml_weight) * policy.heuristic_confidence)
+        }
+        crate::detector_ml_policy::ActiveMlMode::Authoritative => policy.model_confidence,
+    };
+
+    let context_penalty_applies = match policy.code_context {
+        context::CodeContext::Comment => !policy.scan_comments,
+        context::CodeContext::TestCode | context::CodeContext::Documentation => {
+            policy.penalize_test_paths
+        }
+        _ => false,
+    };
+    if context_penalty_applies && confidence < policy.context_reapply_below {
+        confidence *= policy.context_multiplier;
+    }
+    confidence
+}
+
+#[cfg(feature = "ml")]
+pub(crate) fn ml_pending_match_confidence(
+    pending: &crate::types::MlPendingMatch,
+    model_confidence: f64,
+    scan_comments: bool,
+    penalize_test_paths: bool,
+) -> f64 {
+    ml_pending_confidence(MlConfidencePolicy {
+        heuristic_confidence: pending.heuristic_conf,
+        model_confidence,
+        ml_weight: pending.ml_weight,
+        mode: pending.ml_mode,
+        code_context: pending.code_context,
+        context_multiplier: pending.context_multiplier,
+        scan_comments,
+        penalize_test_paths,
+        context_reapply_below: pending.post_match.ml_context_reapply_below,
+    })
+}
+
+#[cfg(feature = "ml")]
+#[inline]
+pub(crate) fn ml_score_for_candidate_text(text: &str, score: impl FnOnce() -> f64) -> f64 {
+    if text.is_empty() {
+        0.0
+    } else {
+        score()
+    }
+}
+
+#[cfg(all(feature = "ml", feature = "gpu"))]
+pub(crate) fn apply_empty_candidate_score_policy<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    scores: &mut [f64],
+) {
+    for (text, score) in texts.into_iter().zip(scores.iter_mut()) {
+        if text.is_empty() {
+            *score = 0.0;
+        }
+    }
+}
+
+#[cfg(feature = "ml")]
+pub(crate) fn probabilistic_promise_confidence_override(
+    credential: &str,
+    has_companion: bool,
+    low_promise_confidence: Option<f64>,
+) -> Option<f64> {
+    if crate::probabilistic_gate::ProbabilisticGate::looks_promising(credential) {
+        return None;
+    }
+    // A service regex or matched companion is independent detector-owned
+    // evidence. Only a generic detector declares a low-promise score, so the
+    // gate cannot bypass ML or manufacture a score for a stronger service path.
+    low_promise_confidence.filter(|_| !has_companion)
+}
+
+#[cfg(feature = "entropy")]
+/// Score an entropy fallback using the active owner's compiled TOML tiers.
+pub(crate) fn entropy_fallback_confidence(
+    entropy: f64,
+    keyword: &str,
+    entropy_high: f64,
+    entropy_very_high: f64,
+    confidence: keyhog_core::EntropyFallbackConfidenceSpec,
+) -> f64 {
+    // A NaN entropy is undefined evidence, never a real measurement
+    // (`shannon_entropy` is bounded to `[0, 8]`). Critically, `f64::min` ignores
+    // NaN, so the detector-owned low-tier cap would otherwise launder NaN into
+    // positive confidence. Collapse NaN to zero evidence before applying policy.
+    debug_assert!(
+        !entropy.is_nan(),
+        "entropy_fallback_confidence received NaN entropy, broken upstream entropy computation"
+    );
+    let entropy = if entropy.is_nan() { 0.0 } else { entropy };
+    // Keyword-free high-entropy candidates carry weaker evidence than
+    // keyword/isolated-token candidates, so only the latter get the detector's
+    // declared lift. The emit path owns routing; this owner owns the score map.
+    let base_confidence = if entropy >= entropy_very_high {
+        confidence.very_high_entropy
+    } else if entropy >= entropy_high {
+        confidence.high_entropy
+    } else {
+        confidence
+            .low_entropy_max
+            .min(entropy / MAX_BYTE_SHANNON_ENTROPY)
+    };
+    if keyword != crate::entropy::KEYWORD_FREE_LABEL {
+        (base_confidence + confidence.keyword_lift).min(confidence.max_confidence)
+    } else {
+        base_confidence
+    }
+}
+
+pub(crate) fn generic_assignment_confidence(
+    context: context::CodeContext,
+    scan_comments: bool,
+    penalize_test_paths: bool,
+    entropy: f64,
+    value_len: usize,
+    policy: keyhog_core::GenericAssignmentConfidenceSpec,
+) -> f64 {
+    // The test/docs base-confidence haircut follows the same operator policy
+    // as the later path penalties: `--no-suppress-test-fixtures` clears test
+    // and documentation haircuts, while `--scan-comments` promotes comments to
+    // the ordinary-source floor. Keep the entropy/length boosts here too so the
+    // generic emitter supplies raw signals, not a private confidence formula.
+    let base_confidence = match context {
+        context::CodeContext::TestCode if penalize_test_paths => policy.test_base,
+        context::CodeContext::Comment if scan_comments => policy.scanned_comment_base,
+        context::CodeContext::Documentation if penalize_test_paths => policy.documentation_base,
+        context::CodeContext::Comment => policy.comment_base,
+        _ => policy.ordinary_base,
+    };
+    debug_assert!(
+        !entropy.is_nan(),
+        "generic_assignment_confidence received NaN entropy, broken upstream entropy computation"
+    );
+    let entropy_lift = if entropy.is_nan() {
+        0.0
+    } else {
+        ((entropy - policy.entropy_reference) * policy.entropy_gain_per_bit)
+            .clamp(0.0, policy.entropy_lift_max)
+    };
+    let length_lift = (value_len.saturating_sub(policy.length_reference) as f64
+        * policy.length_gain_per_byte)
+        .min(policy.length_lift_max);
+    (base_confidence + entropy_lift + length_lift).clamp(0.0, policy.max_confidence)
+}

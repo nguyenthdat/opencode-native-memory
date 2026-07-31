@@ -86,6 +86,7 @@ const RETRY_SAFE_METHODS = new Set<MemoryMethod>([
   "graph_extract_renew",
   "graph_extract_job_status",
   "graph_extract_cancel",
+  "graph_observation_action",
   "graph_run_status",
   "graph_search",
   "graph_status",

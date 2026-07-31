@@ -1,0 +1,235 @@
+//! PDF-specific configuration.
+//!
+//! Defines PDF extraction options including metadata handling, image extraction,
+//! password management, and hierarchy extraction for document structure analysis.
+
+use serde::{Deserialize, Serialize};
+
+/// PDF-specific configuration.
+#[cfg(feature = "pdf")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdfConfig {
+    /// Extract images from PDF
+    #[serde(default)]
+    pub extract_images: bool,
+
+    /// Extract tables from PDF.
+    ///
+    /// When `true` (default), runs pdf_oxide's native grid detector and, if it
+    /// finds nothing, falls back to the heuristic text-layer reconstruction in
+    /// `pdf::oxide::table::extract_tables_heuristic`. Set to `false` to skip
+    /// both passes — `tables` will then be empty in the result.
+    #[serde(default = "default_true")]
+    pub extract_tables: bool,
+
+    /// List of passwords to try when opening encrypted PDFs
+    #[serde(default)]
+    pub passwords: Option<Vec<String>>,
+
+    /// Extract PDF metadata
+    #[serde(default = "default_true")]
+    pub extract_metadata: bool,
+
+    /// Hierarchy extraction configuration (None = hierarchy extraction disabled)
+    #[serde(default)]
+    pub hierarchy: Option<HierarchyConfig>,
+
+    /// Extract PDF annotations (text notes, highlights, links, stamps).
+    /// Default: false
+    #[serde(default)]
+    pub extract_annotations: bool,
+
+    /// Top margin fraction (0.0–1.0) of page height to exclude headers/running heads.
+    /// Default: 0.06 (6%)
+    #[serde(default)]
+    pub top_margin_fraction: Option<f32>,
+
+    /// Bottom margin fraction (0.0–1.0) of page height to exclude footers/page numbers.
+    /// Default: 0.05 (5%)
+    #[serde(default)]
+    pub bottom_margin_fraction: Option<f32>,
+
+    /// Allow single-column pseudo tables in extraction results.
+    ///
+    /// By default, tables with fewer than 2 columns (layout-guided) or 3 columns
+    /// (heuristic) are rejected. When `true`, the minimum column count is relaxed
+    /// to 1, allowing single-column structured data (glossaries, itemized lists)
+    /// to be emitted as tables. Other quality filters (density, sparsity, prose
+    /// detection) still apply.
+    #[serde(default)]
+    pub allow_single_column_tables: bool,
+
+    /// Perform OCR on inline images extracted from PDF pages and attach the
+    /// recognized text to each `ExtractedImage.ocr_result`. Requires Tesseract
+    /// to be available; if `ExtractionConfig.ocr` is `None` the extractor
+    /// falls back to `TesseractConfig::default()`. Per-image failures degrade
+    /// gracefully (the image is returned without OCR text rather than failing
+    /// the whole extraction). Default: `false`.
+    #[serde(default)]
+    pub ocr_inline_images: bool,
+
+    /// Extract AcroForm and XFA form fields into `ExtractedDocument.form_fields`.
+    ///
+    /// When `true` (default), reads the document's interactive form structure
+    /// (field names, types, values, widget geometry). Cheap and strictly
+    /// additive — non-form PDFs simply yield an empty list. Set to `false` to
+    /// skip the form pass entirely.
+    #[serde(default = "default_true")]
+    pub extract_form_fields: bool,
+
+    /// Reorder extracted text by layout-detected reading order.
+    ///
+    /// When `true`, projects text spans onto layout-detected regions, performs
+    /// column detection, and emits spans in natural reading order (important
+    /// for multi-column academic PDFs). Requires the `layout-detection`
+    /// feature; has no effect without it. Defaults to `false`.
+    #[serde(default)]
+    pub reading_order: bool,
+}
+
+/// Hierarchy extraction configuration for PDF text structure analysis.
+///
+/// Enables extraction of document hierarchy levels (H1-H6) based on font size
+/// clustering and semantic analysis. When enabled, hierarchical blocks are
+/// included in page content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HierarchyConfig {
+    /// Enable hierarchy extraction
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Number of font size clusters to use for hierarchy levels (1-7)
+    ///
+    /// Default: 6, which provides H1-H6 heading levels with body text.
+    /// Larger values create more fine-grained hierarchy levels.
+    #[serde(default = "default_k_clusters")]
+    pub k_clusters: usize,
+
+    /// Include bounding box information in hierarchy blocks
+    #[serde(default = "default_true")]
+    pub include_bbox: bool,
+}
+
+#[cfg(feature = "pdf")]
+impl Default for PdfConfig {
+    fn default() -> Self {
+        Self {
+            extract_images: false,
+            extract_tables: true,
+            passwords: None,
+            extract_metadata: true,
+            hierarchy: None,
+            extract_annotations: false,
+            top_margin_fraction: None,
+            bottom_margin_fraction: None,
+            allow_single_column_tables: false,
+            ocr_inline_images: false,
+            extract_form_fields: true,
+            reading_order: false,
+        }
+    }
+}
+
+impl Default for HierarchyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            k_clusters: 3,
+            include_bbox: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_k_clusters() -> usize {
+    3
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn test_hierarchy_config_default() {
+        use super::*;
+        let config = HierarchyConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.k_clusters, 3);
+        assert!(config.include_bbox);
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn test_hierarchy_config_disabled() {
+        use super::*;
+        let config = HierarchyConfig {
+            enabled: false,
+            k_clusters: 3,
+            include_bbox: false,
+        };
+        assert!(!config.enabled);
+        assert_eq!(config.k_clusters, 3);
+        assert!(!config.include_bbox);
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn test_pdf_config_custom_margins() {
+        use super::*;
+        let config = PdfConfig {
+            extract_images: false,
+            extract_tables: true,
+            passwords: None,
+            extract_metadata: true,
+            hierarchy: None,
+            extract_annotations: false,
+            top_margin_fraction: Some(0.10),
+            bottom_margin_fraction: Some(0.08),
+            allow_single_column_tables: false,
+            ocr_inline_images: false,
+            extract_form_fields: true,
+            reading_order: false,
+        };
+        assert_eq!(config.top_margin_fraction, Some(0.10));
+        assert_eq!(config.bottom_margin_fraction, Some(0.08));
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn pdf_config_omitting_extract_form_fields_defaults_to_true() {
+        use super::*;
+        let json = r#"{"extract_tables": true, "extract_metadata": true}"#;
+        let config: PdfConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            config.extract_form_fields,
+            "omitted extract_form_fields must default to true (default-on)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn pdf_config_omitting_reading_order_defaults_to_false() {
+        use super::*;
+        // reading_order uses `#[serde(default)]` (bool default = false).
+        let json = r#"{"extract_tables": true, "extract_metadata": true}"#;
+        let config: PdfConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.reading_order, "omitted reading_order must default to false");
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn pdf_config_new_fields_round_trip() {
+        use super::*;
+        let config = PdfConfig {
+            extract_form_fields: false,
+            reading_order: true,
+            ..PdfConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: PdfConfig = serde_json::from_str(&json).unwrap();
+        assert!(!deserialized.extract_form_fields);
+        assert!(deserialized.reading_order);
+    }
+}

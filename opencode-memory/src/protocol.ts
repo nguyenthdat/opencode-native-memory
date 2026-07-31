@@ -53,6 +53,8 @@ import {
   GraphExtractJobStatusResponseSchema,
   GraphExtractRenewRequestSchema,
   GraphExtractRenewResponseSchema,
+  GraphObservationActionRequestSchema,
+  GraphObservationActionResponseSchema,
   GraphExportRequestSchema,
   GraphExportResponseSchema,
   GraphRequestSchema,
@@ -118,6 +120,7 @@ export type GraphMethod =
   | "graph_extract_finish"
   | "graph_extract_job_status"
   | "graph_extract_cancel"
+  | "graph_observation_action"
   | "graph_search"
   | "graph_status"
   | "graph_export";
@@ -315,6 +318,12 @@ export function createGraphRequest(id: number, method: GraphMethod, params: unkn
         value: fromJson(GraphExtractCancelRequestSchema, values),
       };
       break;
+    case "graph_observation_action":
+      operation = {
+        case: "observationAction",
+        value: fromJson(GraphObservationActionRequestSchema, values),
+      };
+      break;
   }
   return create(GraphRequestSchema, { id: BigInt(id), operation });
 }
@@ -351,6 +360,7 @@ export function isGraphMethod(method: string): method is GraphMethod {
     method === "graph_extract_finish" ||
     method === "graph_extract_job_status" ||
     method === "graph_extract_cancel" ||
+    method === "graph_observation_action" ||
     method === "graph_search" ||
     method === "graph_status" ||
     method === "graph_export"
@@ -499,6 +509,9 @@ export function decodeGraphResponse(response: GraphResponse, method: GraphMethod
       break;
     case "extractCancel":
       result = graphJobResponseObject(GraphExtractCancelResponseSchema, response.result.value);
+      break;
+    case "observationAction":
+      result = graphMessageObject(GraphObservationActionResponseSchema, response.result.value);
       break;
     case undefined:
       throw new Error(`Native memory daemon omitted the graph result for ${method}`);
@@ -761,6 +774,8 @@ function graphResultCase(method: GraphMethod): Exclude<GraphResponse["result"]["
       return "extractJobStatus";
     case "graph_extract_cancel":
       return "extractCancel";
+    case "graph_observation_action":
+      return "observationAction";
   }
 }
 
@@ -836,6 +851,10 @@ function graphRequestParams(params: unknown, method: GraphMethod): JsonObject {
       break;
     case "graph_extract_cancel":
       requiredGraphStringParam(value, "job_id", method);
+      break;
+    case "graph_observation_action":
+      requiredGraphStringParam(value, "observation_id", method);
+      requiredGraphStringParam(value, "action", method);
       break;
     case "graph_search":
       requiredGraphStringParam(value, "query", method);

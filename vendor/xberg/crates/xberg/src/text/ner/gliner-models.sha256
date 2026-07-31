@@ -1,0 +1,13 @@
+# GLiNER v2.5 weight manifest — hosted at xberg-io/gliner-models, xberg-managed span-mode
+# ONNX exports of the Apache-2.0 gliner-community v2.5 models (weights unmodified; PyTorch
+# re-serialized to ONNX). Single source of truth: gline.rs reads this file via include_str!.
+# Trust attaches to the manifest, not the host — a changed or tampered upstream file fails
+# staging instead of feeding wrong weights into inference. Update the fleet → edit here only.
+# Format: <sha256>  <repo-relative path>.
+#
+4b137f355fe2fc1d7b359934eeb26f9b3bf3810afcb2bfd86d39b24e167309d5  models/gliner_small-v2.5/span/fp32/model.onnx
+91cf35efa9ec3549c6c52a415cdd7531fd172858d7d9eecef720bc4a3f1f8699  models/gliner_small-v2.5/span/fp32/tokenizer.json
+014f8d7185ccd3e1d37af3932a7ade31bea20016359924eb25f35efb8572cc06  models/gliner_medium-v2.5/span/fp32/model.onnx
+91cf35efa9ec3549c6c52a415cdd7531fd172858d7d9eecef720bc4a3f1f8699  models/gliner_medium-v2.5/span/fp32/tokenizer.json
+59147616a660fe09215d911727870d80387adee125ca6df4e4446ad0cad65946  models/gliner_large-v2.5/span/fp32/model.onnx
+91cf35efa9ec3549c6c52a415cdd7531fd172858d7d9eecef720bc4a3f1f8699  models/gliner_large-v2.5/span/fp32/tokenizer.json

@@ -5,32 +5,36 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use super::*;
 use crate::capture::{CaptureSafety, SourceTrust};
 use crate::graph::{
-    DEFAULT_GRAPH_JOB_ATTEMPTS, DEFAULT_GRAPH_JOB_LEASE_MS, GRAPH_POLICY_VERSION,
-    GraphCandidateConflict, GraphCandidateRejection, GraphEntity as StoredGraphEntity,
-    GraphEntityInput, GraphEvidence, GraphEvidenceInput, GraphExtractionJob, GraphJobFinishOutcome,
-    GraphJobState, GraphProvider, GraphRelation as StoredGraphRelation, GraphRelationInput,
-    GraphScope, GraphScopeKind, GraphSource, MAX_GRAPH_DEPTH, MAX_GRAPH_ENTITIES,
-    MAX_GRAPH_EVIDENCE, MAX_GRAPH_FANOUT, MAX_GRAPH_JOB_ATTEMPTS, MAX_GRAPH_JOB_LEASE_MS,
-    MAX_GRAPH_PAGE, MAX_GRAPH_QUOTE_CHARS, MAX_GRAPH_RELATIONS, MAX_GRAPH_RESULTS,
-    MAX_GRAPH_TEXT_BYTES, MAX_GRAPH_TOTAL_TEXT_BYTES, MAX_GRAPH_UNITS,
+    DEFAULT_GRAPH_JOB_ATTEMPTS, DEFAULT_GRAPH_JOB_LEASE_MS, DerivedFact as StoredGraphFact,
+    GRAPH_POLICY_VERSION, GraphCandidateConflict, GraphCandidateRejection,
+    GraphEntity as StoredGraphEntity, GraphEntityInput, GraphEvidence, GraphEvidenceInput,
+    GraphExtractionJob, GraphFactInput, GraphJobFinishOutcome, GraphJobState,
+    GraphObservation as StoredGraphObservation, GraphObservationInput, GraphProvider,
+    GraphRelation as StoredGraphRelation, GraphRelationInput, GraphRunMetrics, GraphScope,
+    GraphScopeKind, GraphSource, MAX_GRAPH_DEPTH, MAX_GRAPH_ENTITIES, MAX_GRAPH_EVIDENCE,
+    MAX_GRAPH_FACTS, MAX_GRAPH_FANOUT, MAX_GRAPH_JOB_ATTEMPTS, MAX_GRAPH_JOB_LEASE_MS,
+    MAX_GRAPH_OBSERVATIONS, MAX_GRAPH_PAGE, MAX_GRAPH_QUOTE_CHARS, MAX_GRAPH_RELATIONS,
+    MAX_GRAPH_RESULTS, MAX_GRAPH_TEXT_BYTES, MAX_GRAPH_TOTAL_TEXT_BYTES, MAX_GRAPH_UNITS,
 };
 use crate::graph_proto::{
-    GraphAcceptedEntity, GraphAcceptedRelation, GraphAuthorization,
-    GraphCandidateConflict as ProtoGraphCandidateConflict, GraphCandidateEvidence,
-    GraphDerivedScope, GraphEntity, GraphEntityCandidate, GraphEntitySearchResult,
-    GraphEvidenceProvenance, GraphExportProvenance, GraphExportRequest, GraphExportResponse,
-    GraphExtractCancelRequest, GraphExtractCancelResponse, GraphExtractClaimRequest,
-    GraphExtractClaimResponse, GraphExtractEnqueueRequest, GraphExtractEnqueueResponse,
-    GraphExtractFinishOutcome, GraphExtractFinishRequest, GraphExtractFinishResponse,
-    GraphExtractJobStatusRequest, GraphExtractJobStatusResponse, GraphExtractPrepareRequest,
-    GraphExtractPrepareResponse, GraphExtractRenewRequest, GraphExtractRenewResponse,
-    GraphExtractionJobState, GraphExtractionUnit, GraphLastExtraction, GraphMemorySearchResult,
-    GraphProviderIdentity, GraphRejectedCandidate as ProtoGraphCandidateRejection,
-    GraphRejectedSource, GraphRelation, GraphRelationCandidate, GraphRelationSearchResult,
-    GraphRunReceipt, GraphRunStatusRequest, GraphRunStatusResponse, GraphScopeFilter,
-    GraphSearchRequest, GraphSearchResponse, GraphSourceBinding, GraphStatusRequest,
-    GraphStatusResponse, GraphTimeFilter, GraphUpsertCandidatesRequest,
-    GraphUpsertCandidatesResponse,
+    GraphAcceptedEntity, GraphAcceptedFact, GraphAcceptedObservation, GraphAcceptedRelation,
+    GraphAuthorization, GraphCandidateConflict as ProtoGraphCandidateConflict,
+    GraphCandidateEvidence, GraphDerivedScope, GraphEntity, GraphEntityCandidate,
+    GraphEntitySearchResult, GraphEvidenceProvenance, GraphExportProvenance, GraphExportRequest,
+    GraphExportResponse, GraphExtractCancelRequest, GraphExtractCancelResponse,
+    GraphExtractClaimRequest, GraphExtractClaimResponse, GraphExtractEnqueueRequest,
+    GraphExtractEnqueueResponse, GraphExtractFinishOutcome, GraphExtractFinishRequest,
+    GraphExtractFinishResponse, GraphExtractJobStatusRequest, GraphExtractJobStatusResponse,
+    GraphExtractPrepareRequest, GraphExtractPrepareResponse, GraphExtractRenewRequest,
+    GraphExtractRenewResponse, GraphExtractionJobState, GraphExtractionUnit, GraphFact,
+    GraphFactCandidate, GraphFactSearchResult, GraphLastExtraction, GraphMemorySearchResult,
+    GraphObservation, GraphObservationActionRequest, GraphObservationActionResponse,
+    GraphObservationCandidate, GraphObservationSearchResult, GraphProviderIdentity,
+    GraphRejectedCandidate as ProtoGraphCandidateRejection, GraphRejectedSource, GraphRelation,
+    GraphRelationCandidate, GraphRelationSearchResult, GraphRunReceipt, GraphRunStatusRequest,
+    GraphRunStatusResponse, GraphScopeFilter, GraphSearchRequest, GraphSearchResponse,
+    GraphSourceBinding, GraphStatusRequest, GraphStatusResponse, GraphTimeFilter,
+    GraphUpsertCandidatesRequest, GraphUpsertCandidatesResponse,
 };
 
 impl MemoryEngine {
@@ -330,26 +334,40 @@ impl MemoryEngine {
                 bail!("graph job finish outcome is required")
             }
         };
-        let (entities, relations) = if outcome == GraphJobFinishOutcome::Completed {
-            (
-                request
+        let (entities, relations, facts, observations) =
+            if outcome == GraphJobFinishOutcome::Completed {
+                let mut entities = request
                     .entities
                     .iter()
                     .map(graph_entity_input)
-                    .collect::<Result<Vec<_>>>()?,
-                request
-                    .relations
+                    .collect::<Result<Vec<_>>>()?;
+                let mut facts = request
+                    .facts
                     .iter()
-                    .map(graph_relation_input)
-                    .collect::<Result<Vec<_>>>()?,
-            )
-        } else {
-            ensure!(
-                request.entities.is_empty() && request.relations.is_empty(),
-                "failed graph job cannot include candidates"
-            );
-            (Vec::new(), Vec::new())
-        };
+                    .map(graph_fact_input)
+                    .collect::<Result<Vec<_>>>()?;
+                let mut observations = request
+                    .observations
+                    .iter()
+                    .map(graph_observation_input)
+                    .collect::<Result<Vec<_>>>()?;
+                self.attach_graph_embeddings(&mut entities, &mut facts, &mut observations);
+                (
+                    entities,
+                    relations_from_request(request)?,
+                    facts,
+                    observations,
+                )
+            } else {
+                ensure!(
+                    request.entities.is_empty()
+                        && request.relations.is_empty()
+                        && request.facts.is_empty()
+                        && request.observations.is_empty(),
+                    "failed graph job cannot include candidates"
+                );
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
         let sources = if outcome == GraphJobFinishOutcome::Completed {
             match self.validate_graph_job_sources(&current, authorization) {
                 Ok(sources) => sources,
@@ -363,7 +381,7 @@ impl MemoryEngine {
         } else {
             Vec::new()
         };
-        let finished = self.graph.finish_job(
+        let finished = self.graph.finish_job_with_learning(
             &current.job_id,
             &request.lease_token,
             &request.extraction_run_id,
@@ -371,6 +389,13 @@ impl MemoryEngine {
             &sources,
             &entities,
             &relations,
+            &facts,
+            &observations,
+            GraphRunMetrics {
+                input_bytes: request.input_bytes,
+                output_bytes: request.output_bytes,
+                latency_ms: request.latency_ms,
+            },
             &request.error_code,
             &request.error_message,
             now_ms_u64()?,
@@ -378,7 +403,7 @@ impl MemoryEngine {
         let upsert = finished
             .upsert
             .as_ref()
-            .map(|outcome| proto_upsert_response(outcome, &entities, &relations));
+            .map(|outcome| proto_upsert_response(outcome, &entities, &relations, &facts));
         Ok(GraphExtractFinishResponse {
             job: Some(proto_graph_job(&finished.job)),
             upsert,
@@ -445,7 +470,15 @@ impl MemoryEngine {
             request.relations.len() <= MAX_GRAPH_RELATIONS,
             "graph relation count exceeds limit"
         );
-        let entities = request
+        ensure!(
+            request.facts.len() <= MAX_GRAPH_FACTS,
+            "graph fact count exceeds limit"
+        );
+        ensure!(
+            request.observations.len() <= MAX_GRAPH_OBSERVATIONS,
+            "graph observation count exceeds limit"
+        );
+        let mut entities = request
             .entities
             .iter()
             .map(graph_entity_input)
@@ -455,6 +488,17 @@ impl MemoryEngine {
             .iter()
             .map(graph_relation_input)
             .collect::<Result<Vec<_>>>()?;
+        let mut facts = request
+            .facts
+            .iter()
+            .map(graph_fact_input)
+            .collect::<Result<Vec<_>>>()?;
+        let mut observations = request
+            .observations
+            .iter()
+            .map(graph_observation_input)
+            .collect::<Result<Vec<_>>>()?;
+        self.attach_graph_embeddings(&mut entities, &mut facts, &mut observations);
         let sources = if let Some(run) = self.graph.run(&request.extraction_run_id) {
             ensure!(
                 run.scopes
@@ -474,12 +518,19 @@ impl MemoryEngine {
             sources.len() <= MAX_GRAPH_UNITS,
             "graph source count exceeds limit"
         );
-        let outcome = self.graph.upsert(
+        let outcome = self.graph.upsert_learning(
             &request.extraction_run_id,
             &sources,
             &graph_provider(provider),
             &entities,
             &relations,
+            &facts,
+            &observations,
+            GraphRunMetrics {
+                input_bytes: request.input_bytes,
+                output_bytes: request.output_bytes,
+                latency_ms: request.latency_ms,
+            },
             now_ms_u64()?,
         )?;
         let accepted_entities = outcome
@@ -530,6 +581,16 @@ impl MemoryEngine {
             receipt: Some(proto_run_receipt(&outcome.run)),
             accepted_entities,
             accepted_relations,
+            accepted_facts: outcome
+                .facts
+                .iter()
+                .map(|(index, fact)| proto_accepted_fact(*index, fact, facts.get(*index)))
+                .collect(),
+            accepted_observations: outcome
+                .observations
+                .iter()
+                .map(|(index, observation)| proto_accepted_observation(*index, observation))
+                .collect(),
             rejected_candidates: outcome.rejected.iter().map(proto_rejection).collect(),
             conflicts: outcome.conflicts.iter().map(proto_conflict).collect(),
             warnings: outcome.warnings,
@@ -563,7 +624,10 @@ impl MemoryEngine {
         })
     }
 
-    pub(crate) fn graph_search(&self, request: &GraphSearchRequest) -> Result<GraphSearchResponse> {
+    pub(crate) fn graph_search(
+        &mut self,
+        request: &GraphSearchRequest,
+    ) -> Result<GraphSearchResponse> {
         let authorization = graph_authorization(request.authorization.as_ref())?;
         let max_depth = bounded_limit(request.max_depth, MAX_GRAPH_DEPTH, MAX_GRAPH_DEPTH)?;
         let max_fanout = bounded_limit(request.max_fanout, MAX_GRAPH_FANOUT, MAX_GRAPH_FANOUT)?;
@@ -575,23 +639,36 @@ impl MemoryEngine {
         )?;
         validate_graph_time_filter(request.time.as_ref())?;
         let current_ms = now_ms_u64()?;
-        let (eligible_entity_ids, eligible_relation_ids) = self.graph_search_eligible_ids(
+        let (
+            eligible_entity_ids,
+            eligible_relation_ids,
+            eligible_fact_ids,
+            eligible_observation_ids,
+        ) = self.graph_search_eligible_ids(
             authorization,
             request.scope.as_ref(),
             request.time.as_ref(),
             current_ms,
         );
-        let stored = self.graph.search(
+        let query_embedding = self.embed_query(&request.query).ok();
+        let embedding_generation_id = self.active_embedding.generation_id.clone();
+        let stored = self.graph.search_learning(
             &request.query,
             max_depth,
             max_fanout,
             max_results,
             &eligible_entity_ids,
             &eligible_relation_ids,
+            &eligible_fact_ids,
+            &eligible_observation_ids,
+            query_embedding.as_deref(),
+            &embedding_generation_id,
         )?;
         let mut memories = Vec::new();
         let mut entities = Vec::new();
         let mut relations = Vec::new();
+        let mut facts = Vec::new();
+        let mut observations = Vec::new();
         let mut eligible_sources = HashSet::new();
         let mut seen_relations = HashSet::new();
         let mut seen_memories = HashSet::new();
@@ -652,6 +729,59 @@ impl MemoryEngine {
                     }],
                 });
             }
+            for fact in &item.facts {
+                if !eligible_fact_ids.contains(&fact.fact_id) {
+                    continue;
+                }
+                let provenance =
+                    self.active_provenance(&fact.evidence, authorization, max_evidence)?;
+                if provenance.is_empty() {
+                    continue;
+                }
+                eligible_sources.extend(
+                    provenance
+                        .iter()
+                        .map(|entry| entry.source_memory_id.clone()),
+                );
+                facts.push(GraphFactSearchResult {
+                    fact: Some(proto_fact(fact)),
+                    score: item.score,
+                    provenance,
+                    score_trace: vec![crate::graph_proto::GraphScoreComponent {
+                        name: "semantic_lexical_fact_v1".to_string(),
+                        value: item.score,
+                    }],
+                });
+            }
+            for observation in &item.observations {
+                if !eligible_observation_ids.contains(&observation.observation_id) {
+                    continue;
+                }
+                let evidence = observation
+                    .source_fact_ids
+                    .iter()
+                    .filter_map(|fact_id| self.graph.fact(fact_id))
+                    .flat_map(|fact| fact.evidence.clone())
+                    .collect::<Vec<_>>();
+                let provenance = self.active_provenance(&evidence, authorization, max_evidence)?;
+                if provenance.is_empty() {
+                    continue;
+                }
+                eligible_sources.extend(
+                    provenance
+                        .iter()
+                        .map(|entry| entry.source_memory_id.clone()),
+                );
+                observations.push(GraphObservationSearchResult {
+                    observation: Some(proto_observation(observation)),
+                    score: item.score,
+                    provenance,
+                    score_trace: vec![crate::graph_proto::GraphScoreComponent {
+                        name: "semantic_lexical_observation_v1".to_string(),
+                        value: item.score,
+                    }],
+                });
+            }
             if memory_provenance.is_empty() {
                 memory_provenance =
                     self.active_provenance(&item.evidence, authorization, max_evidence)?;
@@ -677,21 +807,32 @@ impl MemoryEngine {
                 });
             }
         }
-        let truncated = stored_len_exceeded(&memories, &entities, &relations, max_results);
+        let truncated = stored_len_exceeded(
+            &memories,
+            &entities,
+            &relations,
+            &facts,
+            &observations,
+            max_results,
+        );
         memories.truncate(max_results);
         entities.truncate(max_results);
         relations.truncate(max_results);
+        facts.truncate(max_results);
+        observations.truncate(max_results);
         Ok(GraphSearchResponse {
             memories,
             entities,
             relations,
+            facts,
+            observations,
             eligible_source_count: eligible_sources.len() as u64,
             truncated,
         })
     }
 
     pub(crate) fn graph_ranked_memory_ids(
-        &self,
+        &mut self,
         query: &str,
         request: &SearchRequest,
         limit: usize,
@@ -753,6 +894,8 @@ impl MemoryEngine {
             }
         }
         let mut relation_count = 0_u64;
+        let mut fact_count = 0_u64;
+        let mut observation_count = 0_u64;
         let mut last_extraction = None;
         for relation in self.graph.state().relations.values() {
             if !graph_scope_filter_matches(&relation.scope, request.scope.as_ref())
@@ -767,6 +910,32 @@ impl MemoryEngine {
                 continue;
             }
             relation_count = relation_count.saturating_add(1);
+        }
+        for fact in self.graph.state().facts.values() {
+            if fact.status == "active"
+                && graph_scope_filter_matches(&fact.scope, request.scope.as_ref())
+                && fact
+                    .evidence
+                    .iter()
+                    .any(|evidence| self.graph_evidence_current(evidence, authorization).is_ok())
+            {
+                fact_count = fact_count.saturating_add(1);
+            }
+        }
+        for observation in self.graph.state().observations.values() {
+            if observation.freshness == "current"
+                && observation.proof_count > 0
+                && graph_scope_filter_matches(&observation.scope, request.scope.as_ref())
+                && observation.source_fact_ids.iter().any(|fact_id| {
+                    self.graph.fact(fact_id).is_some_and(|fact| {
+                        fact.evidence.iter().any(|evidence| {
+                            self.graph_evidence_current(evidence, authorization).is_ok()
+                        })
+                    })
+                })
+            {
+                observation_count = observation_count.saturating_add(1);
+            }
         }
         for run in self.graph.state().runs.values() {
             if run
@@ -803,6 +972,8 @@ impl MemoryEngine {
             schema_version: self.graph.state().schema_version.to_string(),
             entity_count: entity_ids.len() as u64,
             relation_count,
+            fact_count,
+            observation_count,
             pending_job_count,
             last_extraction,
         })
@@ -844,6 +1015,35 @@ impl MemoryEngine {
                 items.push(("relation".to_string(), relation.relation_id.clone()));
             }
         }
+        for fact in self.graph.state().facts.values() {
+            if fact.status == "active"
+                && graph_scope_filter_matches(&fact.scope, request.scope.as_ref())
+                && fact
+                    .evidence
+                    .iter()
+                    .any(|evidence| self.graph_evidence_current(evidence, authorization).is_ok())
+            {
+                items.push(("fact".to_string(), fact.fact_id.clone()));
+            }
+        }
+        for observation in self.graph.state().observations.values() {
+            if observation.freshness == "current"
+                && observation.proof_count > 0
+                && graph_scope_filter_matches(&observation.scope, request.scope.as_ref())
+                && observation.source_fact_ids.iter().any(|id| {
+                    self.graph.fact(id).is_some_and(|fact| {
+                        fact.evidence.iter().any(|evidence| {
+                            self.graph_evidence_current(evidence, authorization).is_ok()
+                        })
+                    })
+                })
+            {
+                items.push((
+                    "observation".to_string(),
+                    observation.observation_id.clone(),
+                ));
+            }
+        }
         ensure!(
             cursor <= items.len(),
             "graph export cursor is outside the result set"
@@ -851,6 +1051,8 @@ impl MemoryEngine {
         let page = &items[cursor..items.len().min(cursor.saturating_add(page_limit))];
         let mut entities = Vec::new();
         let mut relations = Vec::new();
+        let mut facts = Vec::new();
+        let mut observations = Vec::new();
         let mut provenance = Vec::new();
         for (kind, id) in page {
             if kind == "entity" {
@@ -864,7 +1066,7 @@ impl MemoryEngine {
                     fact_id: id.clone(),
                     sources: self.entity_provenance(entity, authorization, MAX_GRAPH_EVIDENCE)?,
                 });
-            } else {
+            } else if kind == "relation" {
                 let relation = self
                     .graph
                     .relation(id)
@@ -879,6 +1081,42 @@ impl MemoryEngine {
                         MAX_GRAPH_EVIDENCE,
                     )?,
                 });
+            } else if kind == "fact" {
+                let fact = self
+                    .graph
+                    .fact(id)
+                    .ok_or_else(|| anyhow!("graph export fact disappeared"))?;
+                facts.push(proto_fact(fact));
+                provenance.push(GraphExportProvenance {
+                    fact_kind: kind.clone(),
+                    fact_id: id.clone(),
+                    sources: self.active_provenance(
+                        &fact.evidence,
+                        authorization,
+                        MAX_GRAPH_EVIDENCE,
+                    )?,
+                });
+            } else {
+                let observation = self
+                    .graph
+                    .observation(id)
+                    .ok_or_else(|| anyhow!("graph export observation disappeared"))?;
+                observations.push(proto_observation(observation));
+                let evidence = observation
+                    .source_fact_ids
+                    .iter()
+                    .filter_map(|fact_id| self.graph.fact(fact_id))
+                    .flat_map(|fact| fact.evidence.clone())
+                    .collect::<Vec<_>>();
+                provenance.push(GraphExportProvenance {
+                    fact_kind: kind.clone(),
+                    fact_id: id.clone(),
+                    sources: self.active_provenance(
+                        &evidence,
+                        authorization,
+                        MAX_GRAPH_EVIDENCE,
+                    )?,
+                });
             }
         }
         let next_cursor =
@@ -888,9 +1126,49 @@ impl MemoryEngine {
             schema_version: self.graph.state().schema_version.to_string(),
             entities,
             relations,
+            facts,
+            observations,
             provenance,
             next_cursor,
             complete,
+        })
+    }
+
+    pub(crate) fn graph_observation_action(
+        &mut self,
+        request: &GraphObservationActionRequest,
+    ) -> Result<GraphObservationActionResponse> {
+        let authorization = graph_authorization(request.authorization.as_ref())?;
+        let observation = self
+            .graph
+            .observation(&request.observation_id)
+            .ok_or_else(|| anyhow!("graph observation not found: {}", request.observation_id))?;
+        ensure!(
+            graph_scope_visible(&observation.scope, authorization),
+            "graph observation not found: {}",
+            request.observation_id
+        );
+        if request.action == "restore" {
+            ensure!(
+                observation.source_fact_ids.iter().any(|fact_id| {
+                    self.graph.fact(fact_id).is_some_and(|fact| {
+                        fact.evidence.iter().any(|evidence| {
+                            self.graph_evidence_current(evidence, authorization).is_ok()
+                        })
+                    })
+                }),
+                "observation cannot be restored without current source evidence"
+            );
+        }
+        let (observation, outcome) = self.graph.act_on_observation(
+            &request.observation_id,
+            &request.action,
+            request.statement.as_deref(),
+            now_ms_u64()?,
+        )?;
+        Ok(GraphObservationActionResponse {
+            observation: Some(proto_observation(&observation)),
+            outcome,
         })
     }
 
@@ -1009,6 +1287,7 @@ impl MemoryEngine {
             origin: memory_origin_name(metadata.origin).to_string(),
             policy_revision: GRAPH_POLICY_VERSION.to_string(),
             remote_eligible,
+            reference_time_ms: u64::try_from(stored.created_at_ms).unwrap_or_default(),
             text: stored.content,
         })
     }
@@ -1126,7 +1405,12 @@ impl MemoryEngine {
         scope_filter: Option<&GraphScopeFilter>,
         time_filter: Option<&GraphTimeFilter>,
         current_ms: u64,
-    ) -> (HashSet<String>, HashSet<String>) {
+    ) -> (
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+    ) {
         let mut source_cache = HashMap::<String, Option<GraphSource>>::new();
         let mut entity_ids = HashSet::new();
         for mention in &self.graph.state().mentions {
@@ -1173,7 +1457,42 @@ impl MemoryEngine {
             })
             .map(|(id, _)| id.clone())
             .collect::<HashSet<_>>();
-        (entity_ids, relation_ids)
+        let fact_ids = self
+            .graph
+            .state()
+            .facts
+            .iter()
+            .filter(|(_, fact)| {
+                fact.status == "active"
+                    && graph_scope_filter_matches(&fact.scope, scope_filter)
+                    && graph_fact_time_filter_matches(fact, time_filter)
+                    && fact.evidence.iter().any(|evidence| {
+                        self.graph_evidence_current_cached(
+                            evidence,
+                            authorization,
+                            &mut source_cache,
+                        )
+                    })
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        let observation_ids = self
+            .graph
+            .state()
+            .observations
+            .iter()
+            .filter(|(_, observation)| {
+                observation.freshness == "current"
+                    && observation.proof_count > 0
+                    && graph_scope_filter_matches(&observation.scope, scope_filter)
+                    && observation
+                        .source_fact_ids
+                        .iter()
+                        .any(|fact_id| fact_ids.contains(fact_id))
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        (entity_ids, relation_ids, fact_ids, observation_ids)
     }
 
     fn graph_evidence_current_cached(
@@ -1223,6 +1542,46 @@ impl MemoryEngine {
             .map(|mention| mention.evidence.clone())
             .collect::<Vec<_>>();
         self.active_provenance(&evidence, authorization, limit)
+    }
+
+    fn attach_graph_embeddings(
+        &mut self,
+        entities: &mut [GraphEntityInput],
+        facts: &mut [GraphFactInput],
+        observations: &mut [GraphObservationInput],
+    ) {
+        let generation_id = self.active_embedding.generation_id.clone();
+        for entity in entities {
+            let text = format!(
+                "{} {} {}",
+                entity.canonical_hint,
+                entity.entity_type,
+                entity.aliases.join(" ")
+            );
+            if let Ok(embedding) = self.embed_passage(&text) {
+                entity.embedding = embedding;
+                entity.embedding_generation_id.clone_from(&generation_id);
+            }
+        }
+        for fact in facts {
+            let text = if fact.context.is_empty() {
+                fact.text.clone()
+            } else {
+                format!("{}\n{}", fact.text, fact.context)
+            };
+            if let Ok(embedding) = self.embed_passage(&text) {
+                fact.embedding = embedding;
+                fact.embedding_generation_id.clone_from(&generation_id);
+            }
+        }
+        for observation in observations {
+            if let Ok(embedding) = self.embed_passage(&observation.statement) {
+                observation.embedding = embedding;
+                observation
+                    .embedding_generation_id
+                    .clone_from(&generation_id);
+            }
+        }
     }
 }
 
@@ -1332,13 +1691,33 @@ fn graph_time_filter_matches(
 }
 
 fn graph_relation_valid_at(relation: &StoredGraphRelation, at_ms: u64) -> bool {
-    relation.status == "active"
-        && relation
-            .valid_at_ms
-            .is_none_or(|valid_at_ms| valid_at_ms <= at_ms)
+    relation
+        .valid_at_ms
+        .is_none_or(|valid_at_ms| valid_at_ms <= at_ms)
         && relation
             .invalid_at_ms
             .is_none_or(|invalid_at_ms| at_ms < invalid_at_ms)
+}
+
+fn graph_fact_time_filter_matches(
+    fact: &StoredGraphFact,
+    filter: Option<&GraphTimeFilter>,
+) -> bool {
+    let Some(filter) = filter else { return true };
+    let occurred_start = fact.occurred_start_ms.or(fact.occurred_end_ms);
+    let occurred_end = fact.occurred_end_ms.or(fact.occurred_start_ms);
+    filter
+        .occurred_after_ms
+        .is_none_or(|after| occurred_end.is_some_and(|end| end >= after))
+        && filter
+            .occurred_before_ms
+            .is_none_or(|before| occurred_start.is_some_and(|start| start <= before))
+        && filter
+            .extracted_after_ms
+            .is_none_or(|after| fact.learned_at_ms >= after)
+        && filter
+            .extracted_before_ms
+            .is_none_or(|before| fact.learned_at_ms <= before)
 }
 
 fn graph_exact_as_of_ms(filter: &GraphTimeFilter) -> Option<u64> {
@@ -1364,6 +1743,13 @@ fn validate_graph_time_filter(filter: Option<&GraphTimeFilter>) -> Result<()> {
             .is_none_or(|(after, before)| after <= before),
         "graph extraction-time range is invalid"
     );
+    ensure!(
+        filter
+            .occurred_after_ms
+            .zip(filter.occurred_before_ms)
+            .is_none_or(|(after, before)| after <= before),
+        "graph occurred-time range is invalid"
+    );
     Ok(())
 }
 
@@ -1383,6 +1769,7 @@ fn graph_job_source_binding(source: &crate::graph::GraphJobSource) -> GraphSourc
         origin: source.origin.clone(),
         policy_revision: source.policy_revision.clone(),
         remote_eligible: source.remote_eligible,
+        reference_time_ms: source.reference_time_ms,
     }
 }
 
@@ -1459,6 +1846,7 @@ fn proto_upsert_response(
     outcome: &crate::graph::GraphUpsertOutcome,
     entities: &[GraphEntityInput],
     relations: &[GraphRelationInput],
+    facts: &[GraphFactInput],
 ) -> GraphUpsertCandidatesResponse {
     GraphUpsertCandidatesResponse {
         receipt: Some(proto_run_receipt(&outcome.run)),
@@ -1506,9 +1894,63 @@ fn proto_upsert_response(
                     .unwrap_or_default(),
             })
             .collect(),
+        accepted_facts: outcome
+            .facts
+            .iter()
+            .map(|(index, fact)| proto_accepted_fact(*index, fact, facts.get(*index)))
+            .collect(),
+        accepted_observations: outcome
+            .observations
+            .iter()
+            .map(|(index, observation)| proto_accepted_observation(*index, observation))
+            .collect(),
         rejected_candidates: outcome.rejected.iter().map(proto_rejection).collect(),
         conflicts: outcome.conflicts.iter().map(proto_conflict).collect(),
         warnings: outcome.warnings.clone(),
+    }
+}
+
+fn proto_accepted_fact(
+    index: usize,
+    fact: &StoredGraphFact,
+    candidate: Option<&GraphFactInput>,
+) -> GraphAcceptedFact {
+    GraphAcceptedFact {
+        candidate_index: index as u32,
+        fact_id: fact.fact_id.clone(),
+        fact_type: fact.fact_type.clone(),
+        status: fact.status.clone(),
+        derived_scope: Some(graph_derived_scope(&fact.scope)),
+        source_memory_ids: fact
+            .evidence
+            .iter()
+            .map(|item| item.source_memory_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect(),
+        evidence: candidate
+            .map(|candidate| {
+                candidate
+                    .evidence
+                    .iter()
+                    .map(proto_candidate_evidence)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn proto_accepted_observation(
+    index: usize,
+    observation: &StoredGraphObservation,
+) -> GraphAcceptedObservation {
+    GraphAcceptedObservation {
+        candidate_index: index as u32,
+        observation_id: observation.observation_id.clone(),
+        freshness: observation.freshness.clone(),
+        proof_count: observation.proof_count,
+        derived_scope: Some(graph_derived_scope(&observation.scope)),
+        source_fact_ids: observation.source_fact_ids.iter().cloned().collect(),
     }
 }
 
@@ -1535,7 +1977,52 @@ fn graph_entity_input(candidate: &GraphEntityCandidate) -> Result<GraphEntityInp
             .map(graph_evidence_input)
             .collect::<Result<Vec<_>>>()?,
         confidence: candidate.confidence,
+        embedding: Vec::new(),
+        embedding_generation_id: String::new(),
     })
+}
+
+fn graph_fact_input(candidate: &GraphFactCandidate) -> Result<GraphFactInput> {
+    Ok(GraphFactInput {
+        text: candidate.text.clone(),
+        fact_type: candidate.fact_type.clone(),
+        context: candidate.context.clone(),
+        occurred_start_ms: candidate.occurred_start_ms,
+        occurred_end_ms: candidate.occurred_end_ms,
+        mentioned_at_ms: candidate.mentioned_at_ms,
+        entity_mentions: candidate.entity_mentions.clone(),
+        causal_fact_indexes: candidate
+            .causal_fact_indexes
+            .iter()
+            .map(|value| usize::try_from(*value).context("causal fact index is invalid"))
+            .collect::<Result<Vec<_>>>()?,
+        evidence: candidate
+            .evidence
+            .iter()
+            .map(graph_evidence_input)
+            .collect::<Result<Vec<_>>>()?,
+        confidence: candidate.confidence,
+        embedding: Vec::new(),
+        embedding_generation_id: String::new(),
+    })
+}
+
+fn graph_observation_input(candidate: &GraphObservationCandidate) -> Result<GraphObservationInput> {
+    Ok(GraphObservationInput {
+        statement: candidate.statement.clone(),
+        source_fact_indexes: candidate
+            .source_fact_indexes
+            .iter()
+            .map(|value| usize::try_from(*value).context("observation fact index is invalid"))
+            .collect::<Result<Vec<_>>>()?,
+        confidence: candidate.confidence,
+        embedding: Vec::new(),
+        embedding_generation_id: String::new(),
+    })
+}
+
+fn relations_from_request(request: &GraphExtractFinishRequest) -> Result<Vec<GraphRelationInput>> {
+    request.relations.iter().map(graph_relation_input).collect()
 }
 
 fn graph_relation_input(candidate: &GraphRelationCandidate) -> Result<GraphRelationInput> {
@@ -1579,6 +2066,7 @@ fn graph_source_binding(source: &GraphSource) -> GraphSourceBinding {
         origin: source.origin.clone(),
         policy_revision: source.policy_revision.clone(),
         remote_eligible: source.remote_eligible,
+        reference_time_ms: source.reference_time_ms,
     }
 }
 
@@ -1623,6 +2111,7 @@ fn graph_source_from_binding(binding: &GraphSourceBinding) -> Result<GraphSource
         origin: binding.origin.clone(),
         policy_revision: binding.policy_revision.clone(),
         remote_eligible: binding.remote_eligible,
+        reference_time_ms: binding.reference_time_ms,
         text: String::new(),
     })
 }
@@ -1698,6 +2187,68 @@ fn proto_relation(relation: &StoredGraphRelation) -> GraphRelation {
     }
 }
 
+fn proto_fact(fact: &StoredGraphFact) -> GraphFact {
+    GraphFact {
+        fact_id: fact.fact_id.clone(),
+        text: fact.text.clone(),
+        fact_type: fact.fact_type.clone(),
+        context: fact.context.clone(),
+        occurred_start_ms: fact.occurred_start_ms,
+        occurred_end_ms: fact.occurred_end_ms,
+        mentioned_at_ms: fact.mentioned_at_ms,
+        learned_at_ms: fact.learned_at_ms,
+        entity_ids: fact.entity_ids.iter().cloned().collect(),
+        causal_fact_ids: fact.causal_fact_ids.iter().cloned().collect(),
+        confidence: fact.confidence,
+        status: fact.status.clone(),
+        source_memory_ids: fact
+            .evidence
+            .iter()
+            .map(|evidence| evidence.source_memory_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect(),
+        evidence: fact
+            .evidence
+            .iter()
+            .map(proto_candidate_evidence_from_graph)
+            .collect(),
+        derived_scope: Some(graph_derived_scope(&fact.scope)),
+        provider_id: fact.provider_id.clone(),
+        model_id: fact.model_id.clone(),
+        prompt_version: fact.prompt_version.clone(),
+        schema_version: fact.schema_version.clone(),
+        embedding_generation_id: fact.embedding_generation_id.clone(),
+    }
+}
+
+fn proto_observation(observation: &StoredGraphObservation) -> GraphObservation {
+    GraphObservation {
+        observation_id: observation.observation_id.clone(),
+        statement: observation.statement.clone(),
+        derived_scope: Some(graph_derived_scope(&observation.scope)),
+        source_fact_ids: observation.source_fact_ids.iter().cloned().collect(),
+        source_memory_ids: observation.source_memory_ids.iter().cloned().collect(),
+        proof_count: observation.proof_count,
+        confidence: observation.confidence,
+        consolidated_through_revision: observation.consolidated_through_revision.clone(),
+        freshness: observation.freshness.clone(),
+        supersedes_observation_ids: observation
+            .supersedes_observation_ids
+            .iter()
+            .cloned()
+            .collect(),
+        provider_id: observation.provider_id.clone(),
+        model_id: observation.model_id.clone(),
+        prompt_version: observation.prompt_version.clone(),
+        schema_version: observation.schema_version.clone(),
+        created_at_ms: observation.created_at_ms,
+        updated_at_ms: observation.updated_at_ms,
+        reviewed: observation.reviewed,
+        embedding_generation_id: observation.embedding_generation_id.clone(),
+    }
+}
+
 fn proto_run_receipt(run: &crate::graph::GraphRun) -> GraphRunReceipt {
     GraphRunReceipt {
         extraction_run_id: run.extraction_run_id.clone(),
@@ -1707,10 +2258,15 @@ fn proto_run_receipt(run: &crate::graph::GraphRun) -> GraphRunReceipt {
         source_count: run.source_count,
         accepted_entity_count: run.accepted_entity_count,
         accepted_relation_count: run.accepted_relation_count,
+        accepted_fact_count: run.accepted_fact_count,
+        accepted_observation_count: run.accepted_observation_count,
         rejected_candidate_count: run.rejected_candidate_count,
         conflict_count: run.conflict_count,
         warning_count: run.warning_count,
         terminal: run.terminal,
+        input_bytes: run.input_bytes,
+        output_bytes: run.output_bytes,
+        latency_ms: run.latency_ms,
     }
 }
 
@@ -1912,9 +2468,15 @@ fn stored_len_exceeded(
     memories: &[GraphMemorySearchResult],
     entities: &[GraphEntitySearchResult],
     relations: &[GraphRelationSearchResult],
+    facts: &[GraphFactSearchResult],
+    observations: &[GraphObservationSearchResult],
     max: usize,
 ) -> bool {
-    memories.len() >= max || entities.len() >= max || relations.len() >= max
+    memories.len() >= max
+        || entities.len() >= max
+        || relations.len() >= max
+        || facts.len() >= max
+        || observations.len() >= max
 }
 
 #[cfg(test)]

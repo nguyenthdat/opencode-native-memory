@@ -1,0 +1,13 @@
+# PaddleOCR-VL 1.6 weight manifest — re-hosted at xberg-io/paddleocr-vl-1.6, a
+# byte-identical mirror of PaddlePaddle/PaddleOCR-VL-1.6 (Apache-2.0). Single source of
+# truth: the runtime staging path (model_stager.rs, via include_str!) reads this file.
+# Update the model → edit here only.
+#
+# PaddleOCR-VL 1.6 keeps the same architecture as 1.5 (SigLIP vision encoder + ERNIE
+# 4.5 text decoder) and ships weights as a single unsharded model.safetensors file, so
+# there is no shard set to enumerate.
+ce7f4565f8b1db78532ad5d1b9ebe55c2139d49bd4cb04778b580a08a598f171  config.json
+111872ab1e8bb7fd040ac5087bfced7ab8f011f02139b088cba294964c3b1d0e  preprocessor_config.json
+c8a215a59183d0d0781adc33bacd3ce6162716f7fd568fb30234a74d69803a7d  tokenizer.json
+a6701d78ab3b4d972307cdec3b69d4c13f46e0d5140514f50ab7d84259324b94  generation_config.json
+85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db  model.safetensors

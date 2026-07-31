@@ -1,0 +1,112 @@
+//! Fast probabilistic gating to reject obvious non-secrets before heavy ML scoring.
+//!
+//! Uses character diversity and simple bigram analysis to identify high-entropy noise
+//! like UUIDs, hashes, and base64-encoded binary that doesn't look like a secret.
+
+/// A tiny statistical gate for fast candidate rejection.
+pub(crate) struct ProbabilisticGate;
+
+impl ProbabilisticGate {
+    /// Returns true if the candidate string looks like a potential secret.
+    /// Returns false if it's almost certainly noise (UUID, hash, etc).
+    pub(crate) fn looks_promising(s: &str) -> bool {
+        if s.len() < 16 {
+            return true; // Too short for reliable gating
+        }
+
+        let mut count = 0;
+        let mut seen = [false; 256];
+        for b in s.bytes() {
+            if !seen[b as usize] {
+                seen[b as usize] = true;
+                count += 1;
+                if count >= 5 {
+                    break;
+                }
+            }
+        }
+
+        // UUID detection: exactly 4 dashes in 8-4-4-4-12 hex pattern.
+        // Allocation-free, UTF-8 iteration-free optimized byte scanner.
+        if s.len() >= 32 && s.len() <= 40 {
+            let bytes = s.as_bytes();
+            let dash_count = bytes.iter().filter(|&&b| b == b'-').count();
+            if dash_count == 4 {
+                let mut valid = true;
+                let mut current_len = 0;
+                let mut part_count = 0;
+                for &b in bytes {
+                    if b == b'-' {
+                        if current_len == 0 {
+                            valid = false;
+                            break;
+                        }
+                        current_len = 0;
+                        part_count += 1;
+                    } else if b.is_ascii_hexdigit() {
+                        current_len += 1;
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid && current_len > 0 {
+                    part_count += 1;
+                }
+                if valid && part_count == 5 {
+                    return false;
+                }
+            }
+        }
+
+        // Extremely low diversity (e.g. "aaaaaaaaaaaaaaaa") is rejected
+        if count < 5 {
+            return false;
+        }
+
+        // Lightweight approximation of a full bigram frequency table.
+        //
+        // Real secrets are alphabet-restricted but bigram-distributed: a
+        // base64 token has roughly uniform bigram frequencies, while a SHA
+        // hex digest has STRONGLY skewed frequencies (only 16 chars × 16
+        // bigrams = 256 possible bigrams, so any 32-char hex string visits
+        // ~31 of those 256). UUIDs without dashes are an extreme case.
+        //
+        // The cheap proxy: count distinct bigrams in s and require a
+        // minimum density. For a length-N candidate with K distinct chars,
+        // a uniform-random base64 string visits ~min(N-1, K^2)
+        // distinct bigrams; a hex string maxes out at 256 regardless of
+        // length. We require distinct_bigrams >= length / 4 (very lax) AND
+        // distinct_bigrams >= 8 (absolute floor for short candidates).
+        // These bounds reject 32-hex SHAs (which have ~28 distinct bigrams
+        // on 32 chars) very rarely - they pass - while killing pure-base64
+        // UUID-without-dashes pads.
+        //
+        // We compute distinct bigrams via a 64-byte (512-bit) bitset over
+        // a cheap deterministic 9-bit byte-pair mix. This gate is a
+        // lossy statistical screen, so paying two FNV rounds per adjacent
+        // byte pair is unnecessary hot-path work.
+        let bytes = s.as_bytes();
+        if bytes.len() >= 32 {
+            let mut bigram_seen = [0u64; 8]; // 512 bits ≈ 0.6% FP at 28 bigrams
+            for window in bytes.windows(2) {
+                let h = bigram_slot_512(window[0], window[1]);
+                bigram_seen[h >> 6] |= 1u64 << (h & 63);
+            }
+            let distinct: u32 = bigram_seen.iter().map(|w| w.count_ones()).sum();
+            let length_floor = (bytes.len() / 4) as u32;
+            if distinct < 8 || distinct < length_floor {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+#[inline]
+fn bigram_slot_512(a: u8, b: u8) -> usize {
+    let a = a as usize;
+    let b = b as usize;
+    (a.wrapping_mul(33) ^ b.wrapping_mul(17) ^ (a << 1) ^ (b >> 3)) & 0x01ff
+}

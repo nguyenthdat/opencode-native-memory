@@ -32,6 +32,27 @@ const validCandidates: GraphExtractionCandidates = {
       confidence: 0.91,
     },
   ],
+  facts: [
+    {
+      text: "OpenCode Memory uses zvec.",
+      fact_type: "world",
+      context: "Storage architecture",
+      occurred_start_ms: 1_700_000_000_000,
+      occurred_end_ms: 1_700_000_000_001,
+      mentioned_at_ms: 1_700_000_000_002,
+      entity_mentions: ["OpenCode Memory", "zvec"],
+      causal_fact_indexes: [],
+      evidence: [{ source_unit_id: "unit-1", quote: "OpenCode Memory uses zvec." }],
+      confidence: 0.93,
+    },
+  ],
+  observations: [
+    {
+      statement: "OpenCode Memory depends on zvec for storage.",
+      source_fact_indexes: [0],
+      confidence: 0.89,
+    },
+  ],
 };
 
 class FakeGraphClient implements GraphExtractionClient {
@@ -130,6 +151,7 @@ describe("OpenCode graph extractor", () => {
       format: { type: "json_schema", retryCount: 2 },
     });
     expect(client.promptCalls[0]?.parameters.system).toContain("untrusted evidence");
+    expect(client.promptCalls[0]?.parameters.system).toContain("64 facts");
     expect(client.promptCalls[0]?.options?.signal).toBeInstanceOf(AbortSignal);
     expect(client.deleteCalls).toEqual(["graph-session"]);
     expect(sessionChanges).toEqual([
@@ -140,7 +162,11 @@ describe("OpenCode graph extractor", () => {
 
   test("rejects malformed structured output and deletes the session", async () => {
     const client = new FakeGraphClient();
-    client.promptResult = { data: { info: { structured: { entities: "bad", relations: [] } } } };
+    client.promptResult = {
+      data: {
+        info: { structured: { entities: "bad", relations: [], facts: [], observations: [] } },
+      },
+    };
 
     await expect(
       createExtractor(client).extract([{ source_unit_id: "unit-1", text: "evidence" }]),
@@ -156,6 +182,57 @@ describe("OpenCode graph extractor", () => {
       createExtractor(client).extract([{ source_unit_id: "unit-1", text: "evidence" }]),
     ).rejects.toThrow("provider unavailable");
     expect(client.deleteCalls).toEqual(["graph-session"]);
+  });
+
+  test("validates fact evidence against submitted source units", async () => {
+    const client = new FakeGraphClient();
+    client.promptResult = {
+      data: {
+        info: {
+          structured: {
+            ...validCandidates,
+            facts: [
+              {
+                ...validCandidates.facts[0],
+                evidence: [{ source_unit_id: "unknown-unit", quote: "unsupported" }],
+              },
+            ],
+          },
+        },
+      },
+    };
+
+    await expect(
+      createExtractor(client).extract([{ source_unit_id: "unit-1", text: "evidence" }]),
+    ).rejects.toThrow("evidence references unknown source_unit_id: unknown-unit");
+    expect(client.deleteCalls).toEqual(["graph-session"]);
+  });
+
+  test("rejects invalid fact types", () => {
+    expect(() =>
+      validateGraphExtractionCandidates({
+        ...validCandidates,
+        facts: [{ ...validCandidates.facts[0], fact_type: "opinion" }],
+      }),
+    ).toThrow("facts[0].fact_type must be world or experience");
+  });
+
+  test("rejects causal references to the current or a future fact", () => {
+    expect(() =>
+      validateGraphExtractionCandidates({
+        ...validCandidates,
+        facts: [{ ...validCandidates.facts[0], causal_fact_indexes: [1] }],
+      }),
+    ).toThrow("facts[0].causal_fact_indexes[0] must reference an earlier fact");
+  });
+
+  test("rejects observation references outside the facts array", () => {
+    expect(() =>
+      validateGraphExtractionCandidates({
+        ...validCandidates,
+        observations: [{ ...validCandidates.observations[0], source_fact_indexes: [1] }],
+      }),
+    ).toThrow("observations[0].source_fact_indexes[0] must reference a fact in facts");
   });
 
   test("honors cancellation before and after the provider call", async () => {
@@ -185,18 +262,21 @@ describe("OpenCode graph extractor", () => {
   test("enforces candidate, name, quote, and total JSON limits", () => {
     expect(() =>
       validateGraphExtractionCandidates({
+        ...validCandidates,
         entities: Array.from({ length: 65 }, () => validCandidates.entities[0]),
         relations: [],
       }),
     ).toThrow("at most 64");
     expect(() =>
       validateGraphExtractionCandidates({
+        ...validCandidates,
         entities: [{ ...validCandidates.entities[0], mention: "n".repeat(513) }],
         relations: [],
       }),
     ).toThrow("at most 512 characters");
     expect(() =>
       validateGraphExtractionCandidates({
+        ...validCandidates,
         entities: [
           {
             ...validCandidates.entities[0],
@@ -208,6 +288,7 @@ describe("OpenCode graph extractor", () => {
     ).toThrow("at most 1024 characters");
     expect(() =>
       validateGraphExtractionCandidates({
+        ...validCandidates,
         entities: [
           {
             ...validCandidates.entities[0],
@@ -220,6 +301,12 @@ describe("OpenCode graph extractor", () => {
         relations: [],
       }),
     ).toThrow("must not exceed 262144 bytes");
+    expect(() =>
+      validateGraphExtractionCandidates({
+        ...validCandidates,
+        facts: Array.from({ length: 65 }, () => validCandidates.facts[0]),
+      }),
+    ).toThrow("facts must contain at most 64 candidates");
   });
 
   test("bounds structured-output retries", () => {

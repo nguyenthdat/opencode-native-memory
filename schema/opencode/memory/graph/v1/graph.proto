@@ -44,6 +44,7 @@ message GraphSourceBinding {
   string origin = 6;
   string policy_revision = 7; // required
   bool remote_eligible = 8;
+  uint64 reference_time_ms = 9;
 }
 
 message GraphExtractionUnit {
@@ -95,6 +96,25 @@ message GraphRelationCandidate {
   double confidence = 8;
 }
 
+message GraphFactCandidate {
+  string text = 1; // required
+  string fact_type = 2; // world or experience
+  string context = 3;
+  optional uint64 occurred_start_ms = 4;
+  optional uint64 occurred_end_ms = 5;
+  optional uint64 mentioned_at_ms = 6;
+  repeated string entity_mentions = 7;
+  repeated uint32 causal_fact_indexes = 8;
+  repeated GraphCandidateEvidence evidence = 9;
+  double confidence = 10;
+}
+
+message GraphObservationCandidate {
+  string statement = 1; // required
+  repeated uint32 source_fact_indexes = 2;
+  double confidence = 3;
+}
+
 message GraphRunReceipt {
   string extraction_run_id = 1;
   string idempotency_digest = 2;
@@ -107,6 +127,11 @@ message GraphRunReceipt {
   uint64 conflict_count = 9;
   uint64 warning_count = 10;
   bool terminal = 11;
+  uint64 accepted_fact_count = 12;
+  uint64 accepted_observation_count = 13;
+  uint64 input_bytes = 14;
+  uint64 output_bytes = 15;
+  uint64 latency_ms = 16;
 }
 
 message GraphAcceptedEntity {
@@ -127,6 +152,25 @@ message GraphAcceptedRelation {
   string relation_type = 6;
   GraphDerivedScope derived_scope = 7;
   repeated GraphCandidateEvidence evidence = 8;
+}
+
+message GraphAcceptedFact {
+  uint32 candidate_index = 1;
+  string fact_id = 2;
+  string fact_type = 3;
+  string status = 4;
+  GraphDerivedScope derived_scope = 5;
+  repeated string source_memory_ids = 6;
+  repeated GraphCandidateEvidence evidence = 7;
+}
+
+message GraphAcceptedObservation {
+  uint32 candidate_index = 1;
+  string observation_id = 2;
+  string freshness = 3;
+  uint64 proof_count = 4;
+  GraphDerivedScope derived_scope = 5;
+  repeated string source_fact_ids = 6;
 }
 
 message GraphRejectedCandidate {
@@ -208,6 +252,64 @@ message GraphRelationSearchResult {
   repeated GraphScoreComponent score_trace = 4;
 }
 
+message GraphFact {
+  string fact_id = 1;
+  string text = 2;
+  string fact_type = 3;
+  string context = 4;
+  optional uint64 occurred_start_ms = 5;
+  optional uint64 occurred_end_ms = 6;
+  optional uint64 mentioned_at_ms = 7;
+  uint64 learned_at_ms = 8;
+  repeated string entity_ids = 9;
+  repeated string causal_fact_ids = 10;
+  double confidence = 11;
+  string status = 12;
+  repeated string source_memory_ids = 13;
+  repeated GraphCandidateEvidence evidence = 14;
+  GraphDerivedScope derived_scope = 15;
+  string provider_id = 16;
+  string model_id = 17;
+  string prompt_version = 18;
+  string schema_version = 19;
+  string embedding_generation_id = 20;
+}
+
+message GraphObservation {
+  string observation_id = 1;
+  string statement = 2;
+  GraphDerivedScope derived_scope = 3;
+  repeated string source_fact_ids = 4;
+  repeated string source_memory_ids = 5;
+  uint64 proof_count = 6;
+  double confidence = 7;
+  string consolidated_through_revision = 8;
+  string freshness = 9;
+  repeated string supersedes_observation_ids = 10;
+  string provider_id = 11;
+  string model_id = 12;
+  string prompt_version = 13;
+  string schema_version = 14;
+  uint64 created_at_ms = 15;
+  uint64 updated_at_ms = 16;
+  bool reviewed = 17;
+  string embedding_generation_id = 18;
+}
+
+message GraphFactSearchResult {
+  GraphFact fact = 1;
+  double score = 2;
+  repeated GraphEvidenceProvenance provenance = 3;
+  repeated GraphScoreComponent score_trace = 4;
+}
+
+message GraphObservationSearchResult {
+  GraphObservation observation = 1;
+  double score = 2;
+  repeated GraphEvidenceProvenance provenance = 3;
+  repeated GraphScoreComponent score_trace = 4;
+}
+
 message GraphLastExtraction {
   string extraction_run_id = 1;
   uint64 completed_at_ms = 2;
@@ -242,6 +344,11 @@ message GraphUpsertCandidatesRequest {
   GraphProviderIdentity provider = 4; // required
   repeated GraphEntityCandidate entities = 5;
   repeated GraphRelationCandidate relations = 6;
+  repeated GraphFactCandidate facts = 7;
+  repeated GraphObservationCandidate observations = 8;
+  uint64 input_bytes = 9;
+  uint64 output_bytes = 10;
+  uint64 latency_ms = 11;
 }
 
 message GraphUpsertCandidatesResponse {
@@ -251,6 +358,8 @@ message GraphUpsertCandidatesResponse {
   repeated GraphRejectedCandidate rejected_candidates = 4;
   repeated GraphCandidateConflict conflicts = 5;
   repeated string warnings = 6;
+  repeated GraphAcceptedFact accepted_facts = 7;
+  repeated GraphAcceptedObservation accepted_observations = 8;
 }
 
 enum GraphExtractionJobState {
@@ -347,6 +456,11 @@ message GraphExtractFinishRequest {
   repeated GraphRelationCandidate relations = 7;
   string error_code = 8;
   string error_message = 9;
+  repeated GraphFactCandidate facts = 10;
+  repeated GraphObservationCandidate observations = 11;
+  uint64 input_bytes = 12;
+  uint64 output_bytes = 13;
+  uint64 latency_ms = 14;
 }
 
 message GraphExtractFinishResponse {
@@ -397,6 +511,9 @@ message GraphTimeFilter {
   // Inclusive extraction-time bounds.
   optional uint64 extracted_after_ms = 3;
   optional uint64 extracted_before_ms = 4;
+  optional uint64 occurred_after_ms = 5;
+  optional uint64 occurred_before_ms = 6;
+  optional uint64 reference_time_ms = 7;
 }
 
 message GraphSearchRequest {
@@ -416,6 +533,8 @@ message GraphSearchResponse {
   repeated GraphRelationSearchResult relations = 3;
   uint64 eligible_source_count = 4;
   bool truncated = 5;
+  repeated GraphFactSearchResult facts = 6;
+  repeated GraphObservationSearchResult observations = 7;
 }
 
 message GraphStatusRequest {
@@ -429,6 +548,8 @@ message GraphStatusResponse {
   uint64 relation_count = 3;
   uint64 pending_job_count = 4;
   optional GraphLastExtraction last_extraction = 5;
+  uint64 fact_count = 6;
+  uint64 observation_count = 7;
 }
 
 message GraphExportRequest {
@@ -445,6 +566,20 @@ message GraphExportResponse {
   repeated GraphExportProvenance provenance = 4;
   optional string next_cursor = 5;
   bool complete = 6;
+  repeated GraphFact facts = 7;
+  repeated GraphObservation observations = 8;
+}
+
+message GraphObservationActionRequest {
+  GraphAuthorization authorization = 1; // required
+  string observation_id = 2; // required
+  string action = 3; // review, edit, invalidate, restore
+  optional string statement = 4;
+}
+
+message GraphObservationActionResponse {
+  GraphObservation observation = 1; // required
+  string outcome = 2;
 }
 
 message GraphRequest {
@@ -462,6 +597,7 @@ message GraphRequest {
     GraphExtractFinishRequest extract_finish = 19;
     GraphExtractJobStatusRequest extract_job_status = 20;
     GraphExtractCancelRequest extract_cancel = 21;
+    GraphObservationActionRequest observation_action = 22;
   }
 }
 
@@ -481,5 +617,6 @@ message GraphResponse {
     GraphExtractFinishResponse extract_finish = 19;
     GraphExtractJobStatusResponse extract_job_status = 20;
     GraphExtractCancelResponse extract_cancel = 21;
+    GraphObservationActionResponse observation_action = 22;
   }
 }

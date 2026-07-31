@@ -22,6 +22,7 @@ import type {
   GraphExtractFinishResponse,
   GraphExtractJobStatusResponse,
   GraphExtractRenewResponse,
+  GraphObservationActionResponse,
   GraphExtractionJob,
   GraphExtractionUnit,
   GraphProviderIdentity,
@@ -33,7 +34,6 @@ import {
   WRITABLE_MEMORY_SCOPES,
   FEEDBACK_EVENTS,
   LOCK_ACTIONS,
-  MEMORY_TAXONOMIES,
   RETRIEVAL_MODES,
   isUserProfileTaxonomy,
 } from "./contracts.js";
@@ -72,12 +72,20 @@ import {
 import { DEFAULT_OPTIMIZE_DEBOUNCE_MS, MemoryMaintenanceScheduler } from "./maintenance.js";
 import { requestIdempotently } from "./outcome-reconciliation.js";
 import { captureWithOutcomeReconciliation } from "./capture-reconciliation.js";
+import {
+  MEMORY_TAXONOMY_INPUTS,
+  normalizeCreateTaxonomy,
+  normalizeTaxonomyFilters,
+  normalizeUpdateTaxonomy,
+} from "./taxonomy-compat.js";
 
 export interface MemoryPluginOptions {
   root: string;
   warmup?: boolean;
   automaticRecall?: boolean;
   automaticCapture?: boolean;
+  automaticRetain?: boolean;
+  automaticRetainSources?: readonly AutomaticRetainSource[];
   automaticDocumentIndex?: boolean;
   documentIndexDebounceMs?: number;
   automaticOptimize?: boolean;
@@ -87,6 +95,9 @@ export interface MemoryPluginOptions {
   minScore?: number;
   projectRoot?: string;
 }
+
+export const AUTOMATIC_RETAIN_SOURCES = ["document", "compaction", "tool_outcome"] as const;
+export type AutomaticRetainSource = (typeof AUTOMATIC_RETAIN_SOURCES)[number];
 
 type GraphPreparedUnit = GraphExtractionUnit;
 
@@ -100,8 +111,8 @@ const GRAPH_JOB_LEASE_MS = 60_000;
 const GRAPH_JOB_RENEW_INTERVAL_MS = 20_000;
 const GRAPH_JOB_POLL_MS = 1_000;
 const GRAPH_EXTRACTOR_VERSION = "opencode-sdk-v2-json-schema-v1";
-const GRAPH_PROMPT_VERSION = "knowledge-graph-extraction-v1";
-const GRAPH_CANDIDATE_SCHEMA_VERSION = "knowledge-graph-candidates-v1";
+const GRAPH_PROMPT_VERSION = "knowledge-graph-extraction-v2";
+const GRAPH_CANDIDATE_SCHEMA_VERSION = "knowledge-graph-candidates-v2";
 
 export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
   return async ({ client: opencode, directory, worktree, serverUrl }) => {
@@ -150,6 +161,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
     const graphWork = new Map<string, GraphAuthorizationContract>();
     const graphDiscoveries = new Map<string, GraphAuthorizationContract>();
     const graphAttemptAborts = new Map<string, AbortController>();
+    const retainedToolParts = new Set<string>();
     const modelSwitchMonitors = new Set<string>();
     let graphWorker: Promise<void> | undefined;
 
@@ -264,8 +276,9 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
       });
 
       let candidates: GraphExtractionCandidates | undefined;
-      let candidatePayload: ReturnType<typeof graphCandidatePayload> | undefined;
+      let candidatePayload: GraphCandidatePayload | undefined;
       let extractionFailure: Error | undefined;
+      const extractionStartedAt = performance.now();
       try {
         const extractor = createGraphExtractor(
           { serverUrl, directory },
@@ -287,7 +300,21 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
           })),
           attemptSignal,
         );
-        candidatePayload = graphCandidatePayload(candidates);
+        const basePayload = graphCandidatePayload(candidates);
+        const inputBytes = units.reduce(
+          (total, unit) => total + new TextEncoder().encode(unit.text).byteLength,
+          0,
+        );
+        const latencyMs = Math.max(0, Math.round(performance.now() - extractionStartedAt));
+        candidatePayload = {
+          ...basePayload,
+          input_bytes: inputBytes,
+          output_bytes: 0,
+          latency_ms: latencyMs,
+        };
+        candidatePayload.output_bytes = new TextEncoder().encode(
+          JSON.stringify(candidatePayload),
+        ).byteLength;
       } catch (error) {
         extractionFailure = asPluginError(error);
       } finally {
@@ -429,6 +456,58 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
       if (graphWorkerAbort.signal.aborted) return;
       graphDiscoveries.set(graphAuthorizationKey(authorization), authorization);
       startGraphWorker();
+    };
+
+    const enqueueGraphRetain = async (
+      sourceMemoryIDs: readonly string[],
+      authorization: GraphAuthorizationContract,
+      model: { providerID: string; modelID: string; variant?: string },
+      signal: AbortSignal,
+    ): Promise<GraphExtractEnqueueResponse | undefined> => {
+      const prepared = await native.request<GraphPrepareResponse>(
+        "graph_extract_prepare",
+        {
+          authorization,
+          source_memory_ids: [...sourceMemoryIDs],
+          max_units: 32,
+          max_unit_text_bytes: 16 * 1_024,
+          max_total_text_bytes: 128 * 1_024,
+        },
+        signal,
+      );
+      const eligible = prepared.units.filter(
+        (unit): unit is GraphPreparedUnit & { source: GraphSourceBinding } =>
+          unit.source?.remote_eligible === true,
+      );
+      if (eligible.length === 0) return undefined;
+      const provider = {
+        provider_id: model.providerID,
+        model_id: model.modelID,
+        extractor_version: GRAPH_EXTRACTOR_VERSION,
+        prompt_version: GRAPH_PROMPT_VERSION,
+        schema_version: GRAPH_CANDIDATE_SCHEMA_VERSION,
+        ...(model.variant === undefined ? {} : { variant: model.variant }),
+      } satisfies GraphProviderIdentity;
+      const jobID = graphExtractionJobID(
+        eligible.map((unit) => unit.source),
+        provider,
+        2,
+      );
+      const response = await native.request<GraphExtractEnqueueResponse>(
+        "graph_extract_enqueue",
+        {
+          authorization,
+          job_id: jobID,
+          source_memory_ids: eligible.map((unit) => unit.source.source_memory_id),
+          provider,
+          max_attempts: 2,
+          max_unit_text_bytes: 16 * 1_024,
+          max_total_text_bytes: 128 * 1_024,
+        },
+        signal,
+      );
+      if (response.job) scheduleGraphJob(response.job.job_id, authorization);
+      return response;
     };
 
     const syncSharedMemories = async (force = false): Promise<void> => {
@@ -605,6 +684,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions): Plugin {
         graphWork.clear();
         graphDiscoveries.clear();
         graphAttemptAborts.clear();
+        retainedToolParts.clear();
         modelSwitchMonitors.clear();
         await maintenance.dispose();
         await ingestJobs.dispose();
@@ -666,6 +746,58 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           await session.closePendingRecall(event.properties.sessionID, "error");
           return;
         }
+        if (event.type === "message.part.updated") {
+          const part = event.properties.part;
+          if (
+            !settings.automaticRetain ||
+            !settings.automaticRetainSources.includes("tool_outcome") ||
+            part.type !== "tool" ||
+            (part.state.status !== "completed" && part.state.status !== "error") ||
+            extractionSessions.has(part.sessionID) ||
+            retainedToolParts.has(part.id)
+          ) {
+            return;
+          }
+          retainedToolParts.add(part.id);
+          if (retainedToolParts.size > 2_048) {
+            const oldest = retainedToolParts.values().next().value;
+            if (oldest !== undefined) retainedToolParts.delete(oldest);
+          }
+          try {
+            const model = graphModels.get(part.sessionID);
+            if (!model) return;
+            const agent = session.sessionAgents.get(part.sessionID) ?? "unknown";
+            const scopeKey = await session.scopeKey("session", part.sessionID, agent);
+            const durationMs = Math.max(0, part.state.time.end - part.state.time.start);
+            const title = part.state.status === "completed" ? part.state.title : "tool failed";
+            const source = await native.request<{ id: string }>("store", {
+              content: [
+                `Tool: ${truncateText(part.tool, 128)}`,
+                `Outcome: ${part.state.status === "completed" ? "success" : "error"}`,
+                `Title: ${truncateText(title, 512)}`,
+                `Duration: ${durationMs} ms`,
+              ].join("\n"),
+              title: `Tool outcome: ${truncateText(part.tool, 96)}`,
+              kind: "fact",
+              importance: 0.4,
+              tags: ["automatic-retain", "tool-outcome"],
+              source: `session:${part.sessionID}:tool:${part.callID}`,
+              scope: "session",
+              scope_key: scopeKey,
+              origin: "auto_compaction",
+              expires_in_days: 30,
+              code_paths: [],
+              revive: false,
+              taxonomy: "tool_call",
+              confidence: 0.6,
+            });
+            const authorization = await graphAuthorization(part.sessionID, agent);
+            await enqueueGraphRetain([source.id], authorization, model, graphWorkerAbort.signal);
+          } catch (error) {
+            session.warnOnce(error);
+          }
+          return;
+        }
         if (event.type === "file.edited" || event.type === "file.watcher.updated") {
           session.invalidateRecall();
           const file = event.properties.file.replaceAll("\\", "/");
@@ -677,7 +809,9 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
         }
         if (event.type !== "session.compacted") return;
         if (extractionSessions.has(event.properties.sessionID)) return;
-        if (!settings.automaticCapture) return;
+        const retainCompaction =
+          settings.automaticRetain && settings.automaticRetainSources.includes("compaction");
+        if (!settings.automaticCapture && !retainCompaction) return;
 
         try {
           const response = await opencode.session.messages({
@@ -694,7 +828,9 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             .join("\n")
             .trim();
           if (!content) return;
-          const candidates = parseCuratedCandidates(content, extractDirectUserEvidence(messages));
+          const candidates = settings.automaticCapture
+            ? parseCuratedCandidates(content, extractDirectUserEvidence(messages))
+            : [];
           let storedAny = false;
           for (const candidate of candidates) {
             try {
@@ -723,6 +859,31 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           if (storedAny) {
             session.invalidateRecall();
             maintenance.schedule();
+          }
+          if (retainCompaction) {
+            const model = graphModels.get(event.properties.sessionID);
+            if (model) {
+              const agent = session.sessionAgents.get(event.properties.sessionID) ?? "unknown";
+              const scopeKey = await session.scopeKey("session", event.properties.sessionID, agent);
+              const source = await native.request<{ id: string }>("store", {
+                content: truncateText(content, 16_000),
+                title: "Session compaction retain source",
+                kind: "summary",
+                importance: 0.4,
+                tags: ["automatic-retain", "session-summary"],
+                source: `session:${event.properties.sessionID}:retain-source`,
+                scope: "session",
+                scope_key: scopeKey,
+                origin: "auto_compaction",
+                expires_in_days: 30,
+                code_paths: [],
+                revive: false,
+                taxonomy: "session_summary",
+                confidence: 0.6,
+              });
+              const authorization = await graphAuthorization(event.properties.sessionID, agent);
+              await enqueueGraphRetain([source.id], authorization, model, graphWorkerAbort.signal);
+            }
           }
         } catch (error) {
           session.warnOnce(error);
@@ -1067,6 +1228,8 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                   source_count: eligible.length,
                   entity_count: candidates.entities.length,
                   relation_count: candidates.relations.length,
+                  fact_count: candidates.facts.length,
+                  observation_count: candidates.observations.length,
                 },
               );
             }
@@ -1248,6 +1411,96 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             });
           },
         }),
+        memory_reflect: tool({
+          description:
+            "Build a bounded, citation-ready reflection packet from current graph facts and observations without persisting generated synthesis.",
+          args: {
+            query: tool.schema.string().min(1).max(2_000),
+            limit: tool.schema.number().int().min(1).max(32).default(12),
+            as_of_ms: tool.schema.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+          },
+          async execute(args, context) {
+            const authorization = await graphAuthorization(context.sessionID, context.agent);
+            const response = await native.request<GraphSearchResponse>(
+              "graph_search",
+              {
+                authorization,
+                query: args.query,
+                ...(args.as_of_ms === undefined
+                  ? {}
+                  : {
+                      time: {
+                        valid_after_ms: args.as_of_ms,
+                        valid_before_ms: args.as_of_ms,
+                        reference_time_ms: args.as_of_ms,
+                      },
+                    }),
+                max_depth: 2,
+                max_fanout: 16,
+                max_results: args.limit,
+                max_evidence_per_fact: 8,
+              },
+              context.abort,
+            );
+            const citations = [
+              ...response.memories.flatMap((item) => item.provenance),
+              ...response.entities.flatMap((item) => item.provenance),
+              ...response.relations.flatMap((item) => item.provenance),
+              ...response.facts.flatMap((item) => item.provenance),
+              ...response.observations.flatMap((item) => item.provenance),
+            ]
+              .map((item) => item.source_memory_id)
+              .filter((id, index, values) => values.indexOf(id) === index);
+            const noAnswer =
+              response.memories.length === 0 &&
+              response.entities.length === 0 &&
+              response.relations.length === 0 &&
+              response.facts.length === 0 &&
+              response.observations.length === 0;
+            return result(
+              "Memory reflection evidence",
+              {
+                query: args.query,
+                no_answer: noAnswer,
+                citations,
+                facts: response.facts,
+                observations: response.observations,
+                entities: response.entities,
+                relations: response.relations,
+              },
+              { query: args.query, citation_count: citations.length, no_answer: noAnswer },
+            );
+          },
+        }),
+        memory_graph_observation_action: tool({
+          description:
+            "Review, edit, invalidate, or restore a source-backed knowledge graph observation.",
+          args: {
+            observation_id: tool.schema.string().min(1).max(128),
+            action: tool.schema.enum(["review", "edit", "invalidate", "restore"] as const),
+            statement: tool.schema.string().max(2_000).optional(),
+          },
+          async execute(args, context) {
+            if (args.action === "edit" && !args.statement?.trim()) {
+              throw new Error("statement is required when editing an observation");
+            }
+            const authorization = await graphAuthorization(context.sessionID, context.agent);
+            const response = await native.request<GraphObservationActionResponse>(
+              "graph_observation_action",
+              {
+                authorization,
+                observation_id: args.observation_id,
+                action: args.action,
+                ...(args.statement === undefined ? {} : { statement: args.statement }),
+              },
+              context.abort,
+            );
+            return result("Updated knowledge graph observation", response, {
+              observation_id: args.observation_id,
+              outcome: response.outcome,
+            });
+          },
+        }),
         memory_graph_status: tool({
           description: "Inspect source-visible native knowledge graph counts and last extraction.",
           args: {},
@@ -1322,10 +1575,12 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .default([])
               .describe("Optional scopes to include."),
             taxonomies: tool.schema
-              .array(tool.schema.enum(MEMORY_TAXONOMIES))
-              .max(MEMORY_TAXONOMIES.length)
+              .array(tool.schema.enum(MEMORY_TAXONOMY_INPUTS))
+              .max(MEMORY_TAXONOMY_INPUTS.length)
               .default([])
-              .describe("Optional CoALA-derived taxonomies to include."),
+              .describe(
+                "Optional CoALA-derived taxonomies. Compatibility alias gotcha selects the gotcha memory kind and cannot be combined with taxonomy filters.",
+              ),
             min_score: tool.schema
               .number()
               .min(0)
@@ -1349,6 +1604,7 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             session.discardPendingRecall(context.sessionID);
             await syncProjectIndexes();
             const rootSessionID = await session.resolveSessionRoot(context.sessionID);
+            const filters = normalizeTaxonomyFilters(args.kinds, args.taxonomies);
             const response = await native.request<SearchResponse>(
               "search",
               {
@@ -1356,9 +1612,9 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                 retrieval_mode: args.retrieval_mode,
                 max_results: args.limit,
                 budget_chars: args.budget_chars,
-                kinds: args.kinds,
+                kinds: filters.kinds,
                 scopes: args.scopes,
-                taxonomies: args.taxonomies,
+                taxonomies: filters.taxonomies,
                 session_scope_key: rootSessionID,
                 agent_scope_key: context.agent,
                 min_score: args.min_score,
@@ -1443,10 +1699,10 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .default(false)
               .describe("Revive a tombstoned memory after user approval."),
             taxonomy: tool.schema
-              .enum(MEMORY_TAXONOMIES)
+              .enum(MEMORY_TAXONOMY_INPUTS)
               .optional()
               .describe(
-                "Explicit taxonomy. Use user_identity, user_behavior, user_preference, user_goal, or user_relationship only for information stated directly by default_user.",
+                "Explicit taxonomy. Compatibility alias gotcha is accepted only with kind gotcha and infers fix_pattern. Use user_identity, user_behavior, user_preference, user_goal, or user_relationship only for information stated directly by default_user.",
               ),
             evidence_quote: tool.schema
               .string()
@@ -1464,7 +1720,11 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .describe("Confidence in this memory; defaults from importance."),
           },
           async execute(args, context) {
-            const { evidence_quote: evidenceQuote, ...storeArgs } = args;
+            const { evidence_quote: evidenceQuote, ...rawStoreArgs } = args;
+            const storeArgs = {
+              ...rawStoreArgs,
+              taxonomy: normalizeCreateTaxonomy(args.kind, args.taxonomy),
+            };
             const userProfile = isUserProfileTaxonomy(storeArgs.taxonomy);
             if (userProfile) {
               const expectedKind = storeArgs.taxonomy === "user_preference" ? "preference" : "fact";
@@ -1534,7 +1794,12 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .boolean()
               .default(false)
               .describe("Revive matching tombstoned chunks after user approval."),
-            taxonomy: tool.schema.enum(MEMORY_TAXONOMIES).optional(),
+            taxonomy: tool.schema
+              .enum(MEMORY_TAXONOMY_INPUTS)
+              .optional()
+              .describe(
+                "Explicit taxonomy. Compatibility alias gotcha is accepted only with kind gotcha and infers fix_pattern.",
+              ),
             confidence: tool.schema.number().min(0).max(1).optional(),
           },
           async execute(args, context) {
@@ -1553,8 +1818,31 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               });
             }
             const scopeKey = await session.scopeKey(args.scope, context.sessionID, context.agent);
+            const retainModel =
+              settings.automaticRetain && settings.automaticRetainSources.includes("document")
+                ? graphModels.get(context.sessionID)
+                : undefined;
+            const retainAuthorization = retainModel
+              ? await graphAuthorization(context.sessionID, context.agent)
+              : undefined;
+            if (retainModel) {
+              await context.ask({
+                permission: "memory_graph_extract",
+                patterns: [`${retainModel.providerID}/${retainModel.modelID}`],
+                always: [],
+                metadata: {
+                  operation: "automatic_retain",
+                  trigger: "document_ingest",
+                  path: args.path,
+                },
+              });
+            }
             if (context.abort.aborted) throw new Error("Background memory ingestion was cancelled");
-            const request = { ...args, scope_key: scopeKey };
+            const request = {
+              ...args,
+              taxonomy: normalizeCreateTaxonomy(args.kind, args.taxonomy),
+              scope_key: scopeKey,
+            };
             const job = ingestJobs.enqueue(
               { path: args.path, scope: args.scope },
               async (signal) => {
@@ -1564,7 +1852,19 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
                   for (const warning of response.warnings) session.warnOnce(new Error(warning));
                   session.invalidateRecall();
                   maintenance.schedule();
-                  return response;
+                  const retain =
+                    retainModel && retainAuthorization
+                      ? await enqueueGraphRetain(
+                          response.memory_ids,
+                          retainAuthorization,
+                          retainModel,
+                          signal,
+                        )
+                      : undefined;
+                  return {
+                    ...response,
+                    ...(retain?.job ? { retain_job_id: retain.job.job_id } : {}),
+                  };
                 } catch (error) {
                   if (!signal.aborted) session.warnOnce(error);
                   throw error;
@@ -1664,9 +1964,12 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .max(MEMORY_SCOPES.length)
               .default([]),
             taxonomies: tool.schema
-              .array(tool.schema.enum(MEMORY_TAXONOMIES))
-              .max(MEMORY_TAXONOMIES.length)
-              .default([]),
+              .array(tool.schema.enum(MEMORY_TAXONOMY_INPUTS))
+              .max(MEMORY_TAXONOMY_INPUTS.length)
+              .default([])
+              .describe(
+                "Compatibility alias gotcha selects the gotcha memory kind and cannot be combined with taxonomy filters.",
+              ),
             include_expired: tool.schema.boolean().default(false),
             include_stale: tool.schema.boolean().default(false),
             include_superseded: tool.schema.boolean().default(false),
@@ -1676,9 +1979,15 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
           async execute(args, context) {
             await syncProjectIndexes();
             const keys = await session.managementScopeKeys(context.sessionID, context.agent);
+            const filters = normalizeTaxonomyFilters(args.kinds, args.taxonomies);
             const response = await native.request<ListResponse>(
               "list",
-              { ...args, ...keys },
+              {
+                ...args,
+                kinds: filters.kinds,
+                taxonomies: filters.taxonomies,
+                ...keys,
+              },
               context.abort,
             );
             return result("Memory list", response, {
@@ -1723,9 +2032,11 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
               .optional()
               .describe("Reason for locking the memory. Only valid with lock_action='lock'."),
             taxonomy: tool.schema
-              .enum(MEMORY_TAXONOMIES)
+              .enum(MEMORY_TAXONOMY_INPUTS)
               .optional()
-              .describe("Explicit reclassification; omit to preserve the current taxonomy."),
+              .describe(
+                "Explicit reclassification; omit to preserve the current taxonomy. Compatibility alias gotcha requires an effective gotcha kind and maps to fix_pattern.",
+              ),
             confidence: tool.schema.number().min(0).max(1).optional(),
             conflict_with: tool.schema
               .array(tool.schema.string().regex(/^mem_[0-9a-f]{32}$/))
@@ -1751,9 +2062,13 @@ Never modify repository-scoped memory through memory_update; edit its .opencode/
             const key = args.scope
               ? await session.scopeKey(args.scope, context.sessionID, context.agent)
               : undefined;
+            const updateArgs = {
+              ...args,
+              taxonomy: normalizeUpdateTaxonomy(args.kind ?? record.kind, args.taxonomy),
+            };
             const response = await native.request<Record<string, unknown>>(
               "update",
-              { ...args, scope_key: key, ...keys },
+              { ...updateArgs, scope_key: key, ...keys },
               context.abort,
             );
             session.invalidateRecall();
@@ -2093,6 +2408,8 @@ interface ResolvedMemoryPluginOptions {
   warmup: boolean;
   automaticRecall: boolean;
   automaticCapture: boolean;
+  automaticRetain: boolean;
+  automaticRetainSources: readonly AutomaticRetainSource[];
   automaticDocumentIndex: boolean;
   documentIndexDebounceMs: number;
   automaticOptimize: boolean;
@@ -2105,6 +2422,7 @@ interface ResolvedMemoryPluginOptions {
 export function resolveMemoryPluginOptions(
   options: MemoryPluginOptions,
 ): ResolvedMemoryPluginOptions {
+  const automaticRetainSources = resolveAutomaticRetainSources(options.automaticRetainSources);
   const minScore = options.minScore ?? envNumber("OPENCODE_MEMORY_MIN_SCORE", 0.42);
   if (!Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
     throw new Error("memory minScore must be between 0 and 1");
@@ -2132,6 +2450,8 @@ export function resolveMemoryPluginOptions(
     warmup: options.warmup ?? envBoolean("OPENCODE_MEMORY_WARMUP", true),
     automaticRecall: options.automaticRecall ?? envBoolean("OPENCODE_MEMORY_AUTO_RECALL", true),
     automaticCapture: options.automaticCapture ?? envBoolean("OPENCODE_MEMORY_AUTO_CAPTURE", true),
+    automaticRetain: options.automaticRetain ?? envBoolean("OPENCODE_MEMORY_AUTO_RETAIN", false),
+    automaticRetainSources,
     automaticDocumentIndex:
       options.automaticDocumentIndex ?? envBoolean("OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS", true),
     documentIndexDebounceMs,
@@ -2185,8 +2505,41 @@ function graphCandidatePayload(candidates: GraphExtractionCandidates) {
       })),
       confidence: candidate.confidence,
     })),
+    facts: candidates.facts.map((candidate) => ({
+      text: candidate.text,
+      fact_type: candidate.fact_type,
+      context: candidate.context,
+      ...(candidate.occurred_start_ms === undefined
+        ? {}
+        : { occurred_start_ms: candidate.occurred_start_ms }),
+      ...(candidate.occurred_end_ms === undefined
+        ? {}
+        : { occurred_end_ms: candidate.occurred_end_ms }),
+      ...(candidate.mentioned_at_ms === undefined
+        ? {}
+        : { mentioned_at_ms: candidate.mentioned_at_ms }),
+      entity_mentions: [...candidate.entity_mentions],
+      causal_fact_indexes: [...candidate.causal_fact_indexes],
+      evidence: candidate.evidence.map((evidence) => ({
+        source_unit_id: evidence.source_unit_id,
+        quote: evidence.quote,
+        occurrence_index: 0,
+      })),
+      confidence: candidate.confidence,
+    })),
+    observations: candidates.observations.map((candidate) => ({
+      statement: candidate.statement,
+      source_fact_indexes: [...candidate.source_fact_indexes],
+      confidence: candidate.confidence,
+    })),
   };
 }
+
+type GraphCandidatePayload = ReturnType<typeof graphCandidatePayload> & {
+  input_bytes: number;
+  output_bytes: number;
+  latency_ms: number;
+};
 
 function parseGraphTime(value: string | null | undefined): number | undefined {
   if (value === undefined || value === null || value.trim() === "") return undefined;
@@ -2220,6 +2573,7 @@ function graphExtractionJobID(
       origin: source.origin,
       policy_revision: source.policy_revision,
       remote_eligible: source.remote_eligible,
+      reference_time_ms: source.reference_time_ms,
     }))
     .toSorted((left, right) => left.source_memory_id.localeCompare(right.source_memory_id));
   const digest = createHash("sha256")
@@ -2245,6 +2599,25 @@ async function graphWorkerDelay(ms: number, signal: AbortSignal): Promise<void> 
     timer.unref?.();
     signal.addEventListener("abort", finish, { once: true });
   });
+}
+
+function resolveAutomaticRetainSources(
+  configured: readonly AutomaticRetainSource[] | undefined,
+): readonly AutomaticRetainSource[] {
+  const environment = process.env.OPENCODE_MEMORY_AUTO_RETAIN_SOURCES;
+  const values: readonly string[] =
+    configured ??
+    (environment === undefined || environment.trim() === ""
+      ? AUTOMATIC_RETAIN_SOURCES
+      : environment.split(",").map((value) => value.trim()));
+  const allowed = new Set<string>(AUTOMATIC_RETAIN_SOURCES);
+  const sources = [...new Set(values)];
+  if (sources.length === 0 || sources.some((source) => !allowed.has(source))) {
+    throw new Error(
+      `OPENCODE_MEMORY_AUTO_RETAIN_SOURCES must contain only ${AUTOMATIC_RETAIN_SOURCES.join(", ")}`,
+    );
+  }
+  return sources as AutomaticRetainSource[];
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {

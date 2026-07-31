@@ -1,0 +1,238 @@
+//! Path-based suppression predicates. These look only at the source-file
+//! path, not the credential value. Used by the api layer to short-circuit
+//! whole files (`looks_like_secret_scanner_source`) or whole subdirectories
+//! (`looks_like_vendored_minified_path`).
+
+use crate::ascii_ci::{ci_find, contains_path_segment, contains_path_segment_two};
+
+#[derive(serde::Deserialize)]
+struct PathFilterLists {
+    needles: Vec<String>,
+    vendored_js_prefixes: Vec<String>,
+}
+
+fn parse_path_filter_lists(raw: &str) -> Result<PathFilterLists, String> {
+    toml::from_str::<PathFilterLists>(raw).map_err(|error| error.to_string())
+}
+
+/// Single parse of the path-filter Tier-B list: both field statics below read
+/// one list each from this owner instead of re-`include_str!`'ing and re-parsing
+/// the whole file twice at startup. Fail-closed (Law 10): invalid bundled
+/// metadata panics loudly at first use.
+static PATH_FILTER_LISTS: std::sync::LazyLock<PathFilterLists> = std::sync::LazyLock::new(|| {
+    match parse_path_filter_lists(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/rules/path-filter-lists.toml"
+    ))) {
+        Ok(lists) => lists,
+        Err(error) => panic!(
+            "rules/path-filter-lists.toml is invalid: {error}. \
+             Fix the bundled Tier-B metadata file list."
+        ),
+    }
+});
+
+static NEEDLES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| PATH_FILTER_LISTS.needles.clone());
+
+static VENDORED_JS_PREFIXES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| PATH_FILTER_LISTS.vendored_js_prefixes.clone());
+
+/// True if the file at `path` is itself a secret-scanner source file.
+/// Such files contain detector regex patterns (`/AKIA[A-Z0-9]{16}/g`,
+/// `'(?:ASIA|AKIA)[A-Z2-7]{16}'`, `dn_[a-zA-Z0-9_-]{20,}`) that the engine
+/// will match against itself - every named detector + hot pattern routinely
+/// emits a finding on its own regex DEFINITION. Most of these are caught
+/// by `looks_like_regex_literal_tail`, but the unicode-escape / caesar
+/// decoders mangle the trailing sigil out of recognition. Skipping the
+/// whole file (any source whose path or basename contains a secret-scanner
+/// keyword) is safer than playing whack-a-mole with decoder variants.
+pub(crate) fn looks_like_secret_scanner_source(path: Option<&str>) -> bool {
+    let Some(p) = path else {
+        return false;
+    };
+    // Avoid the per-match `p.to_ascii_lowercase()` allocation by skimming
+    // raw path bytes against pre-lowered needles via `ci_find`. Same
+    // ten-needle alternation, zero allocations.
+    let bytes = p.as_bytes();
+    if !NEEDLES.iter().any(|n| ci_find(bytes, n.as_bytes())) {
+        return false;
+    }
+    // KH-1300: path needles alone suppress whole apps named `gitleaks-demo`.
+    // Require a detector-definition-shaped path segment as well.
+    // App configs named after scanners must not be suppressed, so only complete
+    // detector-definition directory segments count.
+    const DEF_SHAPE: &[&str] = &["detectors", "rules", "fixtures", "testdata", "patterns"];
+    DEF_SHAPE
+        .iter()
+        .any(|segment| contains_path_segment(p, segment))
+}
+
+/// True if `path` looks like a vendored 3rd-party JS/CSS/wasm bundle.
+/// These are minified copies of libraries the project does NOT author -
+/// any "secret-like" match inside them is a coincidence in the minified
+/// byte stream, not a leaked credential.
+///
+/// Catches:
+///   * `gogs/public/plugins/codemirror-5.17.0/mode/dockerfile/dockerfile.js`
+///     (`variable-2`/`variable-3` token classes captured as generic-secret)
+///   * `gogs/public/plugins/pdfjs-5.2.133/web/wasm/openjpeg_nowasm_fallback.js`
+///     (minified WASM glue with `ASIA` random byte sequence triggering
+///     `hot-aws_session_key`)
+///   * `node_modules/`, `vendor/`, `wp-includes/`, `wp-content/plugins/`
+///     (npm / Composer / WordPress vendored trees)
+pub(crate) fn looks_like_vendored_minified_path(path: Option<&str>) -> bool {
+    let Some(p) = path else {
+        return false;
+    };
+    // Substring-match both POSIX-style (`/dir/`) and Windows-style
+    // (`\dir\`) vendored-tree fragments. Without this, every match
+    // inside `C:\src\app\node_modules\…` on a Windows checkout would
+    // skip the vendored-suppression and surface as a finding -
+    // emitting thousands of FPs the moment a Windows user scans a
+    // typical Node project. `contains_segment` is path-shape-only;
+    // no allocation per call (just byte scans).
+    if contains_path_segment(p, "node_modules")
+        || contains_path_segment_two(p, "public", "plugins")
+        || contains_path_segment_two(p, "public", "static")
+        || contains_path_segment_two(p, "public", "vendor")
+        || contains_path_segment_two(p, "static", "vendor")
+        || contains_path_segment(p, "wp-includes")
+        || contains_path_segment_two(p, "wp-content", "plugins")
+        || contains_path_segment_two(p, "wp-content", "themes")
+        || contains_path_segment(p, "bower_components")
+        || contains_path_segment(p, "jspm_packages")
+        || contains_path_segment(p, "site-packages")
+        || contains_path_segment_two(p, "dist", "vendor")
+        || contains_path_segment_two(p, "dist", "assets")
+        || contains_path_segment_two(p, "vendor", "assets")
+        || p.ends_with(".min.js")
+        || p.ends_with(".bundle.js")
+        || p.ends_with(".min.css")
+    {
+        return true;
+    }
+    // Rails legacy asset path: `app/assets/javascripts/<name>.js`. First-
+    // party Rails JS today lives in `app/javascript/` (Webpacker era) or
+    // `app/assets/builds/` (esbuild/Vite era). The `app/assets/javascripts/`
+    // directory predominantly holds vendored libraries (bootstrap-*,
+    // jquery-*, alertify, datatables, fullcalendar, jsapi). Match the
+    // most common vendored filename prefixes.
+    if p.starts_with("app/assets/javascripts/")
+        || p.starts_with("app\\assets\\javascripts\\")
+        || p.starts_with("vendor/javascripts/")
+        || p.starts_with("vendor\\javascripts\\")
+        || p.contains("/app/assets/javascripts/")
+        || p.contains("\\app\\assets\\javascripts\\")
+        || p.contains("/vendor/javascripts/")
+        || p.contains("\\vendor\\javascripts\\")
+    {
+        let basename = crate::platform_compat::path_basename(p);
+        let basename_bytes = basename.as_bytes();
+        if VENDORED_JS_PREFIXES.iter().any(|prefix| {
+            basename_bytes
+                .get(..prefix.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(prefix.as_bytes()))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(any(feature = "entropy", test))]
+pub(crate) fn path_is_ci_workflow_file(path: Option<&str>) -> bool {
+    let Some(p) = path else {
+        return false;
+    };
+    // Sources are allowed to report either repository-relative paths (the
+    // staged source does) or absolute paths (the filesystem source normally
+    // does). Keep both forms equivalent so detection truth does not depend on
+    // which source produced the chunk.
+    p.starts_with(".github/workflows/")
+        || p.starts_with(".github\\workflows\\")
+        || p.starts_with(".github/actions/")
+        || p.starts_with(".github\\actions\\")
+        || p.starts_with(".circleci/")
+        || p.starts_with(".circleci\\")
+        || p.starts_with("azure-pipelines")
+        || p.starts_with("bitbucket-pipelines")
+        || p.contains("/.github/workflows/")
+        || p.contains("\\.github\\workflows\\")
+        || p.contains("/.github/actions/")
+        || p.contains("\\.github\\actions\\")
+        || p.contains("/.gitlab-ci.yml")
+        || p.contains("\\.gitlab-ci.yml")
+        || p.ends_with(".gitlab-ci.yml")
+        || p.contains("/.circleci/")
+        || p.contains("\\.circleci\\")
+        || p.contains("/azure-pipelines")
+        || p.contains("\\azure-pipelines")
+        || p.contains("/bitbucket-pipelines")
+        || p.contains("\\bitbucket-pipelines")
+        || p.contains("/.travis.yml")
+        || p.contains("\\.travis.yml")
+        || p.ends_with(".travis.yml")
+        || crate::platform_compat::path_basename(p).eq_ignore_ascii_case("Jenkinsfile")
+}
+
+#[cfg(any(feature = "entropy", test))]
+pub(crate) fn path_is_i18n_file(path: Option<&str>) -> bool {
+    let Some(p) = path else {
+        return false;
+    };
+    crate::platform_compat::path_has_any_component(
+        p,
+        &[
+            "locale",
+            "locales",
+            "i18n",
+            "l10n",
+            "translations",
+            "lang",
+            "langs",
+        ],
+    ) || p.ends_with(".po")
+        || p.ends_with(".pot")
+        || {
+            let name = crate::platform_compat::path_basename(p);
+            (name.starts_with("locale_")
+                || name.starts_with("messages_")
+                || name.starts_with("strings_"))
+                && (name.ends_with(".ini")
+                    || name.ends_with(".properties")
+                    || name.ends_with(".xml")
+                    || name.ends_with(".json")
+                    || name.ends_with(".yaml")
+                    || name.ends_with(".yml"))
+        }
+}
+
+pub(crate) fn looks_like_raw_base64_file_path(path: Option<&str>) -> bool {
+    raw_base64_path_match(path, true)
+}
+
+#[cfg(any(feature = "entropy", test))]
+pub(crate) fn looks_like_entropy_raw_base64_file_path(path: Option<&str>) -> bool {
+    raw_base64_path_match(path, false)
+}
+
+fn raw_base64_path_match(path: Option<&str>, include_plain_base64_txt: bool) -> bool {
+    let Some(p) = path else {
+        return false;
+    };
+    let bytes = p.as_bytes();
+    if crate::ascii_ci::ends_with_ignore_ascii_case(bytes, b".b64")
+        || crate::ascii_ci::ends_with_ignore_ascii_case(bytes, b".base64")
+    {
+        return true;
+    }
+    let basename = crate::platform_compat::path_basename_bytes(bytes);
+    crate::ascii_ci::starts_with_ignore_ascii_case(basename, b"base64_")
+        || crate::ascii_ci::ci_find(basename, b"base64_string")
+        || (include_plain_base64_txt && basename.eq_ignore_ascii_case(b"base64.txt"))
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/suppression_path_filter.rs"]
+mod tests;

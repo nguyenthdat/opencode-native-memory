@@ -1,0 +1,421 @@
+//! `process_match`: the per-match post-processing chain.
+//!
+//! Runs the suppression chain, companion-required gate, entropy + camel-shape
+//! filters for generic detectors, checksum validation, and finally ML /
+//! heuristic scoring. Outputs either a `Final` finding into `scan_state.matches`
+//! or queues an `MlPendingMatch` for the post-scan ML batch.
+
+use super::scan_filters::*;
+use super::CompiledScanner;
+use crate::confidence::policy::MlScoreResult;
+use crate::context;
+use crate::pipeline::*;
+use crate::types::*;
+use keyhog_core::Chunk;
+use std::collections::HashMap;
+
+impl CompiledScanner {
+    pub(crate) fn match_companions(
+        detector_companions: &[CompiledCompanion],
+        preprocessed: &ScannerPreprocessedText<'_>,
+        line: usize,
+    ) -> Option<HashMap<String, String>> {
+        // Most detectors declare no companions. Return the empty map without
+        // sizing a bucket array (`HashMap::new()` is allocation-free until the
+        // first insert) and without entering the search loop. Only detectors
+        // that actually have companions pay for the map.
+        if detector_companions.is_empty() {
+            return Some(HashMap::new());
+        }
+        let mut results = HashMap::with_capacity(detector_companions.len());
+        for companion in detector_companions {
+            if let Some(val) = find_companion(preprocessed, line, companion) {
+                results.insert(companion.name.clone(), val);
+            } else if companion.required {
+                return None;
+            }
+        }
+        Some(results)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn process_match(
+        &self,
+        entry: &CompiledPattern,
+        detector_plan: &crate::detector_plan::CompiledDetectorPlan,
+        data: &str,
+        preprocessed: &ScannerPreprocessedText<'_>,
+        line_offsets: &[usize],
+        code_lines: &[&str],
+        documentation_lines: &[bool],
+        chunk: &Chunk,
+        scan_state: &mut ScanState,
+        credential: &str,
+        credential_start: usize,
+        credential_end: usize,
+        keyword_nearby: bool,
+        sensitive_file: bool,
+    ) {
+        let (credential, match_end, checksum_decision) = extend_known_prefix_credential(
+            data,
+            credential,
+            credential_end,
+            |candidate, pattern_proven| {
+                detector_plan.validators.validate(candidate, pattern_proven)
+            },
+        );
+        let line = match_line_number(preprocessed, line_offsets, credential_start);
+        let execution_policy = &detector_plan.execution;
+        let is_generic = execution_policy.is_generic;
+        let structural_password_slot =
+            execution_policy.structural_password_slot || entry.structural_password_slot;
+        // A declared structural slot is exact syntactic evidence even when the
+        // owning detector is generic, so generic probabilistic admission must
+        // not veto it before the slot-specific placeholder policy runs.
+        let apply_generic_candidate_gates = is_generic && !structural_password_slot;
+
+        let process_signals = crate::adjudicate::ProcessCandidateSignals::from_match(
+            apply_generic_candidate_gates,
+            execution_policy.length,
+            detector_plan.credential_shape.as_ref(),
+            detector_plan
+                .match_confidence
+                .post_match()
+                .degenerate_run_min_length,
+            credential,
+            data,
+            credential_start,
+            match_end,
+        );
+        let process_ctx = crate::adjudicate::MatchCtx::for_process_signals(process_signals);
+        if crate::adjudicate::record_suppression(
+            chunk.metadata.path.as_deref(),
+            credential,
+            &process_ctx,
+        )
+        .is_some()
+        {
+            return;
+        }
+        let false_positive_context = context::is_false_positive_context(
+            code_lines,
+            line.saturating_sub(PREVIOUS_LINE_DISTANCE),
+            chunk.metadata.path.as_deref(),
+        ) || context::is_false_positive_match_context(
+            data,
+            credential_start,
+            chunk.metadata.path.as_deref(),
+        );
+        let false_positive_ctx = crate::adjudicate::MatchCtx::for_process_signals(
+            crate::adjudicate::ProcessCandidateSignals::from_false_positive_context(
+                false_positive_context,
+            ),
+        );
+        if crate::adjudicate::record_suppression(
+            chunk.metadata.path.as_deref(),
+            credential,
+            &false_positive_ctx,
+        )
+        .is_some()
+        {
+            return;
+        }
+
+        let inferred_context = context::infer_context_with_documentation(
+            code_lines,
+            line.saturating_sub(PREVIOUS_LINE_DISTANCE),
+            chunk.metadata.path.as_deref(),
+            documentation_lines,
+        );
+        // Combine the construction-time detector base with the explicit policy
+        // bit compiled beside this exact regex. Index mismatch is an internal
+        // construction bug and remains loud.
+        let weak_anchor = detector_plan.pattern_weak_anchor(entry.weak_anchor);
+        let key_material_policy = &detector_plan.key_material;
+        let allow_decoded_hex_key_material = key_material_policy.allows_decoded_hex_len(
+            crate::decode_structure::evidence(credential).decoded_hex_text_len(),
+        );
+        let allow_canonical_hex_key_material = allow_decoded_hex_key_material
+            || (credential.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && key_material_policy.allows_canonical_hex_len(credential.len()));
+        let named_suppression_ctx =
+            crate::suppression::NamedDetectorSuppressionCtx::with_weak_anchor_and_key_material_policy(
+                chunk.metadata.path.as_deref(),
+                inferred_context,
+                Some(chunk.metadata.source_type.as_ref()),
+                detector_plan.suppression.as_ref(),
+                !is_generic,
+                weak_anchor,
+                structural_password_slot,
+                allow_canonical_hex_key_material,
+            );
+        let match_ctx = crate::adjudicate::MatchCtx::for_named_detector(named_suppression_ctx);
+        if crate::adjudicate::record_suppression(
+            chunk.metadata.path.as_deref(),
+            credential,
+            &match_ctx,
+        )
+        .is_some()
+        {
+            // KH-L-0412 (Law-10): named-detector context/example suppression
+            // was the last silent `return` on this path. Trace it through the
+            // adjudicator so a dropped match is visible to `--dogfood` with
+            // the deciding stage name.
+            return;
+        }
+
+        // `None` means a required companion is missing; record that hard skip
+        // instead of treating it like an empty companion set.
+        let companions = match Self::match_companions(&detector_plan.companions, preprocessed, line)
+        {
+            Some(companions) => companions,
+            None => {
+                crate::adjudicate::record_missing_required_companion_suppression(
+                    chunk.metadata.path.as_deref(),
+                    credential,
+                );
+                return;
+            }
+        };
+        let entropy = match_entropy(credential.as_bytes());
+
+        let is_weakly_anchored = weak_anchor;
+        let effective_entropy_floor = (is_generic || is_weakly_anchored)
+            .then(|| {
+                detector_plan.entropy_floor.as_ref().map(|policy| {
+                    policy.effective_floor(credential.len(), self.config.entropy_threshold)
+                })
+            })
+            .flatten();
+        let entropy_shape_ctx = crate::adjudicate::MatchCtx::for_process_signals(
+            crate::adjudicate::ProcessCandidateSignals::from_process_entropy_shape(
+                is_generic,
+                is_weakly_anchored,
+                entropy,
+                effective_entropy_floor,
+                credential,
+            ),
+        );
+        if crate::adjudicate::record_suppression(
+            chunk.metadata.path.as_deref(),
+            credential,
+            &entropy_shape_ctx,
+        )
+        .is_some()
+        {
+            return;
+        }
+
+        // Detector policy follows the candidate across producers. Generic
+        // regex envelopes must not bypass the BPE gate that the same detector
+        // applies to assignment and entropy candidates. Keep tokenization
+        // after the cheaper shape and entropy checks.
+        #[cfg(feature = "entropy")]
+        let bpe_bound = if is_generic {
+            detector_plan.entropy.as_ref().and_then(|policy| {
+                policy.bpe_bound(self.config.entropy_bpe_max_bytes_per_token_override)
+            })
+        } else {
+            None
+        };
+        #[cfg(feature = "entropy")]
+        if let Some(bpe_bound) = bpe_bound {
+            // The explicit generic regex proves an owning detector field, but
+            // this stage no longer retains the textual assignment key.
+            // Preserve the detector's exact canonical length evidence instead
+            // of letting BPE reinterpret declared hex key material as text.
+            let allow_canonical_hex_key = credential.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && key_material_policy.allows_canonical_hex_len(credential.len());
+            let allow_encoded_text_secret = !allow_canonical_hex_key
+                && crate::decode_structure::decodes_to_printable_text(credential);
+            if !allow_canonical_hex_key
+                && !allow_encoded_text_secret
+                && !allow_decoded_hex_key_material
+            {
+                if crate::entropy::bpe::is_word_like_low_bpe(credential, bpe_bound) {
+                    let bpe_ctx = crate::adjudicate::MatchCtx::for_stage(
+                        crate::adjudicate::StageId::GenericValueShape(
+                            crate::adjudicate::GenericValueShapeStage::WordLikeLowBpe,
+                        ),
+                    );
+                    crate::adjudicate::record_suppression(
+                        chunk.metadata.path.as_deref(),
+                        credential,
+                        &bpe_ctx,
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Checksum validation: tokens with embedded checksums (GitHub, npm, Slack,
+        // Stripe, GitLab, PyPI) can be verified without network requests. The
+        // confidence policy owner makes the drop/floor rule shared with hot,
+        // generic, entropy, and ML emitters.
+        let checksum_ctx = crate::adjudicate::MatchCtx::for_process_signals(
+            crate::adjudicate::ProcessCandidateSignals::from_checksum_invalid(
+                checksum_decision.is_invalid(),
+            ),
+        );
+        if crate::adjudicate::record_suppression(
+            chunk.metadata.path.as_deref(),
+            credential,
+            &checksum_ctx,
+        )
+        .is_some()
+        {
+            // Checksum failed: NOT a real token. Skip expensive ML scoring.
+            return;
+        }
+
+        // Service-anchored detector regexes are positive evidence; generic
+        // shape gates stay load-bearing only for generic/entropy/private-key
+        // fallbacks and weak anchors.
+        let is_named_detector = !is_generic && !weak_anchor;
+        #[cfg(feature = "ml")]
+        let detector_ml_policy = detector_plan.ml;
+        #[cfg(feature = "ml")]
+        let detector_ml_mode = self
+            .config
+            .ml_enabled
+            .then_some(detector_ml_policy.match_mode)
+            .flatten();
+        let policy_result = crate::confidence::policy::candidate_match_score(
+            crate::confidence::policy::CandidateMatchScorePolicy {
+                // Per-PATTERN constant, memoized on the `LazyRegex` (see
+                // `LazyRegex::has_literal_prefix`): the prior inline
+                // `extract_literal_prefix(entry.regex.as_str()).is_some()`
+                // re-ran the allocating prefix parser on every surviving
+                // candidate. Identical value, computed at most once.
+                has_literal_prefix: entry.regex.has_literal_prefix(),
+                has_context_anchor: entry.group.is_some(),
+                entropy,
+                entropy_threshold: self.config.entropy_threshold,
+                keyword_nearby,
+                sensitive_file,
+                match_length: credential.len(),
+                has_companion: !companions.is_empty(),
+                code_context: inferred_context,
+                penalize_test_paths: self.config.penalize_test_paths,
+                confidence: &detector_plan.match_confidence,
+                named_anchor_floor_eligible: !weak_anchor,
+                #[cfg(feature = "ml")]
+                ml_mode: detector_ml_mode,
+                #[cfg(not(feature = "ml"))]
+                ml_enabled: false,
+                credential,
+                // Per-PATTERN constant, memoized on the `LazyRegex`: the matched
+                // regex requires a distinctive literal infix (terraform
+                // `\.atlasv1\.`) that no prefix/keyword-group anchor captures.
+                has_distinctive_inner_literal: entry.regex.has_distinctive_inner_literal(),
+            },
+        );
+
+        let min_confidence_floor = crate::adjudicate::detector_min_confidence_floor(
+            execution_policy.min_confidence,
+            self.config.min_confidence,
+        );
+
+        match policy_result {
+            MlScoreResult::Final(policy_conf) => {
+                let Some(report_conf) = crate::adjudicate::finalize_report_candidate(
+                    chunk.metadata.path.as_deref(),
+                    credential,
+                    crate::adjudicate::ReportAdjudicationPolicy {
+                        detector_id: detector_plan.metadata.0.as_ref(),
+                        code_context: inferred_context,
+                        confidence: policy_conf,
+                        min_confidence_floor,
+                        penalize_test_paths: self.config.penalize_test_paths,
+                        context_suppression_threshold: detector_plan
+                            .match_confidence
+                            .context_suppression_threshold(inferred_context),
+                        post_match: detector_plan.match_confidence.post_match(),
+                        file_path: chunk.metadata.path.as_deref(),
+                        is_named_detector,
+                        is_generic_detector: is_generic,
+                        allow_encoded_text_lift: false,
+                        allow_canonical_hex_key: allow_canonical_hex_key_material,
+                        checksum: checksum_decision,
+                        calibration: self.config.calibration.as_deref(),
+                    },
+                ) else {
+                    return;
+                };
+                let source_offset =
+                    preprocessed.source_offset_for_match(&chunk.data, credential_start, credential);
+                let raw_match = build_raw_match(
+                    execution_policy.severity,
+                    detector_plan.cloned_metadata(),
+                    chunk,
+                    credential,
+                    companions,
+                    source_offset,
+                    line,
+                    entropy,
+                    report_conf,
+                    scan_state,
+                    entry.client_safe,
+                );
+                if scan_state.push_match(raw_match, self.config.max_matches_per_chunk) {
+                    crate::telemetry::record_match_found();
+                }
+            }
+            #[cfg(feature = "ml")]
+            MlScoreResult::Pending {
+                heuristic_conf,
+                code_context,
+                context_multiplier,
+                mode,
+            } => {
+                let source_offset =
+                    preprocessed.source_offset_for_match(&chunk.data, credential_start, credential);
+                let ml_features = crate::types::ml_features_for_candidate(
+                    data,
+                    line,
+                    chunk.metadata.path.as_deref(),
+                    credential,
+                    detector_ml_policy.context_radius_lines,
+                    &self.config,
+                    detector_plan.metadata.2.as_ref(),
+                    detector_ml_policy.features,
+                    crate::ml_scorer::MlCandidateChannel::Pattern,
+                );
+                let raw_match = build_raw_match(
+                    execution_policy.severity,
+                    detector_plan.cloned_metadata(),
+                    chunk,
+                    credential,
+                    companions,
+                    source_offset,
+                    line,
+                    entropy,
+                    heuristic_conf,
+                    scan_state,
+                    entry.client_safe,
+                );
+                if scan_state.push_detector_ml_pending(
+                    raw_match,
+                    heuristic_conf,
+                    code_context,
+                    context_multiplier,
+                    detector_plan
+                        .match_confidence
+                        .context_suppression_threshold(code_context),
+                    detector_plan.match_confidence.post_match(),
+                    ml_features,
+                    detector_ml_policy.effective_weight(&self.config),
+                    min_confidence_floor,
+                    is_named_detector,
+                    is_generic,
+                    allow_canonical_hex_key_material,
+                    false,
+                    checksum_decision,
+                    mode,
+                ) {
+                    crate::telemetry::record_match_found();
+                }
+            }
+        }
+    }
+}

@@ -5,6 +5,8 @@ const ENVIRONMENT_KEYS = [
   "OPENCODE_MEMORY_WARMUP",
   "OPENCODE_MEMORY_AUTO_RECALL",
   "OPENCODE_MEMORY_AUTO_CAPTURE",
+  "OPENCODE_MEMORY_AUTO_RETAIN",
+  "OPENCODE_MEMORY_AUTO_RETAIN_SOURCES",
   "OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS",
   "OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS",
   "OPENCODE_MEMORY_AUTO_OPTIMIZE",
@@ -30,6 +32,8 @@ describe("memory plugin options", () => {
       warmup: true,
       automaticRecall: true,
       automaticCapture: true,
+      automaticRetain: false,
+      automaticRetainSources: ["document", "compaction", "tool_outcome"],
       automaticDocumentIndex: true,
       documentIndexDebounceMs: 750,
       automaticOptimize: true,
@@ -43,6 +47,8 @@ describe("memory plugin options", () => {
   test("reads environment controls and lets explicit options win", () => {
     process.env.OPENCODE_MEMORY_AUTO_RECALL = "off";
     process.env.OPENCODE_MEMORY_AUTO_CAPTURE = "0";
+    process.env.OPENCODE_MEMORY_AUTO_RETAIN = "1";
+    process.env.OPENCODE_MEMORY_AUTO_RETAIN_SOURCES = "document,tool_outcome";
     process.env.OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS = "off";
     process.env.OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS = "1500";
     process.env.OPENCODE_MEMORY_AUTO_OPTIMIZE = "off";
@@ -54,6 +60,8 @@ describe("memory plugin options", () => {
     });
     expect(resolved.automaticRecall).toBe(true);
     expect(resolved.automaticCapture).toBe(false);
+    expect(resolved.automaticRetain).toBe(true);
+    expect(resolved.automaticRetainSources).toEqual(["document", "tool_outcome"]);
     expect(resolved.automaticDocumentIndex).toBe(false);
     expect(resolved.documentIndexDebounceMs).toBe(1500);
     expect(resolved.automaticOptimize).toBe(false);
@@ -65,6 +73,13 @@ describe("memory plugin options", () => {
     process.env.OPENCODE_MEMORY_SHARED_SYNC = "sometimes";
     expect(() => resolveMemoryPluginOptions({ root: "/tmp/plugin" })).toThrow(
       "OPENCODE_MEMORY_SHARED_SYNC must be a boolean",
+    );
+  });
+
+  test("rejects unknown automatic retain source classes", () => {
+    process.env.OPENCODE_MEMORY_AUTO_RETAIN_SOURCES = "document,raw_logs";
+    expect(() => resolveMemoryPluginOptions({ root: "/tmp/plugin" })).toThrow(
+      "OPENCODE_MEMORY_AUTO_RETAIN_SOURCES must contain only",
     );
   });
 
