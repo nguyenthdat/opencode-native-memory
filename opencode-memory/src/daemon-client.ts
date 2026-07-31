@@ -23,11 +23,13 @@ import {
   DaemonRequestSchema,
   DaemonResponseSchema,
   DaemonStatusCode,
+  DrainOutcome,
   EmbeddingIdentitySchema,
   GetDaemonInfoRequestSchema,
   OpenSessionRequestSchema,
   ProjectCallRequestSchema,
   ReleaseProjectRequestSchema,
+  RequestDrainRequestSchema,
   SessionHeartbeatRequestSchema,
 } from "./generated/opencode/memory/daemon/v1/daemon_pb.js";
 import type {
@@ -144,6 +146,14 @@ export type DaemonControlInfo = Pick<
   | "capabilities"
   | "pid"
 >;
+
+export type DaemonDrainOutcome = "accepted" | "busy" | "unsupported";
+
+export interface DaemonDrainResult {
+  readonly daemon: DaemonControlInfo;
+  readonly outcome: DaemonDrainOutcome;
+  readonly retryAfterMs: number;
+}
 
 export class DaemonRpcError extends Error {
   readonly name = "DaemonRpcError";
@@ -392,6 +402,43 @@ class DaemonProjectClient implements NativeMemoryRequester {
     }
   }
 
+  async requestDrainIfRunning(): Promise<DaemonDrainResult | undefined> {
+    try {
+      try {
+        await this.connectTransport(false);
+      } catch (error) {
+        if (isUnavailableEndpointError(error)) return undefined;
+        throw error;
+      }
+      const infoResponse = await this.send(
+        { case: "getDaemonInfo", value: create(GetDaemonInfoRequestSchema) },
+        CONNECT_TIMEOUT_MS,
+      );
+      if (infoResponse.body.case !== "getDaemonInfo") {
+        throw new Error("Native memory daemon omitted GetDaemonInfo before drain");
+      }
+      const daemon = infoResponse.body.value;
+      // Drain must remain available when the project-domain schema is stale.
+      const request = create(RequestDrainRequestSchema, {
+        expectedDaemonInstanceId: daemon.daemonInstanceId,
+      });
+      const response = await this.send(
+        { case: "requestDrain", value: request },
+        CONNECT_TIMEOUT_MS,
+      );
+      if (response.body.case !== "requestDrain") {
+        throw new Error("Native memory daemon omitted RequestDrain");
+      }
+      return {
+        daemon,
+        outcome: daemonDrainOutcome(response.body.value.outcome),
+        retryAfterMs: response.body.value.retryAfterMs,
+      };
+    } finally {
+      await this.dispose();
+    }
+  }
+
   async dispose(): Promise<void> {
     if (this.disposePromise) return await this.disposePromise;
     this.disposePromise = this.disposeOnce();
@@ -520,13 +567,14 @@ class DaemonProjectClient implements NativeMemoryRequester {
     return { daemon, session, project: projectResponse.body.value, generation };
   }
 
-  private async connectTransport(): Promise<void> {
+  private async connectTransport(bootstrapIfMissing = true): Promise<void> {
     if (this.disposed) throw new Error("Native memory client is disposed");
     if (this.socket && !this.socket.destroyed) return;
     let socket: Socket;
     try {
       socket = await connectSocket(this.endpoint, CONNECT_TIMEOUT_MS);
-    } catch {
+    } catch (error) {
+      if (!bootstrapIfMissing) throw error;
       await bootstrapDaemon(this.root, this.endpoint);
       socket = await connectSocket(this.endpoint, CONNECT_TIMEOUT_MS);
     }
@@ -854,6 +902,13 @@ export async function probeNativeMemoryDaemon(root: string): Promise<DaemonContr
   return await client.probe();
 }
 
+export async function requestNativeMemoryDaemonDrain(
+  root: string,
+): Promise<DaemonDrainResult | undefined> {
+  const client = new DaemonProjectClient(root, process.cwd(), CONNECT_TIMEOUT_MS);
+  return await client.requestDrainIfRunning();
+}
+
 export function resolveDaemonEndpoint(): string {
   const uid = process.getuid?.() ?? 0;
   const runtimeDirectory =
@@ -1068,13 +1123,31 @@ async function canConnect(path: string): Promise<boolean> {
     socket.destroy();
     return true;
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ECONNREFUSED") return false;
-    if (error instanceof DaemonTransportError && error.cause) {
-      const causeCode = (error.cause as NodeJS.ErrnoException).code;
-      if (causeCode === "ENOENT" || causeCode === "ECONNREFUSED") return false;
-    }
+    if (isUnavailableEndpointError(error)) return false;
     throw error;
+  }
+}
+
+function isUnavailableEndpointError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ENOENT" || code === "ECONNREFUSED") return true;
+  if (!(error instanceof DaemonTransportError) || !error.cause) return false;
+  const causeCode = (error.cause as NodeJS.ErrnoException).code;
+  return causeCode === "ENOENT" || causeCode === "ECONNREFUSED";
+}
+
+function daemonDrainOutcome(outcome: DrainOutcome): DaemonDrainOutcome {
+  switch (outcome) {
+    case DrainOutcome.ACCEPTED:
+      return "accepted";
+    case DrainOutcome.BUSY:
+      return "busy";
+    case DrainOutcome.UNSUPPORTED:
+      return "unsupported";
+    case DrainOutcome.UNSPECIFIED:
+      throw new Error("Native memory daemon returned an unspecified drain outcome");
+    default:
+      throw new Error(`Native memory daemon returned unknown drain outcome ${outcome}`);
   }
 }
 

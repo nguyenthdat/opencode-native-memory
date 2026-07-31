@@ -12,7 +12,8 @@ process.env.OPENCODE_NATIVE_MEMORY_BIN ??= resolve(
   "opencode-memory",
 );
 try {
-  const { probeNativeMemoryDaemon } = await import("../opencode-memory/src/daemon-client.js");
+  const { probeNativeMemoryDaemon, requestNativeMemoryDaemonDrain } =
+    await import("../opencode-memory/src/daemon-client.js");
   const info = await probeNativeMemoryDaemon(process.cwd());
   if (!info.capabilities.includes("project-actors")) {
     throw new Error("Daemon did not report project actor support");
@@ -39,7 +40,23 @@ try {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
   }
-  console.log(`Protobuf daemon control round-trip passed for pid ${info.pid}`);
+
+  const drainInfo = await probeNativeMemoryDaemon(process.cwd());
+  await Bun.sleep(100);
+  const drain = await requestNativeMemoryDaemonDrain(process.cwd());
+  if (!drain || drain.daemon.pid !== drainInfo.pid || drain.outcome !== "accepted") {
+    throw new Error("Daemon did not accept the control-plane drain request");
+  }
+  await Bun.sleep(2_000);
+  try {
+    process.kill(drainInfo.pid, 0);
+    throw new Error("Drained daemon did not exit");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  console.log(
+    `Protobuf daemon startup, idle exit, and drain passed for pids ${info.pid} and ${drainInfo.pid}`,
+  );
 } finally {
   await rm(runtimeRoot, { recursive: true, force: true });
 }
