@@ -59,7 +59,7 @@ const STARTUP_TIMEOUT_MS = 15_000;
 const START_LOCK_STALE_MS = 30_000;
 const START_LOCK_TIMEOUT_MS = START_LOCK_STALE_MS + STARTUP_TIMEOUT_MS;
 const DAEMON_PROTOCOL_GENERATION = 1;
-const DOMAIN_SCHEMA_GENERATION = 5;
+const DOMAIN_SCHEMA_GENERATION = 6;
 const require = createRequire(import.meta.url);
 const NATIVE_PACKAGES: Partial<Record<string, string>> = {
   "darwin-arm64": "@nguyenthdat/opencode-memory-darwin-arm64",
@@ -507,6 +507,7 @@ class DaemonProjectClient implements NativeMemoryRequester {
       ...optionalEnv("OPENCODE_MEMORY_MODEL_CACHE", "modelCache"),
       ...optionalEnv("OPENCODE_MEMORY_INITIAL_PROFILE", "initialProfileId"),
       ...optionalEnv("OPENCODE_MEMORY_EXPECTED_PROFILE", "expectedProfileId"),
+      ...contentScanningPolicyFromEnv(),
       embedding: embeddingIdentity(),
     });
     const projectResponse = await this.send(
@@ -1169,6 +1170,40 @@ function optionalBooleanEnv<const K extends string>(
   throw new Error(`Invalid ${name}: expected true or false, received ${value}`);
 }
 
+function optionalEnabledUnlessDisabledEnv<const K extends string>(
+  name: string,
+  key: K,
+  environment: NodeJS.ProcessEnv = process.env,
+): Partial<Record<K, boolean>> {
+  const value = environment[name];
+  if (!value) return {};
+  if (["1", "true", "yes", "on"].includes(value.toLowerCase())) {
+    return { [key]: false } as Partial<Record<K, boolean>>;
+  }
+  if (["0", "false", "no", "off"].includes(value.toLowerCase())) {
+    return { [key]: true } as Partial<Record<K, boolean>>;
+  }
+  throw new Error(`Invalid ${name}: expected true or false, received ${value}`);
+}
+
+export function contentScanningPolicyFromEnv(environment: NodeJS.ProcessEnv = process.env): {
+  secretScanning?: boolean;
+  promptInjectionScanning?: boolean;
+} {
+  return {
+    ...optionalEnabledUnlessDisabledEnv(
+      "OPENCODE_MEMORY_DISABLE_SECRET_SCANNER",
+      "secretScanning",
+      environment,
+    ),
+    ...optionalEnabledUnlessDisabledEnv(
+      "OPENCODE_MEMORY_DISABLE_PROMPT_INJECTION_SCAN",
+      "promptInjectionScanning",
+      environment,
+    ),
+  };
+}
+
 function optionalIntegerEnv<const K extends string>(
   name: string,
   key: K,
@@ -1196,7 +1231,12 @@ function optionalPositiveInt32Env<const K extends string>(
 }
 
 function daemonPoolKey(worktree: string): string {
-  return `${resolve(worktree)}\0${process.env.OPENCODE_MEMORY_DATA_DIR ?? ""}`;
+  return [
+    resolve(worktree),
+    process.env.OPENCODE_MEMORY_DATA_DIR ?? "",
+    process.env.OPENCODE_MEMORY_DISABLE_SECRET_SCANNER ?? "",
+    process.env.OPENCODE_MEMORY_DISABLE_PROMPT_INJECTION_SCAN ?? "",
+  ].join("\0");
 }
 
 function configuredRequestTimeoutMs(): number {

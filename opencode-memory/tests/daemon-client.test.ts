@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   assertDaemonVersionCompatible,
   assertDaemonSchemaCompatible,
+  contentScanningPolicyFromEnv,
   isRetrySafeMemoryMethod,
   NativeMemoryClient,
   NativeMemoryClientPool,
@@ -39,6 +40,18 @@ describe("shared daemon client", () => {
     expect(() => new NativeMemoryClient(".", ".", Number.NaN)).toThrow("request timeout");
   });
 
+  test("maps per-project scanner disable flags to acquire policy", () => {
+    expect(
+      contentScanningPolicyFromEnv({
+        OPENCODE_MEMORY_DISABLE_SECRET_SCANNER: "true",
+        OPENCODE_MEMORY_DISABLE_PROMPT_INJECTION_SCAN: "0",
+      }),
+    ).toEqual({ secretScanning: false, promptInjectionScanning: true });
+    expect(() =>
+      contentScanningPolicyFromEnv({ OPENCODE_MEMORY_DISABLE_SECRET_SCANNER: "sometimes" }),
+    ).toThrow("OPENCODE_MEMORY_DISABLE_SECRET_SCANNER");
+  });
+
   test("rejects a stale daemon version but permits development clients", () => {
     expect(() => assertDaemonVersionCompatible("0.6.0", "0.6.0-beta.2", 64346)).toThrow(
       "Close all OpenCode processes using memory and restart OpenCode",
@@ -55,12 +68,12 @@ describe("shared daemon client", () => {
         "/tmp/opencode-memory/daemon.sock",
       ),
     ).toThrow(
-      "Native memory daemon domain schema mismatch at /tmp/opencode-memory/daemon.sock: client 5, daemon 2 (plugin 0.6.0, daemon 0.6.0, pid 64346). Close all OpenCode processes using memory and restart the native memory daemon.",
+      "Native memory daemon domain schema mismatch at /tmp/opencode-memory/daemon.sock: client 6, daemon 2 (plugin 0.6.0, daemon 0.6.0, pid 64346). Close all OpenCode processes using memory and restart the native memory daemon.",
     );
     expect(() =>
       assertDaemonSchemaCompatible(
         "0.6.0",
-        { daemonVersion: "0.6.0", domainSchemaGeneration: 5, pid: 64346 },
+        { daemonVersion: "0.6.0", domainSchemaGeneration: 6, pid: 64346 },
         "/tmp/opencode-memory/daemon.sock",
       ),
     ).not.toThrow();

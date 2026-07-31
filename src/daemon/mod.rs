@@ -17,6 +17,7 @@ use tokio::sync::{Semaphore, mpsc};
 use self::actor::{CALL_CANCELLED, CALL_COMPLETED, CALL_QUEUED, CALL_RUNNING, ProjectActor};
 use self::endpoint::EndpointGuard;
 use self::registry::ProjectRegistry;
+use crate::config::ValidationPolicy;
 use crate::daemon_proto::daemon_request;
 use crate::daemon_proto::daemon_response;
 use crate::daemon_proto::{
@@ -33,7 +34,7 @@ use crate::rpc::{
 use crate::{EmbeddingConfig, MemoryConfig};
 
 pub const DAEMON_PROTOCOL_GENERATION: u32 = 1;
-pub const DOMAIN_SCHEMA_GENERATION: u32 = 5;
+pub const DOMAIN_SCHEMA_GENERATION: u32 = 6;
 const MAX_SESSIONS: usize = 64;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_OUTSTANDING_CALLS_PER_CONNECTION: usize = 32;
@@ -1177,6 +1178,10 @@ fn config_from_acquire(request: &AcquireProjectRequest) -> Result<MemoryConfig> 
         request.model_cache.as_deref().map(PathBuf::from),
         embedding,
     )?;
+    config.set_validation_policy(ValidationPolicy {
+        secret_scanning: request.secret_scanning.unwrap_or(true),
+        prompt_injection_scanning: request.prompt_injection_scanning.unwrap_or(true),
+    });
     if let Some(active) = crate::embedding_generation::ActiveEmbedding::load(
         &config.active_embedding_path(),
         config.project_id(),
@@ -1445,6 +1450,7 @@ fn configured_duration(name: &str, default_seconds: u64) -> Duration {
 mod tests {
     use super::*;
     use crate::model_proto::{ListModelProfilesRequest, ModelRequest, model_request};
+    use tempfile::tempdir;
 
     fn hello() -> OpenSessionRequest {
         OpenSessionRequest {
@@ -1472,6 +1478,30 @@ mod tests {
             model_request,
             graph_request: None,
         }
+    }
+
+    #[test]
+    fn acquire_config_keeps_scanner_policy_project_local() {
+        let project = tempdir().expect("temporary project");
+        let request = AcquireProjectRequest {
+            project_root: project.path().display().to_string(),
+            worktree: project.path().display().to_string(),
+            data_dir: Some(project.path().join("data").display().to_string()),
+            model_cache: Some(project.path().join("models").display().to_string()),
+            secret_scanning: Some(false),
+            prompt_injection_scanning: Some(false),
+            ..AcquireProjectRequest::default()
+        };
+
+        let config = config_from_acquire(&request).expect("acquire config");
+
+        assert_eq!(
+            config.validation_policy(),
+            ValidationPolicy {
+                secret_scanning: false,
+                prompt_injection_scanning: false,
+            }
+        );
     }
 
     #[test]

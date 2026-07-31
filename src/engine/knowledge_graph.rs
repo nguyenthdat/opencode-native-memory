@@ -1271,7 +1271,12 @@ impl MemoryEngine {
         );
         let content_hash = required_string(&document, "content_hash")?;
         let scope = graph_scope(&self.config, &metadata);
-        let remote_eligible = graph_remote_ineligible_reason_values(&stored, &metadata).is_none();
+        let remote_eligible = graph_remote_ineligible_reason_values(
+            &stored,
+            &metadata,
+            self.config.validation_policy(),
+        )
+        .is_none();
         Ok(GraphSource {
             source_memory_id: stored.id,
             source_unit_id: graph_source_unit_id(
@@ -2406,6 +2411,7 @@ fn graph_remote_ineligible_reason(source: &GraphSource) -> Option<String> {
 fn graph_remote_ineligible_reason_values(
     stored: &StoredMemory,
     metadata: &MemoryMetadata,
+    validation_policy: crate::config::ValidationPolicy,
 ) -> Option<String> {
     if metadata.scope == MemoryScope::Repository {
         return Some(
@@ -2432,7 +2438,7 @@ fn graph_remote_ineligible_reason_values(
         confidence: None,
     };
     (!matches!(
-        classify_capture_safety(&request, SourceTrust::User, true),
+        classify_capture_safety_with_policy(&request, SourceTrust::User, true, validation_policy,),
         CaptureSafety::Safe
     ))
     .then(|| {

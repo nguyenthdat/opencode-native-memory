@@ -2,6 +2,7 @@
 
 use anyhow::{Result, ensure};
 
+use crate::config::ValidationPolicy;
 use crate::contract::{LockAction, MemoryKind, MemoryScope, UpdateRequest};
 use crate::storage::state::MemoryMetadata;
 
@@ -60,10 +61,20 @@ pub(crate) fn retention_factor(now_ms: i64, updated_at_ms: i64, metadata: &Memor
     2.0_f32.powf(-f32::from(bounded_age) / metadata.half_life_days.max(1.0))
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_update(
     metadata: &MemoryMetadata,
     request: &UpdateRequest,
     target_scope: MemoryScope,
+) -> Result<LifecycleValues> {
+    resolve_update_with_policy(metadata, request, target_scope, ValidationPolicy::default())
+}
+
+pub(crate) fn resolve_update_with_policy(
+    metadata: &MemoryMetadata,
+    request: &UpdateRequest,
+    target_scope: MemoryScope,
+    policy: ValidationPolicy,
 ) -> Result<LifecycleValues> {
     ensure!(
         request.lock_reason.is_none() || request.lock_action == Some(LockAction::Lock),
@@ -91,7 +102,7 @@ pub(crate) fn resolve_update(
         Some(LockAction::Lock) => {
             values.locked = true;
             if let Some(reason) = request.lock_reason.as_deref() {
-                values.lock_reason = normalize_lock_reason(reason)?;
+                values.lock_reason = normalize_lock_reason(reason, policy)?;
             }
         }
         Some(LockAction::Unlock) => {
@@ -123,7 +134,7 @@ pub(crate) fn ensure_delete_allowed(metadata: &MemoryMetadata) -> Result<()> {
     Ok(())
 }
 
-fn normalize_lock_reason(reason: &str) -> Result<Option<String>> {
+fn normalize_lock_reason(reason: &str, policy: ValidationPolicy) -> Result<Option<String>> {
     let reason = reason.trim();
     ensure!(
         reason.chars().count() <= MAX_LOCK_REASON_CHARS,
@@ -133,7 +144,7 @@ fn normalize_lock_reason(reason: &str) -> Result<Option<String>> {
         !reason.contains('\0'),
         "lock_reason cannot contain NUL bytes"
     );
-    crate::validation::scan_sensitive("lock_reason", reason)?;
+    crate::validation::scan_sensitive_with_policy(policy, "lock_reason", reason)?;
     Ok((!reason.is_empty()).then(|| reason.to_string()))
 }
 

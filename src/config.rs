@@ -117,6 +117,32 @@ pub struct MemoryConfig {
     data_root: PathBuf,
     model_cache: PathBuf,
     embedding: EmbeddingConfig,
+    validation_policy: ValidationPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidationPolicy {
+    pub(crate) secret_scanning: bool,
+    pub(crate) prompt_injection_scanning: bool,
+}
+
+impl Default for ValidationPolicy {
+    fn default() -> Self {
+        Self {
+            secret_scanning: true,
+            prompt_injection_scanning: true,
+        }
+    }
+}
+
+impl ValidationPolicy {
+    fn discover() -> Result<Self> {
+        Ok(Self {
+            secret_scanning: !env_bool("OPENCODE_MEMORY_DISABLE_SECRET_SCANNER")?.unwrap_or(false),
+            prompt_injection_scanning: !env_bool("OPENCODE_MEMORY_DISABLE_PROMPT_INJECTION_SCAN")?
+                .unwrap_or(false),
+        })
+    }
 }
 
 impl MemoryConfig {
@@ -135,6 +161,7 @@ impl MemoryConfig {
         };
 
         let embedding = EmbeddingConfig::discover()?;
+        let validation_policy = ValidationPolicy::discover()?;
         let data_home = default_data_home();
         let data_root =
             env_path("OPENCODE_MEMORY_DATA_DIR").unwrap_or_else(|| data_home.join(DATA_SUBDIR));
@@ -144,7 +171,9 @@ impl MemoryConfig {
             &embedding.revision,
         );
 
-        Ok(Self::new(project_root, data_root, model_cache).with_embedding(embedding))
+        let mut config = Self::new(project_root, data_root, model_cache).with_embedding(embedding);
+        config.set_validation_policy(validation_policy);
+        Ok(config)
     }
 
     #[must_use]
@@ -157,6 +186,7 @@ impl MemoryConfig {
             data_root,
             model_cache,
             embedding: EmbeddingConfig::default(),
+            validation_policy: ValidationPolicy::default(),
         }
     }
 
@@ -193,6 +223,10 @@ impl MemoryConfig {
         self.embedding = embedding;
     }
 
+    pub(crate) fn set_validation_policy(&mut self, validation_policy: ValidationPolicy) {
+        self.validation_policy = validation_policy;
+    }
+
     #[must_use]
     pub fn project_root(&self) -> &Path {
         &self.project_root
@@ -211,6 +245,11 @@ impl MemoryConfig {
     #[must_use]
     pub(crate) fn embedding(&self) -> &EmbeddingConfig {
         &self.embedding
+    }
+
+    #[must_use]
+    pub(crate) fn validation_policy(&self) -> ValidationPolicy {
+        self.validation_policy
     }
 
     #[must_use]
@@ -270,6 +309,14 @@ impl MemoryConfig {
                 self.embedding_profile_fingerprint()?.as_bytes(),
             );
         }
+        hash_fingerprint_field(
+            &mut hasher,
+            &[u8::from(self.validation_policy.secret_scanning)],
+        );
+        hash_fingerprint_field(
+            &mut hasher,
+            &[u8::from(self.validation_policy.prompt_injection_scanning)],
+        );
         Ok(hex::encode(hasher.finalize()))
     }
 
@@ -541,8 +588,8 @@ pub(crate) fn hash_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EmbeddingConfig, MemoryConfig, default_model_cache, discover_project_root,
-        resolve_model_cache, resolve_project_root, revision_cache_component,
+        EmbeddingConfig, MemoryConfig, ValidationPolicy, default_model_cache,
+        discover_project_root, resolve_model_cache, resolve_project_root, revision_cache_component,
     };
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -727,6 +774,28 @@ mod tests {
         assert_ne!(
             base.configuration_fingerprint().expect("fingerprint"),
             different.configuration_fingerprint().expect("fingerprint")
+        );
+    }
+
+    #[test]
+    fn actor_compatibility_fingerprint_separates_scanner_policies() {
+        let temp = tempfile::tempdir().expect("temp");
+        let base = MemoryConfig::new(
+            temp.path().join("project"),
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        );
+        let mut scanners_disabled = base.clone();
+        scanners_disabled.set_validation_policy(ValidationPolicy {
+            secret_scanning: false,
+            prompt_injection_scanning: false,
+        });
+
+        assert_ne!(
+            base.actor_compatibility_fingerprint().expect("fingerprint"),
+            scanners_disabled
+                .actor_compatibility_fingerprint()
+                .expect("scanner policy fingerprint")
         );
     }
 

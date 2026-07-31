@@ -326,6 +326,22 @@ Use the `projectRoot` factory option to override the project root in plugin
 integrations. `OPENCODE_MEMORY_PROJECT_ROOT` applies to standalone native modes,
 not normal daemon acquisition by this plugin.
 
+### Content Scanner Configuration
+
+| Variable                                        | Default or behavior                                     |
+| ----------------------------------------------- | ------------------------------------------------------- |
+| `OPENCODE_MEMORY_DISABLE_SECRET_SCANNER`        | `false`; disables all secret checks for this project    |
+| `OPENCODE_MEMORY_DISABLE_PROMPT_INJECTION_SCAN` | `false`; disables all injection checks for this project |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_MODEL`          | Optional local prompt-injection ONNX model              |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_TOKENIZER`      | Matching local tokenizer JSON                           |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_THRESHOLD`      | Classification threshold; default `0.85`                |
+
+Disable flags accept `1`, `true`, `yes`, or `on`, case-insensitively. They are
+resolved by each plugin process and sent as project-acquisition policy, rather
+than inherited globally by the shared daemon. Disabling a scanner removes a
+safety boundary; only do so for inputs and exports you independently trust and
+review.
+
 ## Storage
 
 The default data root is:

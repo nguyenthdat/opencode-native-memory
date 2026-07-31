@@ -169,49 +169,57 @@ Changing model identity or vector-affecting preprocessing requires rebuilding th
 
 ### Environment
 
-| Variable                                       | Default / purpose                                                                           |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH`         | Local GGUF path; bypasses Hugging Face                                                      |
-| `OPENCODE_MEMORY_EMBEDDING_MODEL_REPO`         | `Qwen/Qwen3-Embedding-4B-GGUF`                                                              |
-| `OPENCODE_MEMORY_EMBEDDING_MODEL_FILE`         | `Qwen3-Embedding-4B-Q4_K_M.gguf`                                                            |
-| `OPENCODE_MEMORY_EMBEDDING_MODEL_REVISION`     | Pinned Hugging Face commit                                                                  |
-| `OPENCODE_MEMORY_EMBEDDING_POOLING`            | `last`; accepts `unspecified`, `mean`, `cls`, `last`                                        |
-| `OPENCODE_MEMORY_EMBEDDING_ATTENTION`          | `causal`; accepts `unspecified`, `causal`, `non_causal`                                     |
-| `OPENCODE_MEMORY_EMBEDDING_QUERY_TEMPLATE`     | Query instruction containing `{text}`                                                       |
-| `OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE`   | `{text}`                                                                                    |
-| `OPENCODE_MEMORY_EMBEDDING_ADD_BOS`            | `true`                                                                                      |
-| `OPENCODE_MEMORY_EMBEDDING_APPEND_EOS`         | `true`                                                                                      |
-| `OPENCODE_MEMORY_EMBEDDING_NORMALIZE`          | `true`                                                                                      |
-| `OPENCODE_MEMORY_EMBEDDING_DIMENSION`          | Native model dimension; lower values use MRL truncation then renormalization                |
-| `OPENCODE_MEMORY_EMBEDDING_CONTEXT_SIZE`       | `8192`                                                                                      |
-| `OPENCODE_MEMORY_EMBEDDING_THREADS`            | Hard per-inference maximum; daemon default shares CPU capacity across actors                |
-| `OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS`         | All layers when GPU offload is supported, otherwise `0`                                     |
-| `OPENCODE_MEMORY_PROJECT_ROOT`                 | Standalone native-mode project-root override; not used for normal plugin daemon acquisition |
-| `OPENCODE_MEMORY_DATA_DIR`                     | Override project store base directory                                                       |
-| `OPENCODE_MEMORY_MODEL_CACHE`                  | Replace the complete local Hugging Face model-cache path                                    |
-| `OPENCODE_MEMORY_INITIAL_PROFILE`              | Initial catalog profile for a new project only                                              |
-| `OPENCODE_MEMORY_EXPECTED_PROFILE`             | Optional acquire-time assertion for the persisted active profile                            |
-| `OPENCODE_MEMORY_MODEL_MEMORY_BUDGET_BYTES`    | Switch worker memory budget; default `16 GiB`                                               |
-| `OPENCODE_MEMORY_REQUEST_TIMEOUT_MS`           | Native RPC timeout in milliseconds; default 5 minutes, maximum 2 hours                      |
-| `OPENCODE_NATIVE_MEMORY_BIN`                   | Development/debug native daemon binary override                                             |
-| `OPENCODE_MEMORY_PROJECT_IDLE_SECONDS`         | Release an unleased project actor after 5 minutes                                           |
-| `OPENCODE_MEMORY_DAEMON_IDLE_SECONDS`          | Stop the daemon after 10 minutes with no sessions or project activity                       |
-| `OPENCODE_MEMORY_MAINTENANCE_INTERVAL_SECONDS` | Native active-project maintenance probe; default `300`                                      |
-| `OPENCODE_MEMORY_WARMUP`                       | Enable model/shared-memory warmup; default `true`                                           |
-| `OPENCODE_MEMORY_AUTO_RECALL`                  | Enable automatic contextual recall; default `true`                                          |
-| `OPENCODE_MEMORY_AUTO_CAPTURE`                 | Evaluate compaction candidates through the capture gate; default `true`                     |
-| `OPENCODE_MEMORY_AUTO_RETAIN`                  | Enqueue bounded provider-backed document/compaction retain; default `false`                 |
-| `OPENCODE_MEMORY_AUTO_RETAIN_SOURCES`          | Comma-separated `document`, `compaction`, `tool_outcome`; all three by default              |
-| `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS`         | Incrementally index non-ignored project documents; default `true`                           |
-| `OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS`   | File-watcher re-index debounce; default `750`                                               |
-| `OPENCODE_MEMORY_AUTO_OPTIMIZE`                | Coalesced zvec compaction after writes/index drift; default `true`                          |
-| `OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS`         | Maintenance debounce; default `5000`                                                        |
-| `OPENCODE_MEMORY_SHARED_SYNC`                  | Synchronize `.opencode/memory/**/*.md`; default `true`                                      |
-| `OPENCODE_MEMORY_FEEDBACK_TRACKING`            | Track retrieval feedback; default `true`                                                    |
-| `OPENCODE_MEMORY_MIN_SCORE`                    | Default calibrated search threshold; default `0.42`                                         |
-| `OPENCODE_MEMORY_GUARDRAIL_ONNX_MODEL`         | Optional local DeBERTa prompt-injection ONNX model path                                     |
-| `OPENCODE_MEMORY_GUARDRAIL_ONNX_TOKENIZER`     | Optional matching Hugging Face tokenizer JSON path                                          |
-| `OPENCODE_MEMORY_GUARDRAIL_ONNX_THRESHOLD`     | Semantic injection block threshold; default `0.85`                                          |
+| Variable                                        | Default / purpose                                                                           |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_PATH`          | Local GGUF path; bypasses Hugging Face                                                      |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_REPO`          | `Qwen/Qwen3-Embedding-4B-GGUF`                                                              |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_FILE`          | `Qwen3-Embedding-4B-Q4_K_M.gguf`                                                            |
+| `OPENCODE_MEMORY_EMBEDDING_MODEL_REVISION`      | Pinned Hugging Face commit                                                                  |
+| `OPENCODE_MEMORY_EMBEDDING_POOLING`             | `last`; accepts `unspecified`, `mean`, `cls`, `last`                                        |
+| `OPENCODE_MEMORY_EMBEDDING_ATTENTION`           | `causal`; accepts `unspecified`, `causal`, `non_causal`                                     |
+| `OPENCODE_MEMORY_EMBEDDING_QUERY_TEMPLATE`      | Query instruction containing `{text}`                                                       |
+| `OPENCODE_MEMORY_EMBEDDING_PASSAGE_TEMPLATE`    | `{text}`                                                                                    |
+| `OPENCODE_MEMORY_EMBEDDING_ADD_BOS`             | `true`                                                                                      |
+| `OPENCODE_MEMORY_EMBEDDING_APPEND_EOS`          | `true`                                                                                      |
+| `OPENCODE_MEMORY_EMBEDDING_NORMALIZE`           | `true`                                                                                      |
+| `OPENCODE_MEMORY_EMBEDDING_DIMENSION`           | Native model dimension; lower values use MRL truncation then renormalization                |
+| `OPENCODE_MEMORY_EMBEDDING_CONTEXT_SIZE`        | `8192`                                                                                      |
+| `OPENCODE_MEMORY_EMBEDDING_THREADS`             | Hard per-inference maximum; daemon default shares CPU capacity across actors                |
+| `OPENCODE_MEMORY_EMBEDDING_GPU_LAYERS`          | All layers when GPU offload is supported, otherwise `0`                                     |
+| `OPENCODE_MEMORY_PROJECT_ROOT`                  | Standalone native-mode project-root override; not used for normal plugin daemon acquisition |
+| `OPENCODE_MEMORY_DATA_DIR`                      | Override project store base directory                                                       |
+| `OPENCODE_MEMORY_MODEL_CACHE`                   | Replace the complete local Hugging Face model-cache path                                    |
+| `OPENCODE_MEMORY_INITIAL_PROFILE`               | Initial catalog profile for a new project only                                              |
+| `OPENCODE_MEMORY_EXPECTED_PROFILE`              | Optional acquire-time assertion for the persisted active profile                            |
+| `OPENCODE_MEMORY_MODEL_MEMORY_BUDGET_BYTES`     | Switch worker memory budget; default `16 GiB`                                               |
+| `OPENCODE_MEMORY_REQUEST_TIMEOUT_MS`            | Native RPC timeout in milliseconds; default 5 minutes, maximum 2 hours                      |
+| `OPENCODE_NATIVE_MEMORY_BIN`                    | Development/debug native daemon binary override                                             |
+| `OPENCODE_MEMORY_PROJECT_IDLE_SECONDS`          | Release an unleased project actor after 5 minutes                                           |
+| `OPENCODE_MEMORY_DAEMON_IDLE_SECONDS`           | Stop the daemon after 10 minutes with no sessions or project activity                       |
+| `OPENCODE_MEMORY_MAINTENANCE_INTERVAL_SECONDS`  | Native active-project maintenance probe; default `300`                                      |
+| `OPENCODE_MEMORY_WARMUP`                        | Enable model/shared-memory warmup; default `true`                                           |
+| `OPENCODE_MEMORY_AUTO_RECALL`                   | Enable automatic contextual recall; default `true`                                          |
+| `OPENCODE_MEMORY_AUTO_CAPTURE`                  | Evaluate compaction candidates through the capture gate; default `true`                     |
+| `OPENCODE_MEMORY_AUTO_RETAIN`                   | Enqueue bounded provider-backed document/compaction retain; default `false`                 |
+| `OPENCODE_MEMORY_AUTO_RETAIN_SOURCES`           | Comma-separated `document`, `compaction`, `tool_outcome`; all three by default              |
+| `OPENCODE_MEMORY_AUTO_INDEX_DOCUMENTS`          | Incrementally index non-ignored project documents; default `true`                           |
+| `OPENCODE_MEMORY_DOCUMENT_INDEX_DEBOUNCE_MS`    | File-watcher re-index debounce; default `750`                                               |
+| `OPENCODE_MEMORY_AUTO_OPTIMIZE`                 | Coalesced zvec compaction after writes/index drift; default `true`                          |
+| `OPENCODE_MEMORY_OPTIMIZE_DEBOUNCE_MS`          | Maintenance debounce; default `5000`                                                        |
+| `OPENCODE_MEMORY_SHARED_SYNC`                   | Synchronize `.opencode/memory/**/*.md`; default `true`                                      |
+| `OPENCODE_MEMORY_FEEDBACK_TRACKING`             | Track retrieval feedback; default `true`                                                    |
+| `OPENCODE_MEMORY_MIN_SCORE`                     | Default calibrated search threshold; default `0.42`                                         |
+| `OPENCODE_MEMORY_DISABLE_SECRET_SCANNER`        | Disable all secret-content checks for this project; default `false`                         |
+| `OPENCODE_MEMORY_DISABLE_PROMPT_INJECTION_SCAN` | Disable all prompt-injection checks for this project; default `false`                       |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_MODEL`          | Optional local DeBERTa prompt-injection ONNX model path                                     |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_TOKENIZER`      | Optional matching Hugging Face tokenizer JSON path                                          |
+| `OPENCODE_MEMORY_GUARDRAIL_ONNX_THRESHOLD`      | Semantic injection block threshold; default `0.85`                                          |
+
+The two `OPENCODE_MEMORY_DISABLE_*` flags accept `1`, `true`, `yes`, or `on`
+(and the corresponding false values). The plugin sends the resolved policy with
+project acquisition, so projects sharing one daemon retain separate policies.
+Disabling either scanner removes a safety boundary and should only be used for a
+project whose inputs and memory exports you independently trust and review.
 
 Example local model:
 

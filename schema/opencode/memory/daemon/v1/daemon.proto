@@ -138,6 +138,8 @@ message AcquireProjectRequest {
   optional string model_cache = 7;
   optional string initial_profile_id = 8;
   optional string expected_profile_id = 9;
+  optional bool secret_scanning = 10;
+  optional bool prompt_injection_scanning = 11;
 }
 
 message AcquireProjectResponse {

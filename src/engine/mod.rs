@@ -36,7 +36,7 @@ use crate::embedding_generation::{
 use crate::graph::GraphStore;
 use crate::lifecycle::{
     default_expiry, default_half_life_days, ensure_delete_allowed, ensure_store_overwrite_allowed,
-    expiry_from_days, is_expired, is_prunable_expired, resolve_update,
+    expiry_from_days, is_expired, is_prunable_expired, resolve_update_with_policy,
 };
 use crate::storage::state::{
     MemoryMetadata, MemoryState, PendingDocument, PendingUpsert, STATE_SCHEMA_VERSION, Tombstone,
@@ -46,9 +46,9 @@ use crate::storage::zvec::{self, RESULT_FIELDS, ensure_write_succeeded};
 use crate::taxonomy::MemoryTaxonomy;
 use crate::validation::{
     MAX_ID_COUNT, MAX_LIST_RESULTS, MAX_SHARED_RECORDS, NormalizedStoreRequest, anchors_stale,
-    capture_code_anchors, classify_capture_safety, git_head, normalize_scope_key, normalize_tags,
-    resolve_confidence, truncate_chars, validate_ids, validate_retrieval_id,
-    validate_shared_source, validate_store_request,
+    capture_code_anchors, classify_capture_safety_with_policy, git_head, normalize_scope_key,
+    normalize_tags, resolve_confidence, truncate_chars, validate_ids, validate_retrieval_id,
+    validate_shared_source, validate_store_request_with_policy,
 };
 use crate::{EmbeddingConfig, MemoryConfig};
 
@@ -100,7 +100,8 @@ impl MemoryEngine {
         let writer_lock = zvec::acquire_writer_lock(&config.project_data_dir())?;
         let state = MemoryState::load(&config.state_path())?;
         let document_index = DocumentIndexManifest::load(&config.document_index_path())?;
-        let graph = GraphStore::load(&config.graph_state_path(), &config.graph_pending_path())?;
+        let graph = GraphStore::load(&config.graph_state_path(), &config.graph_pending_path())?
+            .with_validation_policy(config.validation_policy());
         let switch_store =
             ModelSwitchStore::load(&config.model_switch_path(), config.project_id())?;
         let persisted_active =
@@ -247,7 +248,8 @@ impl MemoryEngine {
         predecessor_ids: Vec<String>,
         conflict_ids: Vec<String>,
     ) -> Result<PreparedStore> {
-        let normalized = validate_store_request(request)?;
+        let normalized =
+            validate_store_request_with_policy(request, self.config.validation_policy())?;
         let fingerprint = memory_fingerprint(
             normalized.kind,
             normalized.scope,
@@ -740,13 +742,17 @@ impl MemoryEngine {
     /// or storage/inference failures. Safety rejections are returned as capture
     /// decisions rather than errors.
     pub fn capture(&mut self, request: CaptureRequest) -> Result<CaptureResponse> {
-        let safety = classify_capture_safety(
+        let safety = classify_capture_safety_with_policy(
             &request.candidate,
             request.source_trust,
             request.has_valid_evidence,
+            self.config.validation_policy(),
         );
         let normalized = if safety == crate::capture::CaptureSafety::Safe {
-            Some(validate_store_request(request.candidate.clone())?)
+            Some(validate_store_request_with_policy(
+                request.candidate.clone(),
+                self.config.validation_policy(),
+            )?)
         } else {
             None
         };
@@ -954,26 +960,29 @@ impl MemoryEngine {
                 "snapshot timestamps are invalid for {}",
                 record.id
             );
-            let normalized = validate_store_request(StoreRequest {
-                content: record.content.clone(),
-                title: Some(record.title.clone()),
-                kind: record.kind,
-                importance: record.importance,
-                tags: record.tags.clone(),
-                source: Some(record.source.clone()),
-                scope: record.scope,
-                scope_key: record.scope_key.clone(),
-                origin: record.origin,
-                expires_in_days: None,
-                code_paths: record
-                    .code_anchors
-                    .iter()
-                    .map(|anchor| anchor.path.clone())
-                    .collect(),
-                revive: false,
-                taxonomy: Some(record.taxonomy),
-                confidence: Some(record.confidence),
-            })?;
+            let normalized = validate_store_request_with_policy(
+                StoreRequest {
+                    content: record.content.clone(),
+                    title: Some(record.title.clone()),
+                    kind: record.kind,
+                    importance: record.importance,
+                    tags: record.tags.clone(),
+                    source: Some(record.source.clone()),
+                    scope: record.scope,
+                    scope_key: record.scope_key.clone(),
+                    origin: record.origin,
+                    expires_in_days: None,
+                    code_paths: record
+                        .code_anchors
+                        .iter()
+                        .map(|anchor| anchor.path.clone())
+                        .collect(),
+                    revive: false,
+                    taxonomy: Some(record.taxonomy),
+                    confidence: Some(record.confidence),
+                },
+                self.config.validation_policy(),
+            )?;
             let expected_id = deterministic_memory_id(&normalized);
             let legacy_document_id = (normalized.origin == MemoryOrigin::IngestedDocument)
                 .then(|| legacy_deterministic_memory_id(&normalized));
@@ -1172,29 +1181,37 @@ impl MemoryEngine {
             )?;
         }
         let scope = request.scope.unwrap_or(old_metadata.scope);
-        let lifecycle = resolve_update(&old_metadata, &request, scope)?;
+        let lifecycle = resolve_update_with_policy(
+            &old_metadata,
+            &request,
+            scope,
+            self.config.validation_policy(),
+        )?;
         let scope_key = if request.scope.is_some() || request.scope_key.is_some() {
             normalize_scope_key(scope, request.scope_key.as_deref())?
         } else {
             old_metadata.scope_key.clone()
         };
         let code_paths = request.code_paths.clone().unwrap_or_default();
-        let merged = validate_store_request(StoreRequest {
-            content: request.content.unwrap_or_else(|| existing.content.clone()),
-            title: Some(request.title.unwrap_or_else(|| existing.title.clone())),
-            kind: request.kind.unwrap_or(existing.kind),
-            importance: request.importance.unwrap_or(existing.importance),
-            tags: request.tags.unwrap_or_else(|| existing.tags.clone()),
-            source: Some(existing.source.clone()),
-            scope,
-            scope_key: scope_key.clone(),
-            origin: old_metadata.origin,
-            expires_in_days: request.expires_in_days,
-            code_paths,
-            revive: false,
-            taxonomy: request.taxonomy.or(Some(old_metadata.taxonomy)),
-            confidence: request.confidence.or(Some(old_metadata.confidence)),
-        })?;
+        let merged = validate_store_request_with_policy(
+            StoreRequest {
+                content: request.content.unwrap_or_else(|| existing.content.clone()),
+                title: Some(request.title.unwrap_or_else(|| existing.title.clone())),
+                kind: request.kind.unwrap_or(existing.kind),
+                importance: request.importance.unwrap_or(existing.importance),
+                tags: request.tags.unwrap_or_else(|| existing.tags.clone()),
+                source: Some(existing.source.clone()),
+                scope,
+                scope_key: scope_key.clone(),
+                origin: old_metadata.origin,
+                expires_in_days: request.expires_in_days,
+                code_paths,
+                revive: false,
+                taxonomy: request.taxonomy.or(Some(old_metadata.taxonomy)),
+                confidence: request.confidence.or(Some(old_metadata.confidence)),
+            },
+            self.config.validation_policy(),
+        )?;
         let new_fingerprint = memory_fingerprint(
             merged.kind,
             merged.scope,
@@ -1343,7 +1360,12 @@ impl MemoryEngine {
             metadata.scope != MemoryScope::Repository,
             "repository memory lifecycle is managed through its Markdown source"
         );
-        let values = resolve_update(&metadata, &request, metadata.scope)?;
+        let values = resolve_update_with_policy(
+            &metadata,
+            &request,
+            metadata.scope,
+            self.config.validation_policy(),
+        )?;
         if metadata.pinned == values.pinned
             && metadata.locked == values.locked
             && metadata.lock_reason == values.lock_reason

@@ -15,9 +15,9 @@ use oxigraph::store::Store;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::config::hash_hex;
+use crate::config::{ValidationPolicy, hash_hex};
 use crate::storage::atomic::{remove_file_durable, write_json_atomic};
-use crate::validation::{contains_instruction_injection, scan_sensitive};
+use crate::validation::{contains_instruction_injection_with_policy, scan_sensitive_with_policy};
 
 pub(crate) const GRAPH_SCHEMA_VERSION: u32 = 2;
 pub(crate) const GRAPH_POLICY_VERSION: &str = "egress-v1";
@@ -405,6 +405,7 @@ pub(crate) struct GraphStore {
     pending_path: std::path::PathBuf,
     state: GraphState,
     rdf: Store,
+    validation_policy: ValidationPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -787,6 +788,7 @@ impl GraphStore {
             pending_path: pending_path.to_path_buf(),
             state,
             rdf,
+            validation_policy: ValidationPolicy::default(),
         };
         let now_ms = u64::try_from(
             SystemTime::now()
@@ -797,6 +799,11 @@ impl GraphStore {
         .context("graph timestamp exceeds u64")?;
         store.recover_job_leases(now_ms)?;
         Ok(store)
+    }
+
+    pub(crate) fn with_validation_policy(mut self, policy: ValidationPolicy) -> Self {
+        self.validation_policy = policy;
+        self
     }
 
     pub(crate) fn state(&self) -> &GraphState {
@@ -1318,6 +1325,7 @@ impl GraphStore {
                 observations,
                 metrics,
                 now_ms,
+                self.validation_policy,
             )?;
             let job = next
                 .jobs
@@ -1494,9 +1502,9 @@ impl GraphStore {
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| anyhow!("observation edit requires a statement"))?;
                 validate_name(statement, "observation statement")?;
-                scan_sensitive("graph observation", statement)?;
+                scan_sensitive_with_policy(self.validation_policy, "graph observation", statement)?;
                 ensure!(
-                    !contains_instruction_injection(statement),
+                    !contains_instruction_injection_with_policy(self.validation_policy, statement),
                     "observation statement resembles an instruction injection"
                 );
                 observation.statement = statement.to_string();
@@ -1589,6 +1597,7 @@ impl GraphStore {
             observations,
             metrics,
             now_ms,
+            self.validation_policy,
         )?;
         self.commit_state(next, &format!("run:{run_id}"))?;
         Ok(outcome)
@@ -1914,6 +1923,7 @@ fn apply_upsert(
     observations: &[GraphObservationInput],
     metrics: GraphRunMetrics,
     now_ms: u64,
+    validation_policy: ValidationPolicy,
 ) -> Result<GraphUpsertOutcome> {
     validate_run_id(run_id)?;
     validate_provider(provider)?;
@@ -2031,6 +2041,7 @@ fn apply_upsert(
             &accepted_facts,
             provider,
             now_ms,
+            validation_policy,
         ) {
             Ok(fact) => accepted_facts.push((index, fact)),
             Err(error) => rejected.push(GraphCandidateRejection {
@@ -2042,7 +2053,14 @@ fn apply_upsert(
         }
     }
     for (index, candidate) in observations.iter().enumerate() {
-        match build_observation(state, candidate, &accepted_facts, provider, now_ms) {
+        match build_observation(
+            state,
+            candidate,
+            &accepted_facts,
+            provider,
+            now_ms,
+            validation_policy,
+        ) {
             Ok(observation) => accepted_observations.push((index, observation)),
             Err(error) => rejected.push(GraphCandidateRejection {
                 kind: "observation".to_string(),
@@ -2707,11 +2725,12 @@ fn build_fact(
     accepted_facts: &[(usize, DerivedFact)],
     provider: &GraphProvider,
     now_ms: u64,
+    validation_policy: ValidationPolicy,
 ) -> Result<DerivedFact> {
     validate_name(&candidate.text, "fact text")?;
-    scan_sensitive("graph fact", &candidate.text)?;
+    scan_sensitive_with_policy(validation_policy, "graph fact", &candidate.text)?;
     ensure!(
-        !contains_instruction_injection(&candidate.text),
+        !contains_instruction_injection_with_policy(validation_policy, &candidate.text),
         "fact text resembles an instruction injection"
     );
     ensure!(
@@ -2723,9 +2742,9 @@ fn build_fact(
         "fact context is too long"
     );
     if !candidate.context.is_empty() {
-        scan_sensitive("graph fact context", &candidate.context)?;
+        scan_sensitive_with_policy(validation_policy, "graph fact context", &candidate.context)?;
         ensure!(
-            !contains_instruction_injection(&candidate.context),
+            !contains_instruction_injection_with_policy(validation_policy, &candidate.context),
             "fact context resembles an instruction injection"
         );
     }
@@ -2832,11 +2851,12 @@ fn build_observation(
     accepted_facts: &[(usize, DerivedFact)],
     provider: &GraphProvider,
     now_ms: u64,
+    validation_policy: ValidationPolicy,
 ) -> Result<GraphObservation> {
     validate_name(&candidate.statement, "observation statement")?;
-    scan_sensitive("graph observation", &candidate.statement)?;
+    scan_sensitive_with_policy(validation_policy, "graph observation", &candidate.statement)?;
     ensure!(
-        !contains_instruction_injection(&candidate.statement),
+        !contains_instruction_injection_with_policy(validation_policy, &candidate.statement),
         "observation statement resembles an instruction injection"
     );
     validate_confidence(candidate.confidence)?;
