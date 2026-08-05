@@ -61,7 +61,7 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.13.0",
-    "@opencode-ai/sdk": "1.18.4",
+    "@opencode-ai/sdk": "1.18.11",
     "yaml": "^2.9.0"
   },
   "peerDependencies": {
